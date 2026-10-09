@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Author-provided alias. Edit these two resources to your preferred signature. -->
+    <string name="brand_author_signature" translatable="false">S.</string>
+    <string name="brand_copyright" translatable="false">© 2026 S. · TG Ledger</string>
+</resources>

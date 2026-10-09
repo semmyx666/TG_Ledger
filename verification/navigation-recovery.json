@@ -1,0 +1,18 @@
+{
+  "kind": "source-regression-guards",
+  "passed": 10,
+  "checks": [
+    "Explicit real Activity owners are provided above localized content",
+    "Registry owner is installed before the localized Context replacement",
+    "History button no longer invokes dashboard back action",
+    "History has an independent navigation destination",
+    "Analytics selected month is passed to history",
+    "System settings launched safely from localized non-Activity Context",
+    "Local text recovery has a preview and explicit submit action",
+    "Manual recovery works without automation and never bypasses confirmation",
+    "Live import diagnostics are visible in the banking screen",
+    "Reconnect and bank package configuration are provided"
+  ],
+  "compiled_android": false,
+  "device_crash_fixed_verified": false
+}

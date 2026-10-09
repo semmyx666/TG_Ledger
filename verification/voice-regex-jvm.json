@@ -1,0 +1,7 @@
+{
+  "kind": "exact-source-regex-on-JVM",
+  "passed": 7,
+  "compiled_kotlin": false,
+  "compiled_android": false,
+  "output": "JVM monetary-regex checks passed: 7"
+}

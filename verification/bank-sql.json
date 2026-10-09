@@ -1,0 +1,17 @@
+{
+  "kind": "exact-migration-and-Room-bank-SQL-in-SQLite",
+  "passed": 10,
+  "checks": [
+    "Migration preserves entries and does not invent cash/card attribution",
+    "All six metadata columns migrated",
+    "Source totals exclude income, deleted and other currencies",
+    "Mono is isolated from Privat and cash",
+    "Source category filter uses chosen bank",
+    "Custom categories retain their own identity",
+    "Unique fingerprint prevents repeated delivery imports",
+    "Near duplicates are detected for review",
+    "Different banks do not deduplicate each other",
+    "Clearing review history preserves ledger entries"
+  ],
+  "compiled_android": false
+}

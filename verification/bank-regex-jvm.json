@@ -1,0 +1,6 @@
+{
+  "kind": "actual-source-regex-on-JVM",
+  "passed_fixtures": 12,
+  "compiled_kotlin": false,
+  "executed_android": false
+}

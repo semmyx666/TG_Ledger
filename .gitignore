@@ -1,0 +1,17 @@
+.gradle/
+.kotlin/
+.idea/
+**/build/
+local.properties
+secrets.properties
+*.jks
+*.keystore
+*.pem
+tools/developer_private_key.pem
+tools/developer_public_key.der
+.DS_Store
+verification/local-*
+gradle/wrapper/gradle-wrapper.jar
+
+__pycache__/
+*.pyc

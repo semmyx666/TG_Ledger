@@ -1,0 +1,10 @@
+{
+  "dimensions": [
+    1024,
+    1024
+  ],
+  "changed_pixels": 440799,
+  "eye_nose_pixels_preserved": true,
+  "dark_background_preserved": true,
+  "android_render_verified": false
+}

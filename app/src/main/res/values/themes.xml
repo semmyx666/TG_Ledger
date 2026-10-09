@@ -1,0 +1,15 @@
+<resources>
+    <style name="Theme.Ledger" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#F6F8FC</item>
+    </style>
+    <style name="Theme.Ledger.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#10223F</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash</item>
+        <item name="windowSplashScreenAnimationDuration">400</item>
+        <item name="postSplashScreenTheme">@style/Theme.Ledger</item>
+    </style>
+    <color name="launcher_background">#10223F</color>
+</resources>

@@ -1,0 +1,22 @@
+{
+  "kind": "exact-Room-SQL-in-SQLite",
+  "passed": 14,
+  "checks": [
+    "Calendar month: exact food sum across more than 50 records",
+    "Calendar month: all expense categories",
+    "Income excludes expenses",
+    "All-time includes earlier years and excludes deleted/future/currency",
+    "Empty category returns zero",
+    "Category pagination initial window plus sentinel",
+    "Load more obtains every category transaction",
+    "Transaction details retained",
+    "Seven-day details share exact seven-day bounds",
+    "Category header uses full dataset rather than current page",
+    "Assistant statistics exclude newly deleted entries",
+    "Undo restores aggregate",
+    "Income/expense counts remain separate inside one category",
+    "Combined category detail count remains backwards compatible"
+  ],
+  "compiled_android": false,
+  "executed_junit": false
+}
