@@ -15,7 +15,7 @@ def check(test,label):
 old=c.execute("SELECT * FROM entries WHERE id='old'").fetchone()
 check(old['sourceType']=='UNKNOWN' and old['amountMinor']==100,'Migration preserves entries and does not invent cash/card attribution')
 check(len(c.execute('PRAGMA table_info(entries)').fetchall())==17,'All six metadata columns migrated')
-s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/local/BankEntities.kt').read_text()
+s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt').read_text()
 queries={}
 for quoted,name in re.findall(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:suspend\s+)?fun\s+(\w+)',s):queries[name]=quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 def insert(id,amount,source,bank,currency='UAH',kind='EXPENSE',category='FOOD',custom=None,deleted=None):

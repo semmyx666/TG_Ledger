@@ -5,6 +5,11 @@ TGLedger-3.2.0/
 ├── app/
 │   ├── src/
 │   │   ├── androidTest/
+│   │   │   ├── java/
+│   │   │   │   └── com/
+│   │   │   │       └── example/
+│   │   │   │           └── myapplication/
+│   │   │   │               └── ExampleInstrumentedTest.kt
 │   │   │   └── kotlin/
 │   │   │       └── com/
 │   │   │           └── semmyx/
@@ -13,118 +18,146 @@ TGLedger-3.2.0/
 │   │   ├── legacyV7/
 │   │   │   └── AndroidManifest.xml
 │   │   ├── main/
+│   │   │   ├── keepRules/
+│   │   │   │   └── rules.keep
 │   │   │   ├── kotlin/
 │   │   │   │   └── com/
 │   │   │   │       └── semmyx/
 │   │   │   │           └── ledger/
+│   │   │   │               ├── analytics/
+│   │   │   │               │   ├── AnalyticsCharts.kt
+│   │   │   │               │   ├── AnalyticsScreen.kt
+│   │   │   │               │   └── AnalyticsViewModel.kt
+│   │   │   │               ├── auth/
+│   │   │   │               │   ├── AuthenticationScreen.kt
+│   │   │   │               │   └── AuthViewModel.kt
 │   │   │   │               ├── bank/
 │   │   │   │               │   ├── BankNotificationListener.kt
-│   │   │   │               │   └── BankSmsReceiver.kt
+│   │   │   │               │   ├── BankScreen.kt
+│   │   │   │               │   ├── BankSmsReceiver.kt
+│   │   │   │               │   └── BankViewModel.kt
+│   │   │   │               ├── cat/
+│   │   │   │               │   ├── CatAnimation.kt
+│   │   │   │               │   ├── CatAssistantCard.kt
+│   │   │   │               │   ├── CatFaceMesh.kt
+│   │   │   │               │   └── CatMeshRenderer.kt
+│   │   │   │               ├── common/
+│   │   │   │               │   ├── CommonComponents.kt
+│   │   │   │               │   └── ViewModelSupport.kt
+│   │   │   │               ├── dashboard/
+│   │   │   │               │   ├── ActivityChart.kt
+│   │   │   │               │   ├── CategoryDetails.kt
+│   │   │   │               │   ├── DashboardScreen.kt
+│   │   │   │               │   └── DashboardViewModel.kt
 │   │   │   │               ├── diagnostics/
 │   │   │   │               │   └── CrashLogger.kt
+│   │   │   │               ├── editor/
+│   │   │   │               │   ├── EntryScreen.kt
+│   │   │   │               │   └── EntryViewModel.kt
+│   │   │   │               ├── history/
+│   │   │   │               │   ├── HistoryScreen.kt
+│   │   │   │               │   └── HistoryViewModel.kt
+│   │   │   │               ├── navigation/
+│   │   │   │               │   ├── AppRoot.kt
+│   │   │   │               │   └── AppViewModel.kt
+│   │   │   │               ├── onboarding/
+│   │   │   │               │   └── OnboardingScreen.kt
 │   │   │   │               ├── platform/
 │   │   │   │               │   ├── BiometricUnlocker.kt
 │   │   │   │               │   ├── HighRefreshRate.kt
-│   │   │   │               │   ├── RateRefreshWorker.kt
+│   │   │   │               │   └── RateRefreshWorker.kt
+│   │   │   │               ├── settings/
+│   │   │   │               │   ├── ColorSettings.kt
+│   │   │   │               │   ├── SettingsScreen.kt
+│   │   │   │               │   └── SettingsViewModel.kt
+│   │   │   │               ├── support/
+│   │   │   │               │   ├── HelpScreen.kt
 │   │   │   │               │   ├── SupportNavigator.kt
+│   │   │   │               │   ├── SupportSheet.kt
 │   │   │   │               │   └── SupportWebActivity.kt
-│   │   │   │               ├── presentation/
-│   │   │   │               │   ├── analytics/
-│   │   │   │               │   │   ├── AnalyticsScreen.kt
-│   │   │   │               │   │   ├── AnalyticsViewModel.kt
-│   │   │   │               │   │   └── CinematicCharts.kt
-│   │   │   │               │   ├── auth/
-│   │   │   │               │   │   ├── AuthenticationScreen.kt
-│   │   │   │               │   │   └── AuthViewModel.kt
-│   │   │   │               │   ├── bank/
-│   │   │   │               │   │   ├── BankScreen.kt
-│   │   │   │               │   │   └── BankViewModel.kt
-│   │   │   │               │   ├── common/
-│   │   │   │               │   │   ├── Components.kt
-│   │   │   │               │   │   └── ViewModelSupport.kt
-│   │   │   │               │   ├── dashboard/
-│   │   │   │               │   │   ├── ActivityChart.kt
-│   │   │   │               │   │   ├── CategoryDetails.kt
-│   │   │   │               │   │   ├── DashboardScreen.kt
-│   │   │   │               │   │   └── DashboardViewModel.kt
-│   │   │   │               │   ├── editor/
-│   │   │   │               │   │   ├── EntryScreen.kt
-│   │   │   │               │   │   └── EntryViewModel.kt
-│   │   │   │               │   ├── history/
-│   │   │   │               │   │   ├── HistoryScreen.kt
-│   │   │   │               │   │   └── HistoryViewModel.kt
-│   │   │   │               │   ├── onboarding/
-│   │   │   │               │   │   └── OnboardingScreen.kt
-│   │   │   │               │   ├── premium/
-│   │   │   │               │   │   ├── CatFaceMesh.kt
-│   │   │   │               │   │   ├── LiveCatMotion.kt
-│   │   │   │               │   │   ├── MeshCatRenderer.kt
-│   │   │   │               │   │   └── PremiumMascotAssistant.kt
-│   │   │   │               │   ├── settings/
-│   │   │   │               │   │   ├── ColorSettings.kt
-│   │   │   │               │   │   ├── SettingsScreen.kt
-│   │   │   │               │   │   └── SettingsViewModel.kt
-│   │   │   │               │   ├── support/
-│   │   │   │               │   │   ├── HelpScreen.kt
-│   │   │   │               │   │   └── SupportSheet.kt
-│   │   │   │               │   ├── theme/
-│   │   │   │               │   │   ├── AppearancePalette.kt
-│   │   │   │               │   │   └── Theme.kt
-│   │   │   │               │   ├── AppRoot.kt
-│   │   │   │               │   └── AppViewModel.kt
+│   │   │   │               ├── theme/
+│   │   │   │               │   ├── AppearancePalette.kt
+│   │   │   │               │   └── Theme.kt
 │   │   │   │               ├── voice/
-│   │   │   │               │   ├── FinanceQuery.kt
 │   │   │   │               │   ├── OptionalVoiceAssistant.kt
-│   │   │   │               │   ├── SpokenMoney.kt
+│   │   │   │               │   ├── SpokenMoneyFormatter.kt
 │   │   │   │               │   ├── VoiceEntryParser.kt
+│   │   │   │               │   ├── VoiceFinanceQuery.kt
 │   │   │   │               │   └── VoiceSmallTalk.kt
 │   │   │   │               ├── AppContainer.kt
 │   │   │   │               ├── LedgerApplication.kt
 │   │   │   │               └── MainActivity.kt
 │   │   │   ├── res/
+│   │   │   │   ├── drawable-nodpi/
+│   │   │   │   │   ├── cat_amber_base.webp
+│   │   │   │   │   └── cat_amber_sky.webp
 │   │   │   │   ├── drawable/
 │   │   │   │   │   ├── brand_sky.xml
+│   │   │   │   │   ├── ic_launcher_background.xml
 │   │   │   │   │   ├── ic_launcher_foreground.xml
 │   │   │   │   │   ├── ic_splash.xml
 │   │   │   │   │   ├── mascot_gray.xml
 │   │   │   │   │   └── mascot_sky.xml
-│   │   │   │   ├── drawable-nodpi/
-│   │   │   │   │   ├── cat_amber_base.webp
-│   │   │   │   │   └── cat_amber_sky.webp
 │   │   │   │   ├── mipmap-anydpi-v26/
 │   │   │   │   │   ├── ic_launcher.xml
 │   │   │   │   │   └── ic_launcher_round.xml
 │   │   │   │   ├── mipmap-anydpi-v33/
 │   │   │   │   │   ├── ic_launcher.xml
 │   │   │   │   │   └── ic_launcher_round.xml
-│   │   │   │   ├── values/
-│   │   │   │   │   ├── branding.xml
-│   │   │   │   │   ├── strings.xml
-│   │   │   │   │   └── themes.xml
+│   │   │   │   ├── mipmap-hdpi/
+│   │   │   │   │   ├── ic_launcher.webp
+│   │   │   │   │   └── ic_launcher_round.webp
+│   │   │   │   ├── mipmap-mdpi/
+│   │   │   │   │   ├── ic_launcher.webp
+│   │   │   │   │   └── ic_launcher_round.webp
+│   │   │   │   ├── mipmap-xhdpi/
+│   │   │   │   │   ├── ic_launcher.webp
+│   │   │   │   │   └── ic_launcher_round.webp
+│   │   │   │   ├── mipmap-xxhdpi/
+│   │   │   │   │   ├── ic_launcher.webp
+│   │   │   │   │   └── ic_launcher_round.webp
+│   │   │   │   ├── mipmap-xxxhdpi/
+│   │   │   │   │   ├── ic_launcher.webp
+│   │   │   │   │   └── ic_launcher_round.webp
 │   │   │   │   ├── values-night/
 │   │   │   │   │   └── themes.xml
 │   │   │   │   ├── values-uk/
 │   │   │   │   │   └── strings.xml
+│   │   │   │   ├── values/
+│   │   │   │   │   ├── branding.xml
+│   │   │   │   │   ├── colors.xml
+│   │   │   │   │   ├── strings.xml
+│   │   │   │   │   └── themes.xml
 │   │   │   │   └── xml/
+│   │   │   │       ├── backup_rules.xml
 │   │   │   │       ├── data_extraction_rules.xml
 │   │   │   │       └── network_security_config.xml
 │   │   │   └── AndroidManifest.xml
 │   │   └── test/
+│   │       ├── java/
+│   │       │   └── com/
+│   │       │       └── example/
+│   │       │           └── myapplication/
+│   │       │               └── ExampleUnitTest.kt
 │   │       └── kotlin/
 │   │           └── com/
 │   │               └── semmyx/
 │   │                   └── ledger/
-│   │                       ├── presentation/
-│   │                       │   ├── MainDispatcherRule.kt
-│   │                       │   └── ViewModelTest.kt
-│   │                       └── voice/
-│   │                           ├── CatFaceMeshTest.kt
-│   │                           ├── FinanceUpgradeTest.kt
-│   │                           └── OptionalVoiceAssistantParserTest.kt
+│   │                       ├── cat/
+│   │                       │   └── CatFaceMeshTest.kt
+│   │                       ├── voice/
+│   │                       │   ├── FinanceUpgradeTest.kt
+│   │                       │   └── OptionalVoiceAssistantParserTest.kt
+│   │                       ├── MainDispatcherRule.kt
+│   │                       └── ViewModelTest.kt
+│   ├── .gitignore
 │   ├── build.gradle.kts
 │   └── proguard-rules.pro
 ├── data/
 │   ├── schemas/
+│   │   ├── com.semmyx.ledger.data.local.LedgerDatabase/
+│   │   │   ├── 2.json
+│   │   │   └── 3.json
 │   │   └── README.md
 │   ├── src/
 │   │   ├── androidTest/
@@ -149,19 +182,20 @@ TGLedger-3.2.0/
 │   │   │   │       └── semmyx/
 │   │   │   │           └── ledger/
 │   │   │   │               └── data/
+│   │   │   │                   ├── bank/
+│   │   │   │                   │   ├── BankEntities.kt
+│   │   │   │                   │   └── BankImportRepository.kt
 │   │   │   │                   ├── billing/
 │   │   │   │                   │   ├── DeveloperSubscriptionVerifier.kt
 │   │   │   │                   │   ├── PlayPremiumRepository.kt
 │   │   │   │                   │   └── PurchaseSignatureVerifier.kt
 │   │   │   │                   ├── local/
-│   │   │   │                   │   ├── BankEntities.kt
-│   │   │   │                   │   ├── Entities.kt
 │   │   │   │                   │   ├── LedgerDao.kt
-│   │   │   │                   │   └── LedgerDatabase.kt
+│   │   │   │                   │   ├── LedgerDatabase.kt
+│   │   │   │                   │   └── LedgerEntities.kt
 │   │   │   │                   ├── remote/
 │   │   │   │                   │   └── RateApi.kt
 │   │   │   │                   ├── repository/
-│   │   │   │                   │   ├── BankImportRepository.kt
 │   │   │   │                   │   ├── DataStorePreferences.kt
 │   │   │   │                   │   ├── OfflineRateRepository.kt
 │   │   │   │                   │   └── RoomEntryRepository.kt
@@ -229,7 +263,8 @@ TGLedger-3.2.0/
 │   │               └── semmyx/
 │   │                   └── ledger/
 │   │                       └── domain/
-│   │                           ├── BankParserTest.kt
+│   │                           ├── bank/
+│   │                           │   └── BankParserTest.kt
 │   │                           ├── CinematicAnalyticsTest.kt
 │   │                           ├── ColorPreferencesTest.kt
 │   │                           ├── LedgerUseCasesTest.kt
@@ -240,10 +275,11 @@ TGLedger-3.2.0/
 ├── gradle/
 │   ├── wrapper/
 │   │   └── gradle-wrapper.properties
-│   └── bootstrap.ps1
+│   ├── bootstrap.ps1
+│   ├── gradle-daemon-jvm.properties
+│   └── libs.versions.toml
 ├── tools/
 │   ├── audit_project.py
-│   ├── developer_public_key.der
 │   ├── issue_activation_code.py
 │   ├── verify_bank_regex.py
 │   ├── verify_bank_sql.py

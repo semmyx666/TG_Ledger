@@ -43,6 +43,6 @@ Android build попытка остановилась на DNS загрузки 
 
 ## Где код
 
-`domain/.../bank`, `data/.../local`, `data/.../repository/BankImportRepository.kt`, `app/.../bank`, `app/.../presentation/bank`.
+`domain/.../bank`, `data/.../local`, `data/.../bank` (BankImportRepository, BankEntities), `app/.../bank`.
 
 Все файлы собраны в SOURCE_CODE.md; дерево в PROJECT_TREE.txt; контрольные суммы в MANIFEST.sha256. Раздел банков доступен после PIN. Банковский импорт не требует Plus. Проект сохраняет технический package/applicationId для совместимости данных и ключей.

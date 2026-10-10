@@ -30,3 +30,12 @@ reference, not an Android screenshot.
 390px widths. The reference shows onboarding, authentication, dashboard, editor,
 Ukrainian dark settings and support. Clipped actions and the copy icon were fixed
 before packaging. This validates only the static reference, not native Android UI.
+
+## Re-organisation check (folder restructure)
+
+After moving bank/cat/voice code into dedicated folders, the project was built with Gradle 9.6, JDK 25 and
+Android SDK 36: `:app:assemblePlayDebug`, `:app:compileLegacyV7DebugKotlin`, `:app:compilePlayDebugAndroidTestKotlin`,
+`:data:compilePlayDebugAndroidTestKotlin`, `:data:testLegacyV7DebugUnitTest`, `:domain:test` succeeded, and the Room schema
+files were unchanged. Two problems exist in the original code and are unrelated to the restructure:
+`data/src/play/.../BillingVersionAdapter.kt:18` does not compile as written (`offerToken` is `String?` in Billing 8.0.0; it was
+compiled here only with a temporary local `!!`), and `OptionalVoiceAssistantParserTest.recognizesAddEntryRequests` fails.

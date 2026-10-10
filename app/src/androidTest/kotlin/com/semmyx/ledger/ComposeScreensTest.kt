@@ -9,11 +9,11 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.semmyx.ledger.domain.AppLanguage
-import com.semmyx.ledger.presentation.auth.AuthState
-import com.semmyx.ledger.presentation.auth.AuthenticationScreen
-import com.semmyx.ledger.presentation.support.SupportSheet
-import com.semmyx.ledger.presentation.theme.LedgerTheme
-import com.semmyx.ledger.presentation.theme.LocalizedContent
+import com.semmyx.ledger.auth.AuthState
+import com.semmyx.ledger.auth.AuthenticationScreen
+import com.semmyx.ledger.support.SupportSheet
+import com.semmyx.ledger.theme.LedgerTheme
+import com.semmyx.ledger.theme.LocalizedContent
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test

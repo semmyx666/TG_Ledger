@@ -66,7 +66,7 @@ for file in kotlin:
             check(name in en, f'Resolved app string: {name}')
     if path.startswith('domain/src/main/'):
         check(not re.search(r'import (android\.|androidx\.|com\.semmyx\.ledger\.(data|presentation))', source), f'Pure domain boundary: {path}')
-    if '/presentation/' in path and path.endswith('ViewModel.kt'):
+    if path.startswith('app/src/main/') and path.endswith('ViewModel.kt'):
         check('com.semmyx.ledger.data.' not in source, f'Domain-only ViewModel dependencies: {path}')
     stack = []
     valid = True
@@ -86,7 +86,7 @@ for match in re.finditer(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:sus
     quoted, name = match.groups()
     query_map[name] = quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 
-entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/Entities.kt').read_text()
+entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt').read_text()
 body = re.search(r'data class EntryEntity\(([\s\S]*?)\n\)', entities).group(1)
 columns = re.findall(r'val (\w+): (\w+)(\?)?', body)
 types = {'String':'TEXT','Long':'INTEGER','Int':'INTEGER','Double':'REAL'}

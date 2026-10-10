@@ -56,13 +56,13 @@ Production-полірування: вбудувати ліцензований v
 ```
 domain/.../CinematicAnalytics.kt
   CategorySlice, CashBucket, AnalyticsMath.slices/buckets
-app/.../presentation/analytics/AnalyticsViewModel.kt
+app/.../analytics/AnalyticsViewModel.kt
   month/focus/limit → Room flows → AnalyticsState
-app/.../presentation/analytics/AnalyticsScreen.kt
+app/.../analytics/AnalyticsScreen.kt
   overview, month picker, category hero, full transaction list
-app/.../presentation/analytics/CinematicCharts.kt
+app/.../analytics/AnalyticsCharts.kt
   CascadeCard, Odometer, PremiumBars, PremiumDonut, design tokens
-app/.../presentation/premium/LiveCatMotion.kt
+app/.../cat/CatAnimation.kt
   CatPose, CatMotionController, CatRigDriver, CatAssetRenderer, lifecycle host
 app/.../platform/HighRefreshRate.kt
   supported display mode request; no pretend FPS guarantee
@@ -150,12 +150,12 @@ Production-перевірка:
 
 ## 8. Інтелект і голос
 
-Збережено шлях 2.0: верхній помічник → голосовий результат або текст → FinanceQuery → структурований запит → SQL → точний текст → TTS.
+Збережено шлях 2.0: верхній помічник → голосовий результат або текст → VoiceFinanceQuery → структурований запит → SQL → точний текст → TTS.
 
 Приклади працюють у локальній логіці:
 - «скажи витрати за місяць»;
 - «скажи витрати за місяць за продукти»;
-- «Скай, який баланс?» → `SpokenMoney`, явне «мінус», а не лише символ −.
+- «Скай, який баланс?» → `SpokenMoneyFormatter`, явне «мінус», а не лише символ −.
 
 Модель не генерує фінансові суми. Якщо потрібна повноцінна LLM: окремий inference worker/backend повертає JSON intent, після schema/period/category validation виконується SQL. Відповідь з числами формується з результату SQL. Не передавати транзакції у сторонній сервіс без явної згоди користувача. Поточний пакет не містить нейромоделі.
 

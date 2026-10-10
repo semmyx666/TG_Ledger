@@ -120,8 +120,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "3.1.1"
+        versionCode = 13
+        versionName = "3.2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -165,7 +165,10 @@ tasks.configureEach {
 
 dependencies {
     implementation(project(":domain"))
-    implementation(project(":data")) // Used only by the composition root / platform adapters.
+    implementation(project(":data"))
+    implementation(libs.androidx.appcompat)
+    implementation(libs.material)
+    androidTestImplementation(libs.androidx.espresso.core) // Used only by the composition root / platform adapters.
     val composeBom = platform("androidx.compose:compose-bom:2025.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
@@ -223,11 +226,11 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.semmyx.ledger.domain.AppLanguage
-import com.semmyx.ledger.presentation.auth.AuthState
-import com.semmyx.ledger.presentation.auth.AuthenticationScreen
-import com.semmyx.ledger.presentation.support.SupportSheet
-import com.semmyx.ledger.presentation.theme.LedgerTheme
-import com.semmyx.ledger.presentation.theme.LocalizedContent
+import com.semmyx.ledger.auth.AuthState
+import com.semmyx.ledger.auth.AuthenticationScreen
+import com.semmyx.ledger.support.SupportSheet
+import com.semmyx.ledger.theme.LedgerTheme
+import com.semmyx.ledger.theme.LocalizedContent
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -307,6 +310,9 @@ class ComposeScreensTest {
     <uses-permission android:name="com.android.vending.BILLING" />
     <!-- Only requested at runtime when a TG Plus subscriber taps the voice assistant button. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required on Android 13+ (API 33+) to post background import notifications. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <queries>
         <package android:name="org.telegram.messenger" />
         <package android:name="org.telegram.messenger.web" />
@@ -334,7 +340,7 @@ class ComposeScreensTest {
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.Ledger">
-        <activity android:name=".platform.SupportWebActivity" android:exported="false" />
+        <activity android:name=".support.SupportWebActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Ledger.Starting">
@@ -379,7 +385,7 @@ class AppContainer(context: Context, scope: CoroutineScope) {
     val clock: Clock = Clock.systemDefaultZone()
     private val database = LedgerDatabase.create(app)
     private val vault = KeystoreVault(app)
-    val bankImport = com.semmyx.ledger.data.repository.BankImportRepository(database, app)
+    val bankImport = com.semmyx.ledger.data.bank.BankImportRepository(database, app)
     val entries: EntryRepository = RoomEntryRepository(database.ledgerDao(), clock)
     val preferences: PreferencesRepository = DataStorePreferences(app, scope)
     val security: SecurityRepository = KeystoreSecurityRepository(app, vault, clock)
@@ -474,9 +480,9 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelProvider
 import com.semmyx.ledger.platform.HighRefreshRate
-import com.semmyx.ledger.presentation.AppRoot
-import com.semmyx.ledger.presentation.AppViewModel
-import com.semmyx.ledger.presentation.common.LedgerViewModelFactory
+import com.semmyx.ledger.navigation.AppRoot
+import com.semmyx.ledger.navigation.AppViewModel
+import com.semmyx.ledger.common.LedgerViewModelFactory
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
@@ -525,966 +531,10 @@ class MainActivity : FragmentActivity() {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt
 
 ```kotlin
-package com.semmyx.ledger.bank
-
-import android.app.Notification
-import android.service.notification.NotificationListenerService
-import android.service.notification.StatusBarNotification
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.domain.bank.Banks
-import kotlinx.coroutines.*
-
-class BankNotificationListener : NotificationListenerService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    override fun onListenerConnected() { (application as LedgerApplication).container.bankImport.connected(true) }
-    override fun onListenerDisconnected() {
-        (application as LedgerApplication).container.bankImport.connected(false)
-        NotificationListenerService.requestRebind(android.content.ComponentName(this, BankNotificationListener::class.java))
-    }
-    override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        sbn ?: return
-        val repository = (application as LedgerApplication).container.bankImport
-        val bank = repository.bankForPackage(sbn.packageName)
-        repository.note(if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED", sbn.packageName, notification = true, bankMessage = bank != null)
-        bank ?: return
-        val notification = sbn.notification
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
-        val extras = notification.extras
-        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = "$title\n$body".take(8001)
-        if (body.isBlank()) { repository.note("EMPTY_TEXT"); return }
-        if (!repository.enabled) { repository.note("DISABLED"); return }
-        scope.launch {
-            try {
-                repository.receive(bank, text, "PUSH:${sbn.packageName}:${sbn.key}:${sbn.postTime}:$text", sbn.postTime, "PUSH")
-            } catch (error: CancellationException) { throw error }
-            catch (_: Exception) { repository.note("ERROR"); android.util.Log.w("BankImport", "Local import failed; no message contents logged") }
-        }
-    }
-    override fun onDestroy() { (application as LedgerApplication).container.bankImport.connected(false); scope.cancel(); super.onDestroy() }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt
-
-```kotlin
-package com.semmyx.ledger.bank
-
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.provider.Telephony
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.domain.bank.Banks
-import kotlinx.coroutines.*
-
-/** Included in the legacyV7 sideload manifest only. Reads new messages, never the historical SMS inbox. */
-class BankSmsReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
-        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
-        if (messages.isEmpty()) return
-        val sender = messages.first().originatingAddress.orEmpty()
-        val bank = Banks.bySender(sender) ?: return
-        val repository = (context.applicationContext as LedgerApplication).container.bankImport
-        if (!repository.enabled) return
-        val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
-        val at = messages.minOf { it.timestampMillis }
-        val pending = goAsync()
-        (context.applicationContext as LedgerApplication).applicationScope.launch(Dispatchers.IO) {
-            try { withTimeout(7000) { repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS") } }
-            catch (error: CancellationException) { throw error }
-            catch (_: Exception) { android.util.Log.w("BankImport", "Local SMS import failed; no message contents logged") }
-            finally { pending.finish() }
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt
-
-```kotlin
-package com.semmyx.ledger.diagnostics
-
-import android.content.Context
-import java.io.File
-import java.io.PrintWriter
-import java.io.StringWriter
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-
-/**
- * Persists the most recent uncaught crash to app-internal storage so it survives the process
- * dying, and can be viewed later from Settings -> Support without needing adb/logcat access.
- *
- * Only the exception class name, message, and stack trace (file/line/method names) are stored --
- * never entry titles, PINs, purchase tokens, or other user data, matching the existing logging
- * rule in LedgerApplication.
- */
-object CrashLogger {
-    private const val FILE_NAME = "last_crash.txt"
-
-    /** Wraps the app's existing uncaught-exception handler so every fatal crash is saved first. */
-    fun install(context: Context) {
-        val appContext = context.applicationContext
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            try {
-                writeCrash(appContext, error)
-            } catch (_: Throwable) {
-                // The logger itself must never cause a second crash while handling the first.
-            }
-            previous?.uncaughtException(thread, error)
-        }
-    }
-
-    private fun writeCrash(context: Context, error: Throwable) {
-        val writer = StringWriter()
-        error.printStackTrace(PrintWriter(writer))
-        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
-        val text = "TG Ledger crash - $timestamp\n\n$writer"
-        File(context.filesDir, FILE_NAME).writeText(text)
-    }
-
-    /** Returns the saved crash report, if any, or null when the app hasn't crashed since it was last cleared. */
-    fun readLastCrash(context: Context): String? {
-        val file = File(context.filesDir, FILE_NAME)
-        return if (file.exists()) file.readText() else null
-    }
-
-    fun clear(context: Context) {
-        File(context.filesDir, FILE_NAME).delete()
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import androidx.biometric.BiometricManager
-import androidx.biometric.BiometricPrompt
-import androidx.core.content.ContextCompat
-import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.Lifecycle
-import com.semmyx.ledger.data.security.BiometricKeys
-import java.security.SecureRandom
-
-/** A callback without the crypto object is never sufficient to unlock. */
-class BiometricUnlocker(
-    private val activity: FragmentActivity,
-    private val keys: BiometricKeys,
-) {
-    private var prompt: BiometricPrompt? = null
-    fun authenticate(title: String, subtitle: String, negative: String, success: () -> Unit, failure: () -> Unit) {
-        try {
-            val cipher = keys.authenticationCipher()
-            val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            val biometricPrompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity),
-                object : BiometricPrompt.AuthenticationCallback() {
-                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                        try {
-                            val authenticated = requireNotNull(result.cryptoObject?.cipher)
-                            require(authenticated === cipher)
-                            authenticated.doFinal(challenge) // Keystore enforces a fresh strong-biometric auth.
-                            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) success()
-                        } catch (_: Exception) { failure() }
-                        finally { challenge.fill(0) }
-                    }
-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                        challenge.fill(0)
-                        if (errorCode != BiometricPrompt.ERROR_USER_CANCELED && errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON && errorCode != BiometricPrompt.ERROR_CANCELED) failure()
-                    }
-                    override fun onAuthenticationFailed() { failure() }
-                })
-            prompt = biometricPrompt
-            val info = BiometricPrompt.PromptInfo.Builder().setTitle(title).setSubtitle(subtitle)
-                .setNegativeButtonText(negative).setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                .setConfirmationRequired(true).build()
-            biometricPrompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
-        } catch (_: Exception) {
-            // Invalidated enrollment keys are not recreated at the lock screen; use the PIN.
-            failure()
-        }
-    }
-    fun cancel() { prompt?.cancelAuthentication(); prompt = null }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.app.Activity
-import android.view.Display
-import kotlin.math.abs
-
-object HighRefreshRate {
-    fun supported(display: Display?): Set<Int> {
-        if (display == null) return setOf(60)
-        val current = display.mode
-        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
-        return listOf(60, 90, 120).filter { rate -> modes.any { abs(it.refreshRate - rate) <= 1.1f } }.toSet()
-    }
-    fun request(activity: Activity, requestedHz: Int = 0) {
-        val display = activity.window.decorView.display ?: return
-        val current = display.mode
-        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
-        val exact = modes.filter { requestedHz > 0 && abs(it.refreshRate - requestedHz) <= 1.1f }.firstOrNull()
-        val selected = if (requestedHz == 0) null else (exact
-            ?: modes.filter { it.refreshRate <= requestedHz + 1.1f }.maxByOrNull { it.refreshRate }
-            ?: modes.minByOrNull { it.refreshRate })
-        activity.window.attributes = activity.window.attributes.apply {
-            // Auto releases the override back to Android, rather than forcing the maximum forever.
-            preferredDisplayModeId = selected?.modeId ?: 0
-            preferredRefreshRate = selected?.refreshRate ?: 0f
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.content.Context
-import androidx.work.*
-import com.semmyx.ledger.LedgerApplication
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CancellationException
-
-/** Only public rates are refreshed in the background; personal entries never leave Room. */
-class RateRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
-    override suspend fun doWork(): Result {
-        val container = (applicationContext as LedgerApplication).container
-        return try {
-            container.entries.purgeDeletedBefore(container.clock.millis() - TimeUnit.DAYS.toMillis(1))
-            container.rates.refresh()
-            Result.success()
-        } catch (error: Exception) {
-            if (error is CancellationException) throw error
-            if (runAttemptCount >= 4) Result.failure() else Result.retry()
-        }
-    }
-    companion object {
-        fun schedule(context: Context) {
-            val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).setRequiresBatteryNotLow(true).build()
-            val periodic = PeriodicWorkRequestBuilder<RateRefreshWorker>(24, TimeUnit.HOURS)
-                .setConstraints(constraints).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build()
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork("reference-rates", ExistingPeriodicWorkPolicy.UPDATE, periodic)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/SupportNavigator.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.app.Activity
-import android.content.ActivityNotFoundException
-import android.content.ComponentName
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-
-object SupportNavigator {
-    const val HANDLE = "@semmyxth"
-    const val WEB_URL = "https://t.me/semmyxth"
-    private val officialPackages = listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram")
-
-    fun open(activity: Activity) {
-        if (!openTelegram(activity)) activity.startActivity(Intent(activity, SupportWebActivity::class.java))
-    }
-    fun openTelegram(activity: Activity): Boolean {
-        for (packageName in officialPackages) {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=semmyxth")).setPackage(packageName)
-            @Suppress("DEPRECATION")
-            val resolved = activity.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo
-            if (resolved == null || !resolved.exported || resolved.packageName != packageName) continue
-            intent.component = ComponentName(resolved.packageName, resolved.name) // Explicit, not a hijackable chooser.
-            try {
-                activity.startActivity(intent)
-                return true
-            } catch (_: ActivityNotFoundException) {
-                // App could have been removed between resolution and launch; try the next official client.
-                continue
-            } catch (_: SecurityException) { continue }
-        }
-        return false
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/SupportWebActivity.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.annotation.SuppressLint
-import android.os.Bundle
-import android.view.ViewGroup
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.UserPreferences
-import com.semmyx.ledger.presentation.theme.LedgerTheme
-import com.semmyx.ledger.presentation.theme.LocalizedContent
-
-/** Non-exported HTTPS-only fallback. No JS bridge, file access, SSL bypass, or arbitrary URL input. */
-class SupportWebActivity : ComponentActivity() {
-    @OptIn(ExperimentalMaterial3Api::class)
-    @SuppressLint("SetJavaScriptEnabled")
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        setContent {
-            val prefs by (application as LedgerApplication).container.preferences.preferences
-                .collectAsStateWithLifecycle(initialValue = UserPreferences())
-            LocalizedContent(prefs.language) {
-                LedgerTheme(prefs.theme) {
-                    var error by remember { mutableStateOf(false) }
-                    var loading by remember { mutableStateOf(true) }
-                    var webView by remember { mutableStateOf<WebView?>(null) }
-                    BackHandler { if (webView?.canGoBack() == true) webView?.goBack() else finish() }
-                    DisposableEffect(Unit) {
-                        onDispose {
-                            webView?.let { view ->
-                                view.stopLoading()
-                                (view.parent as? ViewGroup)?.removeView(view)
-                                view.destroy()
-                            }
-                            webView = null
-                        }
-                    }
-                    Scaffold(topBar = {
-                        TopAppBar(title = { Text(stringResource(R.string.telegram_support)) }, navigationIcon = {
-                            IconButton(onClick = { finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
-                        })
-                    }) { padding ->
-                        Column(Modifier.fillMaxSize().padding(padding)) {
-                            if (loading && !error) LinearProgressIndicator(Modifier.fillMaxWidth())
-                            if (error) {
-                                Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    Text(stringResource(R.string.support_network_error))
-                                    Button(onClick = { error = false; loading = true; webView?.loadUrl(SupportNavigator.WEB_URL) }) {
-                                        Text(stringResource(R.string.retry))
-                                    }
-                                }
-                            }
-                            AndroidView(modifier = Modifier.fillMaxWidth().weight(1f), factory = { context ->
-                                WebView(context).apply {
-                                    settings.javaScriptEnabled = false
-                                    settings.allowFileAccess = false
-                                    settings.allowContentAccess = false
-                                    settings.domStorageEnabled = false
-                                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                                    settings.safeBrowsingEnabled = true
-                                    webViewClient = object : WebViewClient() {
-                                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                                            val uri = request.url
-                                            if (uri.scheme == "tg" && request.hasGesture()) {
-                                                SupportNavigator.openTelegram(this@SupportWebActivity)
-                                                return true
-                                            }
-                                            return uri.scheme != "https" || uri.host != "t.me"
-                                        }
-                                        override fun onPageFinished(view: WebView, url: String) { loading = false }
-                                        override fun onReceivedError(view: WebView, request: WebResourceRequest, failure: WebResourceError) {
-                                            if (request.isForMainFrame) { error = true; loading = false }
-                                        }
-                                    }
-                                    webView = this
-                                    loadUrl(SupportNavigator.WEB_URL)
-                                }
-                            })
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/AppRoot.kt
-
-```kotlin
-package com.semmyx.ledger.presentation
-
-import android.content.Intent
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.LocalActivityResultRegistryOwner
-import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
-import com.semmyx.ledger.presentation.history.*
-import java.time.YearMonth
-import androidx.activity.result.ActivityResultLauncher
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.core.view.WindowCompat
-import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.ViewModelStoreOwner
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.compose.LifecycleResumeEffect
-import com.semmyx.ledger.platform.HighRefreshRate
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavType
-import androidx.navigation.compose.*
-import androidx.navigation.navArgument
-import com.semmyx.ledger.AppContainer
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.ThemeMode
-import com.semmyx.ledger.platform.BiometricUnlocker
-import com.semmyx.ledger.platform.SupportNavigator
-import com.semmyx.ledger.presentation.auth.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.dashboard.*
-import com.semmyx.ledger.presentation.analytics.*
-import com.semmyx.ledger.presentation.bank.*
-import com.semmyx.ledger.presentation.editor.*
-import com.semmyx.ledger.presentation.onboarding.OnboardingScreen
-import com.semmyx.ledger.presentation.settings.*
-import com.semmyx.ledger.presentation.support.*
-import com.semmyx.ledger.presentation.theme.*
-
-@Composable
-fun AppRoot(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
-    CompositionLocalProvider(LocalActivityResultRegistryOwner provides host, LocalOnBackPressedDispatcherOwner provides host) {
-        AppRootContent(host, model, container)
-    }
-}
-
-@Composable
-private fun AppRootContent(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
-    val state by model.state.collectAsStateWithLifecycle()
-    LifecycleResumeEffect(state.preferences.refreshRateHz) {
-        HighRefreshRate.request(host, state.preferences.refreshRateHz)
-        onPauseOrDispose { }
-    }
-    var supportVisible by remember { mutableStateOf(false) }
-    // Registered unconditionally here, in AppRoot's very first composition (before the PIN
-    // screen even shows), never inside the Dashboard graph. An Activity Result launcher must be
-    // registered before the host Activity passes STARTED; the Dashboard route is only entered
-    // after the user unlocks with their PIN -- long after the Activity is already STARTED -- so
-    // registering it there always throws "LifecycleOwners must call register before they are
-    // STARTED", whether that registration sits inside a lazy list item or at the top of the
-    // screen. Only the *handling* of a result is Dashboard-specific, so that part is supplied
-    // later via a mutable callback the Dashboard route swaps in once it has real data.
-    var onSpeechResult by remember { mutableStateOf<(Intent?) -> Unit>({}) }
-    var onMicPermissionResult by remember { mutableStateOf<(Boolean) -> Unit>({}) }
-    val speechRecognizerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result -> onSpeechResult(result.data) }
-    val micPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> onMicPermissionResult(granted) }
-    LocalizedContent(state.preferences.language) {
-        LedgerTheme(state.preferences.theme, state.preferences.colorOverrides) {
-            val dark = when (state.preferences.theme) {
-                ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false
-            }
-            SideEffect {
-                WindowCompat.getInsetsController(host.window, host.window.decorView).apply {
-                    isAppearanceLightStatusBars = !dark
-                    isAppearanceLightNavigationBars = !dark
-                }
-            }
-            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                // Never cross-fade private content into a lock screen.
-                when {
-                    !state.ready -> LoadingState()
-                    state.failed -> Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                        EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.security_error), stringResource(R.string.retry), model::retry)
-                        TextButton(onClick = { supportVisible = true }) { Text(stringResource(R.string.need_help)) }
-                    }
-                    !state.preferences.onboardingComplete -> OnboardingScreen(model::completeOnboarding)
-                    !state.unlocked -> AuthenticationRoute(host, container, state, onUnlock = {
-                        if (host.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) model.unlock()
-                    }, onSupport = { supportVisible = true })
-                    else -> UnlockedGraph(host, container, state, model::lock, { container.billing.launchPurchase(host) }, { supportVisible = true },
-                        speechRecognizerLauncher, micPermissionLauncher, { onSpeechResult = it }, { onMicPermissionResult = it })
-                }
-                if (supportVisible) SupportSheet(onDismiss = { supportVisible = false }, onContact = {
-                    supportVisible = false
-                    SupportNavigator.open(host)
-                })
-            }
-        }
-    }
-}
-
-@Composable
-private fun AuthenticationRoute(host: FragmentActivity, container: AppContainer, appState: AppState, onUnlock: () -> Unit, onSupport: () -> Unit) {
-    // The auth-attempt owner is disposed on background lock; cancellation wipes PIN buffers.
-    val store = remember(appState.lockEpoch) { ViewModelStore() }
-    val owner = remember(store) { object : ViewModelStoreOwner { override val viewModelStore = store } }
-    DisposableEffect(store) { onDispose { store.clear() } }
-    val model: AuthViewModel = viewModel(viewModelStoreOwner = owner, factory = LedgerViewModelFactory(AuthViewModel::class.java) {
-        AuthViewModel(!appState.hasPin, container.security)
-    })
-    val auth by model.state.collectAsStateWithLifecycle()
-    val unlocker = remember(store, host) { BiometricUnlocker(host, container.biometricKeys) }
-    DisposableEffect(unlocker) { onDispose { unlocker.cancel() } }
-    LaunchedEffect(model) { model.unlocked.collect { onUnlock() } }
-    val title = stringResource(R.string.biometric_title)
-    val subtitle = stringResource(R.string.biometric_subtitle)
-    val negative = stringResource(R.string.use_pin)
-    AuthenticationScreen(auth, appState.preferences.biometricsEnabled && container.biometricAvailable(), model::digit, model::erase,
-        model::startOver, onBiometric = { unlocker.authenticate(title, subtitle, negative, onUnlock, model::biometricFailed) }, onSupport = onSupport)
-}
-
-@Composable
-private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appState: AppState, onLock: () -> Unit, onPurchase: () -> Unit, onSupport: () -> Unit,
-    speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
-    setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit) {
-    val nav = rememberNavController()
-    val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
-    val onNavigate: (Int) -> Unit = { index ->
-        nav.navigate(routes[index]) {
-            popUpTo("dashboard") { saveState = true }
-            launchSingleTop = true
-            restoreState = true
-        }
-    }
-    NavHost(navController = nav, startDestination = "dashboard") {
-        composable("dashboard") {
-            val model: DashboardViewModel = viewModel(factory = LedgerViewModelFactory(DashboardViewModel::class.java) {
-                DashboardViewModel(container.entries, container.preferences, container.premium, container.observeDashboard, container.clock, container.saveEntry)
-            })
-            DashboardRoute(model, host, onNavigate, onAdd = { nav.navigate("entry/new") }, onEdit = { nav.navigate("entry/$it") },
-                speechRecognizerLauncher = speechRecognizerLauncher, micPermissionLauncher = micPermissionLauncher,
-                setOnSpeechResult = setOnSpeechResult, setOnMicPermissionResult = setOnMicPermissionResult)
-        }
-        composable("settings") {
-            val model: SettingsViewModel = viewModel(factory = LedgerViewModelFactory(SettingsViewModel::class.java) {
-                SettingsViewModel(container.preferences, container.premium, container.rates, container::configureBiometrics)
-            })
-            SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
-        }
-        composable("help") { HelpScreen(onNavigate, onSupport) }
-        composable("analytics") {
-            val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
-                AnalyticsViewModel(container.entries, container.preferences, container.clock)
-            })
-            AnalyticsRoute(model, onBack = { onNavigate(0) }, onCurrency = { onNavigate(1) },
-                onEdit = { nav.navigate("entry/$it") },
-                onHistory = { month -> nav.navigate(if (month == null) "history" else "history?month=$month") })
-        }
-        composable("history?month={month}", arguments = listOf(navArgument("month") { type = NavType.StringType; nullable = true; defaultValue = null })) { backStack ->
-            val month = backStack.arguments?.getString("month")?.let { value -> runCatching { YearMonth.parse(value) }.getOrNull() }
-            val historyModel: HistoryViewModel = viewModel(factory = LedgerViewModelFactory(HistoryViewModel::class.java) {
-                HistoryViewModel(container.entries, container.preferences, container.clock, month)
-            })
-            HistoryScreen(historyModel, onBack = { nav.popBackStack() }, onEdit = { nav.navigate("entry/$it") })
-        }
-        composable("banks") {
-            val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
-                BankViewModel(container.bankImport, container.preferences, container.clock)
-            })
-            BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
-                onEdit = { nav.navigate("entry/$it") })
-        }
-        composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
-            val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }
-            val model: EntryViewModel = viewModel(factory = LedgerViewModelFactory(EntryViewModel::class.java) {
-                EntryViewModel(id, container.entries, container.preferences, container.saveEntry, container.clock)
-            })
-            val categories by container.bankImport.categories().collectAsStateWithLifecycle(initialValue = emptyList())
-            EntryRoute(model, appState.preferences.language, onBack = { nav.popBackStack() }, customCategories = categories)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/AppViewModel.kt
-
-```kotlin
-package com.semmyx.ledger.presentation
-
-import androidx.lifecycle.ViewModel
-import com.semmyx.ledger.domain.PreferencesRepository
-import com.semmyx.ledger.domain.SecurityRepository
-import com.semmyx.ledger.domain.UserPreferences
-import com.semmyx.ledger.presentation.common.guarded
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-
-data class AppState(
-    val ready: Boolean = false,
-    val preferences: UserPreferences = UserPreferences(),
-    val hasPin: Boolean = false,
-    val unlocked: Boolean = false,
-    val failed: Boolean = false,
-    val lockEpoch: Long = 0,
-)
-
-class AppViewModel(private val preferences: PreferencesRepository, private val security: SecurityRepository) : ViewModel() {
-    private val mutableState = MutableStateFlow(AppState())
-    val state = mutableState.asStateFlow()
-    private var bootstrap: Job? = null
-    init { retry() }
-
-    fun retry() {
-        bootstrap?.cancel()
-        mutableState.value = AppState()
-        bootstrap = guarded(onError = { mutableState.update { it.copy(ready = true, failed = true, unlocked = false) } }) {
-            val configured = security.hasPin()
-            mutableState.update { it.copy(hasPin = configured) }
-            preferences.preferences.collect { prefs ->
-                mutableState.update { it.copy(ready = true, preferences = prefs, failed = false) }
-            }
-        }
-    }
-    fun completeOnboarding() {
-        guarded(onError = { mutableState.update { it.copy(failed = true) } }) { preferences.completeOnboarding() }
-    }
-    /** Called only by the PIN verifier event or a successful crypto-bound biometric callback. */
-    fun unlock() { mutableState.update { it.copy(unlocked = true, hasPin = true) } }
-    fun lock() { mutableState.update { it.copy(unlocked = false, lockEpoch = it.lockEpoch + 1) } }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/AnalyticsScreen.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
-
-import androidx.activity.compose.BackHandler
-import androidx.compose.animation.*
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import java.time.YearMonth
-import java.time.format.DateTimeFormatter
-import java.util.Locale
-import kotlin.math.abs
-
-@Composable
-fun AnalyticsRoute(model: AnalyticsViewModel, onBack: () -> Unit, onCurrency: () -> Unit, onEdit: (String) -> Unit, onHistory: (YearMonth?) -> Unit) {
-    val state by model.state.collectAsStateWithLifecycle()
-    AnalyticsScreen(state, onBack, onCurrency, model::month, model::focus, model::more, model::retry, onEdit, onHistory = { onHistory(state.month) })
-}
-
-@OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
-@Composable
-fun AnalyticsScreen(state: AnalyticsState, onBack: () -> Unit, onCurrency: () -> Unit,
-    onMonth: (YearMonth?) -> Unit, onFocus: (AnalyticsFocus?) -> Unit, onMore: () -> Unit,
-    onRetry: () -> Unit, onEdit: (String) -> Unit, onHistory: () -> Unit) {
-    var monthPicker by remember { mutableStateOf(false) }
-    BackHandler(state.focus != null) { onFocus(null) }
-    val locale = Locale.forLanguageTag(state.preferences.language.tag)
-    val monthLabel = state.month?.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)) ?: stringResource(R.string.all_time)
-    if (monthPicker) {
-        var draft by remember(state.month) { mutableStateOf(state.month ?: YearMonth.now()) }
-        AlertDialog(onDismissRequest = { monthPicker = false }, title = { Text(stringResource(R.string.cinematic_period)) },
-            text = {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(draft.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)))
-                    Row {
-                        TextButton(onClick = { if (draft > YearMonth.of(2000, 1)) draft = draft.minusMonths(1) }) { Text("‹") }
-                        TextButton(onClick = { if (draft < YearMonth.now()) draft = draft.plusMonths(1) }) { Text("›") }
-                    }
-                    TextButton(onClick = { onMonth(null); monthPicker = false }) { Text(stringResource(R.string.all_time)) }
-                }
-            }, confirmButton = { TextButton(onClick = { onMonth(draft); monthPicker = false }) { Text(stringResource(R.string.cinematic_apply)) } },
-            dismissButton = { TextButton(onClick = { monthPicker = false }) { Text(stringResource(R.string.back)) } })
-    }
-    Surface(color = CinematicTokens.Background, contentColor = MaterialTheme.colorScheme.onSurface, modifier = Modifier.fillMaxSize()) {
-        SharedTransitionLayout(Modifier.fillMaxSize()) {
-            AnimatedContent(targetState = state.focus, label = "categoryHero", transitionSpec = {
-                fadeIn(tween(380)) togetherWith fadeOut(tween(240))
-            }) { focus ->
-                val scope = this
-                if (focus == null) {
-                    LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(22.dp)) {
-                        item {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.back)) }
-                                Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.weight(1f)) {
-                                    Row(Modifier.padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        TextButton(onClick = onHistory, modifier = Modifier.weight(1f)) { Icon(Icons.Default.History, null); Text(stringResource(R.string.cinematic_history)) }
-                                        Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .15f), modifier = Modifier.weight(1f)) {
-                                            Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.Center) {
-                                                Icon(Icons.Default.BarChart, null, tint = CinematicTokens.Accent)
-                                                Text(stringResource(R.string.analytics_title), color = CinematicTokens.Accent)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                OutlinedButton(onClick = { monthPicker = true }) { Text(monthLabel); Icon(Icons.Default.CalendarMonth, null) }
-                                OutlinedButton(onClick = onCurrency) { Text(state.preferences.currency.name); Icon(Icons.Default.Payments, null) }
-                            }
-                        }
-                        if (state.loading) item { LoadingState(Modifier.height(200.dp)) }
-                        else if (state.failed) item { EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry) }
-                        else {
-                            item {
-                                CascadeCard(0) {
-                                    Text(stringResource(R.string.cinematic_expenses_period, monthLabel), color = CinematicTokens.Muted)
-                                    Odometer(-state.expenseMinor, state.preferences.currency, state.preferences.language, color = CinematicTokens.Expense)
-                                    state.previousExpenseMinor?.let { previous ->
-                                        val delta = state.expenseMinor - previous
-                                        Text(stringResource(R.string.cinematic_comparison, formatReferenceMoney(abs(delta), state.preferences.currency, state.preferences.language)),
-                                            color = if (delta > 0) CinematicTokens.Expense else CinematicTokens.Income)
-                                        Text(stringResource(if (delta > 0) R.string.cinematic_more_than_previous else R.string.cinematic_less_than_previous), color = CinematicTokens.Muted)
-                                    }
-                                    PremiumBars(state.buckets, state.preferences.currency, state.preferences.language)
-                                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text(stringResource(if (state.month == null) R.string.cinematic_month_average else R.string.cinematic_week_average),
-                                            modifier = Modifier.fillMaxWidth(), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodyMedium)
-                                        Text(formatReferenceMoney(if (state.buckets.isEmpty()) 0 else state.expenseMinor / state.buckets.size,
-                                            state.preferences.currency, state.preferences.language),
-                                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                            maxLines = 1, softWrap = false, color = CinematicTokens.Expense,
-                                            style = MaterialTheme.typography.headlineSmall)
-                                    }
-                                }
-                            }
-                            listOf(EntryType.EXPENSE, EntryType.INCOME).forEachIndexed { index, type ->
-                                item(key = type) {
-                                    val hero = Modifier.sharedBounds(rememberSharedContentState("focus-$type-all"), scope)
-                                    CascadeCard(index + 1, hero) {
-                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                            Text(stringResource(if (type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(type))
-                                            TextButton(onClick = { onFocus(AnalyticsFocus(type)) }) { Text(stringResource(R.string.cinematic_more), color = CinematicTokens.Accent) }
-                                        }
-                                        val slices = AnalyticsMath.slices(state.totals, type)
-                                        if (slices.isEmpty()) Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted)
-                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            slices.take(4).forEach { slice ->
-                                                val tint = CinematicTokens.category(slice.category, type == EntryType.INCOME)
-                                                Column(Modifier.weight(1f).sharedBounds(rememberSharedContentState("focus-$type-${slice.category}"), scope)
-                                                    .clickable { onFocus(AnalyticsFocus(type, slice.category)) }, horizontalAlignment = Alignment.CenterHorizontally) {
-                                                    Box(Modifier.size(48.dp).background(tint.copy(alpha = .14f), CircleShape), contentAlignment = Alignment.Center) {
-                                                        Icon(slice.category.icon(), stringResource(slice.category.label()), tint = tint)
-                                                    }
-                                                    Spacer(Modifier.height(6.dp))
-                                                    Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor,
-                                                        state.preferences.currency, state.preferences.language), style = MaterialTheme.typography.labelSmall,
-                                                        color = if (type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
-                                                    Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted,
-                                                        style = MaterialTheme.typography.labelSmall)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    val key = "focus-${focus.type}-${focus.category ?: "all"}"
-                    Surface(Modifier.fillMaxSize().sharedBounds(rememberSharedContentState(key), scope), color = CinematicTokens.Background) {
-                        val slices = AnalyticsMath.slices(state.totals, focus.type)
-                        val selected = slices.find { it.category == focus.category }
-                        val total = slices.sumOf { it.minor }
-                        LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
-                            verticalArrangement = Arrangement.spacedBy(20.dp)) {
-                            item {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    IconButton(onClick = { onFocus(null) }) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
-                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.expenses else R.string.income), style = MaterialTheme.typography.headlineSmall)
-                                }
-                                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text(stringResource(R.string.reference_total_for, monthLabel), color = CinematicTokens.Muted)
-                                    Odometer(if (focus.type == EntryType.INCOME) total else -total,
-                                        state.preferences.currency, state.preferences.language,
-                                        if (focus.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense, positiveSign = focus.type == EntryType.INCOME)
-                                }
-                                PremiumDonut(slices, focus.type, focus.category, state.preferences.currency, state.preferences.language) { category ->
-                                    onFocus(AnalyticsFocus(focus.type, category))
-                                }
-                            }
-                            item {
-                                CascadeCard(0) {
-                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(focus.type))
-                                    slices.forEachIndexed { index, slice ->
-                                        CategoryRow(slice, focus.type, state) { onFocus(AnalyticsFocus(focus.type, slice.category)) }
-                                        if (index != slices.lastIndex) HorizontalDivider(Modifier.padding(start = 58.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                                    }
-                                }
-                            }
-                            item {
-                                Text(focus.category?.let { stringResource(it.label()) } ?: stringResource(R.string.all_categories), style = MaterialTheme.typography.titleLarge)
-                                Text(stringResource(R.string.cinematic_transactions), color = CinematicTokens.Muted)
-                            }
-                            if (state.transactions.isEmpty()) item { Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted) }
-                            items(state.transactions, key = { it.id }) { entry ->
-                                Surface(shape = RoundedCornerShape(16.dp), color = CinematicTokens.Surface,
-                                    modifier = Modifier.fillMaxWidth().clickable { onEdit(entry.id) }) {
-                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text(entry.title); Text(formatDate(entry.date, state.preferences.language), color = CinematicTokens.Muted)
-                                        Text(formatReferenceMoney(if (entry.type == EntryType.INCOME) entry.amountMinor else -entry.amountMinor,
-                                            entry.currency, state.preferences.language), color = if (entry.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
-                                        if (entry.note.isNotBlank()) Text(entry.note, color = CinematicTokens.Muted)
-                                    }
-                                }
-                            }
-                            if (state.canLoadMore) item { TextButton(onClick = onMore) { Text(stringResource(R.string.load_more)) } }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CategoryRow(slice: CategorySlice, type: EntryType, state: AnalyticsState,
-    modifier: Modifier = Modifier, onClick: () -> Unit) {
-    val color = CinematicTokens.category(slice.category, type == EntryType.INCOME)
-    Row(modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Box(Modifier.size(46.dp).background(color.copy(alpha = .12f), CircleShape), contentAlignment = Alignment.Center) {
-            Icon(slice.category.icon(), null, tint = color)
-        }
-        Column(Modifier.weight(1f)) {
-            Text(stringResource(slice.category.label()))
-            Text(stringResource(R.string.category_transaction_count, slice.count), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
-        }
-        Column(horizontalAlignment = Alignment.End) {
-            Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor, state.preferences.currency, state.preferences.language), color = LocalAppearance.current.type(type))
-            Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/AnalyticsViewModel.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
-
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.semmyx.ledger.domain.*
-import java.time.Clock
-import java.time.LocalDate
-import java.time.YearMonth
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
-
-data class AnalyticsFocus(val type: EntryType, val category: Category? = null)
-data class AnalyticsState(
-    val preferences: UserPreferences = UserPreferences(),
-    val month: YearMonth? = null,
-    val totals: List<CategoryTotal> = emptyList(),
-    val buckets: List<CashBucket> = emptyList(),
-    val previousExpenseMinor: Long? = null,
-    val focus: AnalyticsFocus? = null,
-    val transactions: List<LedgerEntry> = emptyList(),
-    val canLoadMore: Boolean = false,
-    val loading: Boolean = true,
-    val failed: Boolean = false,
-) {
-    val expenseMinor: Long get() = totals.sumOf { it.expenseMinor }
-    val incomeMinor: Long get() = totals.sumOf { it.incomeMinor }
-}
-private data class AnalyticsSpec(val month: YearMonth?, val focus: AnalyticsFocus? = null, val limit: Int = 50, val retry: Int = 0)
-
-@OptIn(ExperimentalCoroutinesApi::class)
-class AnalyticsViewModel(private val repository: EntryRepository, preferences: PreferencesRepository,
-    private val clock: Clock) : ViewModel() {
-    private val spec = MutableStateFlow(AnalyticsSpec(YearMonth.now(clock)))
-    private val today = flow {
-        while (true) {
-            val day = LocalDate.now(clock); emit(day)
-            delay((day.plusDays(1).atStartOfDay(clock.zone).toInstant().toEpochMilli() - clock.millis()).coerceAtLeast(1000))
-        }
-    }
-    val state = combine(preferences.preferences, spec, today) { prefs, request, day -> Triple(prefs, request, day) }
-        .flatMapLatest { (prefs, request, day) ->
-            val from = request.month?.atDay(1) ?: FinanceWindow.EARLIEST
-            val through = minOf(request.month?.atEndOfMonth() ?: day, day)
-            val previous = request.month?.minusMonths(1)
-            // For the current month compare equal elapsed days, not partial month vs full past month.
-            val previousThrough = previous?.let { if (request.month == YearMonth.from(day))
-                it.atDay(day.dayOfMonth.coerceAtMost(it.lengthOfMonth())) else it.atEndOfMonth() }
-            val comparison = if (previous != null && previousThrough != null)
-                repository.observeCategoryTotals(prefs.currency, previous.atDay(1), previousThrough).map { rows -> rows.sumOf { it.expenseMinor } }
-                else flowOf<Long?>(null)
-            val detail = request.focus?.let { focus -> repository.observeEntries(EntryFilter(prefs.currency,
-                type = focus.type, limit = request.limit + 1, category = focus.category, from = from, through = through)) }
-                ?: flowOf(emptyList<LedgerEntry>())
-            combine(repository.observeCategoryTotals(prefs.currency, from, through),
-                repository.observeActivity(prefs.currency, from, through), comparison, detail) { totals, activity, prior, entries ->
-                AnalyticsState(prefs, request.month, totals, AnalyticsMath.buckets(activity, request.month, through), prior,
-                    request.focus, entries.take(request.limit), entries.size > request.limit, loading = false)
-            }.catch { e ->
-                if (e is CancellationException) throw e
-                emit(AnalyticsState(preferences = prefs, month = request.month, focus = request.focus, loading = false, failed = true))
-            }
-        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AnalyticsState(month = YearMonth.now(clock)))
-    fun month(value: YearMonth?) { if (value == null || value in YearMonth.of(2000, 1)..YearMonth.now(clock)) spec.update { it.copy(month = value, limit = 50) } }
-    fun focus(value: AnalyticsFocus?) { spec.update { it.copy(focus = value, limit = 50) } }
-    fun more() { spec.update { it.copy(limit = if (it.limit < Int.MAX_VALUE - 51) it.limit + 50 else Int.MAX_VALUE - 1) } }
-    fun retry() { spec.update { it.copy(retry = it.retry + 1) } }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/CinematicCharts.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
+package com.semmyx.ledger.analytics
 
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -1513,10 +563,10 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import kotlinx.coroutines.delay
 import java.math.BigDecimal
 import java.text.NumberFormat
@@ -1744,17 +794,319 @@ fun formatReferenceMoney(minor: Long, currency: LedgerCurrency, language: AppLan
 fun percent(basisPoints: Int, language: AppLanguage): String = if (basisPoints == 10000) "100%" else String.format(Locale.forLanguageTag(language.tag), "%.2f%%", basisPoints / 100.0)
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/auth/AuthViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.auth
+package com.semmyx.ledger.analytics
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.semmyx.ledger.theme.LocalAppearance
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.common.*
+import java.time.YearMonth
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import kotlin.math.abs
+
+@Composable
+fun AnalyticsRoute(model: AnalyticsViewModel, onBack: () -> Unit, onCurrency: () -> Unit, onEdit: (String) -> Unit, onHistory: (YearMonth?) -> Unit) {
+    val state by model.state.collectAsStateWithLifecycle()
+    AnalyticsScreen(state, onBack, onCurrency, model::month, model::focus, model::more, model::retry, onEdit, onHistory = { onHistory(state.month) })
+}
+
+@OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun AnalyticsScreen(state: AnalyticsState, onBack: () -> Unit, onCurrency: () -> Unit,
+    onMonth: (YearMonth?) -> Unit, onFocus: (AnalyticsFocus?) -> Unit, onMore: () -> Unit,
+    onRetry: () -> Unit, onEdit: (String) -> Unit, onHistory: () -> Unit) {
+    var monthPicker by remember { mutableStateOf(false) }
+    BackHandler(state.focus != null) { onFocus(null) }
+    val locale = Locale.forLanguageTag(state.preferences.language.tag)
+    val monthLabel = state.month?.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)) ?: stringResource(R.string.all_time)
+    if (monthPicker) {
+        var draft by remember(state.month) { mutableStateOf(state.month ?: YearMonth.now()) }
+        AlertDialog(onDismissRequest = { monthPicker = false }, title = { Text(stringResource(R.string.cinematic_period)) },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(draft.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)))
+                    Row {
+                        TextButton(onClick = { if (draft > YearMonth.of(2000, 1)) draft = draft.minusMonths(1) }) { Text("‹") }
+                        TextButton(onClick = { if (draft < YearMonth.now()) draft = draft.plusMonths(1) }) { Text("›") }
+                    }
+                    TextButton(onClick = { onMonth(null); monthPicker = false }) { Text(stringResource(R.string.all_time)) }
+                }
+            }, confirmButton = { TextButton(onClick = { onMonth(draft); monthPicker = false }) { Text(stringResource(R.string.cinematic_apply)) } },
+            dismissButton = { TextButton(onClick = { monthPicker = false }) { Text(stringResource(R.string.back)) } })
+    }
+    Surface(color = CinematicTokens.Background, contentColor = MaterialTheme.colorScheme.onSurface, modifier = Modifier.fillMaxSize()) {
+        SharedTransitionLayout(Modifier.fillMaxSize()) {
+            AnimatedContent(targetState = state.focus, label = "categoryHero", transitionSpec = {
+                fadeIn(tween(380)) togetherWith fadeOut(tween(240))
+            }) { focus ->
+                val scope = this
+                if (focus == null) {
+                    LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(22.dp)) {
+                        item {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.back)) }
+                                Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.weight(1f)) {
+                                    Row(Modifier.padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        TextButton(onClick = onHistory, modifier = Modifier.weight(1f)) { Icon(Icons.Default.History, null); Text(stringResource(R.string.cinematic_history)) }
+                                        Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .15f), modifier = Modifier.weight(1f)) {
+                                            Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.Center) {
+                                                Icon(Icons.Default.BarChart, null, tint = CinematicTokens.Accent)
+                                                Text(stringResource(R.string.analytics_title), color = CinematicTokens.Accent)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                OutlinedButton(onClick = { monthPicker = true }) { Text(monthLabel); Icon(Icons.Default.CalendarMonth, null) }
+                                OutlinedButton(onClick = onCurrency) { Text(state.preferences.currency.name); Icon(Icons.Default.Payments, null) }
+                            }
+                        }
+                        if (state.loading) item { LoadingState(Modifier.height(200.dp)) }
+                        else if (state.failed) item { EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry) }
+                        else {
+                            item {
+                                CascadeCard(0) {
+                                    Text(stringResource(R.string.cinematic_expenses_period, monthLabel), color = CinematicTokens.Muted)
+                                    Odometer(-state.expenseMinor, state.preferences.currency, state.preferences.language, color = CinematicTokens.Expense)
+                                    state.previousExpenseMinor?.let { previous ->
+                                        val delta = state.expenseMinor - previous
+                                        Text(stringResource(R.string.cinematic_comparison, formatReferenceMoney(abs(delta), state.preferences.currency, state.preferences.language)),
+                                            color = if (delta > 0) CinematicTokens.Expense else CinematicTokens.Income)
+                                        Text(stringResource(if (delta > 0) R.string.cinematic_more_than_previous else R.string.cinematic_less_than_previous), color = CinematicTokens.Muted)
+                                    }
+                                    PremiumBars(state.buckets, state.preferences.currency, state.preferences.language)
+                                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(stringResource(if (state.month == null) R.string.cinematic_month_average else R.string.cinematic_week_average),
+                                            modifier = Modifier.fillMaxWidth(), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodyMedium)
+                                        Text(formatReferenceMoney(if (state.buckets.isEmpty()) 0 else state.expenseMinor / state.buckets.size,
+                                            state.preferences.currency, state.preferences.language),
+                                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                            maxLines = 1, softWrap = false, color = CinematicTokens.Expense,
+                                            style = MaterialTheme.typography.headlineSmall)
+                                    }
+                                }
+                            }
+                            listOf(EntryType.EXPENSE, EntryType.INCOME).forEachIndexed { index, type ->
+                                item(key = type) {
+                                    val hero = Modifier.sharedBounds(rememberSharedContentState("focus-$type-all"), scope)
+                                    CascadeCard(index + 1, hero) {
+                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                            Text(stringResource(if (type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(type))
+                                            TextButton(onClick = { onFocus(AnalyticsFocus(type)) }) { Text(stringResource(R.string.cinematic_more), color = CinematicTokens.Accent) }
+                                        }
+                                        val slices = AnalyticsMath.slices(state.totals, type)
+                                        if (slices.isEmpty()) Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted)
+                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            slices.take(4).forEach { slice ->
+                                                val tint = CinematicTokens.category(slice.category, type == EntryType.INCOME)
+                                                Column(Modifier.weight(1f).sharedBounds(rememberSharedContentState("focus-$type-${slice.category}"), scope)
+                                                    .clickable { onFocus(AnalyticsFocus(type, slice.category)) }, horizontalAlignment = Alignment.CenterHorizontally) {
+                                                    Box(Modifier.size(48.dp).background(tint.copy(alpha = .14f), CircleShape), contentAlignment = Alignment.Center) {
+                                                        Icon(slice.category.icon(), stringResource(slice.category.label()), tint = tint)
+                                                    }
+                                                    Spacer(Modifier.height(6.dp))
+                                                    Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor,
+                                                        state.preferences.currency, state.preferences.language), style = MaterialTheme.typography.labelSmall,
+                                                        color = if (type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
+                                                    Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted,
+                                                        style = MaterialTheme.typography.labelSmall)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val key = "focus-${focus.type}-${focus.category ?: "all"}"
+                    Surface(Modifier.fillMaxSize().sharedBounds(rememberSharedContentState(key), scope), color = CinematicTokens.Background) {
+                        val slices = AnalyticsMath.slices(state.totals, focus.type)
+                        val selected = slices.find { it.category == focus.category }
+                        val total = slices.sumOf { it.minor }
+                        LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                            item {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(onClick = { onFocus(null) }) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
+                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.expenses else R.string.income), style = MaterialTheme.typography.headlineSmall)
+                                }
+                                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(stringResource(R.string.reference_total_for, monthLabel), color = CinematicTokens.Muted)
+                                    Odometer(if (focus.type == EntryType.INCOME) total else -total,
+                                        state.preferences.currency, state.preferences.language,
+                                        if (focus.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense, positiveSign = focus.type == EntryType.INCOME)
+                                }
+                                PremiumDonut(slices, focus.type, focus.category, state.preferences.currency, state.preferences.language) { category ->
+                                    onFocus(AnalyticsFocus(focus.type, category))
+                                }
+                            }
+                            item {
+                                CascadeCard(0) {
+                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(focus.type))
+                                    slices.forEachIndexed { index, slice ->
+                                        CategoryRow(slice, focus.type, state) { onFocus(AnalyticsFocus(focus.type, slice.category)) }
+                                        if (index != slices.lastIndex) HorizontalDivider(Modifier.padding(start = 58.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                                    }
+                                }
+                            }
+                            item {
+                                Text(focus.category?.let { stringResource(it.label()) } ?: stringResource(R.string.all_categories), style = MaterialTheme.typography.titleLarge)
+                                Text(stringResource(R.string.cinematic_transactions), color = CinematicTokens.Muted)
+                            }
+                            if (state.transactions.isEmpty()) item { Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted) }
+                            items(state.transactions, key = { it.id }) { entry ->
+                                Surface(shape = RoundedCornerShape(16.dp), color = CinematicTokens.Surface,
+                                    modifier = Modifier.fillMaxWidth().clickable { onEdit(entry.id) }) {
+                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(entry.title); Text(formatDate(entry.date, state.preferences.language), color = CinematicTokens.Muted)
+                                        Text(formatReferenceMoney(if (entry.type == EntryType.INCOME) entry.amountMinor else -entry.amountMinor,
+                                            entry.currency, state.preferences.language), color = if (entry.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
+                                        if (entry.note.isNotBlank()) Text(entry.note, color = CinematicTokens.Muted)
+                                    }
+                                }
+                            }
+                            if (state.canLoadMore) item { TextButton(onClick = onMore) { Text(stringResource(R.string.load_more)) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryRow(slice: CategorySlice, type: EntryType, state: AnalyticsState,
+    modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val color = CinematicTokens.category(slice.category, type == EntryType.INCOME)
+    Row(modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(46.dp).background(color.copy(alpha = .12f), CircleShape), contentAlignment = Alignment.Center) {
+            Icon(slice.category.icon(), null, tint = color)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(stringResource(slice.category.label()))
+            Text(stringResource(R.string.category_transaction_count, slice.count), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
+        }
+        Column(horizontalAlignment = Alignment.End) {
+            Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor, state.preferences.currency, state.preferences.language), color = LocalAppearance.current.type(type))
+            Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.analytics
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.semmyx.ledger.domain.*
+import java.time.Clock
+import java.time.LocalDate
+import java.time.YearMonth
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+data class AnalyticsFocus(val type: EntryType, val category: Category? = null)
+data class AnalyticsState(
+    val preferences: UserPreferences = UserPreferences(),
+    val month: YearMonth? = null,
+    val totals: List<CategoryTotal> = emptyList(),
+    val buckets: List<CashBucket> = emptyList(),
+    val previousExpenseMinor: Long? = null,
+    val focus: AnalyticsFocus? = null,
+    val transactions: List<LedgerEntry> = emptyList(),
+    val canLoadMore: Boolean = false,
+    val loading: Boolean = true,
+    val failed: Boolean = false,
+) {
+    val expenseMinor: Long get() = totals.sumOf { it.expenseMinor }
+    val incomeMinor: Long get() = totals.sumOf { it.incomeMinor }
+}
+private data class AnalyticsSpec(val month: YearMonth?, val focus: AnalyticsFocus? = null, val limit: Int = 50, val retry: Int = 0)
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class AnalyticsViewModel(private val repository: EntryRepository, preferences: PreferencesRepository,
+    private val clock: Clock) : ViewModel() {
+    private val spec = MutableStateFlow(AnalyticsSpec(YearMonth.now(clock)))
+    private val today = flow {
+        while (true) {
+            val day = LocalDate.now(clock); emit(day)
+            delay((day.plusDays(1).atStartOfDay(clock.zone).toInstant().toEpochMilli() - clock.millis()).coerceAtLeast(1000))
+        }
+    }
+    val state = combine(preferences.preferences, spec, today) { prefs, request, day -> Triple(prefs, request, day) }
+        .flatMapLatest { (prefs, request, day) ->
+            val from = request.month?.atDay(1) ?: FinanceWindow.EARLIEST
+            val through = minOf(request.month?.atEndOfMonth() ?: day, day)
+            val previous = request.month?.minusMonths(1)
+            // For the current month compare equal elapsed days, not partial month vs full past month.
+            val previousThrough = previous?.let { if (request.month == YearMonth.from(day))
+                it.atDay(day.dayOfMonth.coerceAtMost(it.lengthOfMonth())) else it.atEndOfMonth() }
+            val comparison = if (previous != null && previousThrough != null)
+                repository.observeCategoryTotals(prefs.currency, previous.atDay(1), previousThrough).map { rows -> rows.sumOf { it.expenseMinor } }
+                else flowOf<Long?>(null)
+            val detail = request.focus?.let { focus -> repository.observeEntries(EntryFilter(prefs.currency,
+                type = focus.type, limit = request.limit + 1, category = focus.category, from = from, through = through)) }
+                ?: flowOf(emptyList<LedgerEntry>())
+            combine(repository.observeCategoryTotals(prefs.currency, from, through),
+                repository.observeActivity(prefs.currency, from, through), comparison, detail) { totals, activity, prior, entries ->
+                AnalyticsState(prefs, request.month, totals, AnalyticsMath.buckets(activity, request.month, through), prior,
+                    request.focus, entries.take(request.limit), entries.size > request.limit, loading = false)
+            }.catch { e ->
+                if (e is CancellationException) throw e
+                emit(AnalyticsState(preferences = prefs, month = request.month, focus = request.focus, loading = false, failed = true))
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AnalyticsState(month = YearMonth.now(clock)))
+    fun month(value: YearMonth?) { if (value == null || value in YearMonth.of(2000, 1)..YearMonth.now(clock)) spec.update { it.copy(month = value, limit = 50) } }
+    fun focus(value: AnalyticsFocus?) { spec.update { it.copy(focus = value, limit = 50) } }
+    fun more() { spec.update { it.copy(limit = if (it.limit < Int.MAX_VALUE - 51) it.limit + 50 else Int.MAX_VALUE - 1) } }
+    fun retry() { spec.update { it.copy(retry = it.retry + 1) } }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.auth
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.PinPolicy
 import com.semmyx.ledger.domain.PinResult
 import com.semmyx.ledger.domain.SecurityRepository
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.guarded
 import java.security.MessageDigest
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -1863,10 +1215,10 @@ class AuthViewModel(setup: Boolean, private val security: SecurityRepository) : 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/auth/AuthenticationScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.auth
+package com.semmyx.ledger.auth
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -1966,10 +1318,138 @@ private fun PinKey(value: Int, enabled: Boolean, onClick: () -> Unit, modifier: 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/bank/BankScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.bank
+package com.semmyx.ledger.bank
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import com.semmyx.ledger.LedgerApplication
+import com.semmyx.ledger.domain.bank.Banks
+import kotlinx.coroutines.*
+
+/**
+ * Listens to posted notifications from registered bank/wallet apps and routes them
+ * to [com.semmyx.ledger.data.bank.BankImportRepository].
+ *
+ * Works entirely in the background: the service is bound by the OS (no Activity
+ * needed) and uses the application's long-lived [LedgerApplication.applicationScope].
+ * Cross-source deduplication happens inside the repository transaction, so even if
+ * Google Pay fires first and PrivatBank fires 60 s later for the same tap, only one
+ * entry appears in the ledger.
+ */
+class BankNotificationListener : NotificationListenerService() {
+
+    /**
+     * Own supervisor scope for fire-and-forget import coroutines.
+     * Cancelled in onDestroy so pending work is cleaned up if the OS kills the service.
+     */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    override fun onCreate() {
+        super.onCreate()
+        ensureImportChannel()
+    }
+
+    override fun onListenerConnected() {
+        (application as LedgerApplication).container.bankImport.connected(true)
+    }
+
+    override fun onListenerDisconnected() {
+        (application as LedgerApplication).container.bankImport.connected(false)
+        // Request an immediate rebind rather than waiting for the OS back-off timer.
+        requestRebind(android.content.ComponentName(this, BankNotificationListener::class.java))
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        sbn ?: return
+        val repository = (application as LedgerApplication).container.bankImport
+        val bank = repository.bankForPackage(sbn.packageName)
+
+        repository.note(
+            if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED",
+            sbn.packageName,
+            notification = true,
+            bankMessage = bank != null,
+        )
+        bank ?: return
+
+        val notification = sbn.notification
+        // Group summary notifications carry no useful transaction data; skip them.
+        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) {
+            repository.note("GROUP_SUMMARY")
+            return
+        }
+
+        val extras = notification.extras
+        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
+            ?: extras.getCharSequence(Notification.EXTRA_TEXT))
+            ?.toString().orEmpty()
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = "$title\n$body".take(8001)
+
+        if (body.isBlank()) { repository.note("EMPTY_TEXT"); return }
+        if (!repository.enabled) { repository.note("DISABLED"); return }
+
+        scope.launch {
+            try {
+                repository.receive(
+                    bank, text,
+                    eventKey = "PUSH:${sbn.packageName}:${sbn.key}:${sbn.postTime}:$text",
+                    at = sbn.postTime,
+                    origin = "PUSH",
+                )
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                repository.note("ERROR")
+                android.util.Log.w("BankImport", "Background import failed; no message contents logged")
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        (application as LedgerApplication).container.bankImport.connected(false)
+        scope.cancel()
+        super.onDestroy()
+    }
+
+    // -----------------------------------------------------------------------
+    // Notification channel for background import confirmations
+    // -----------------------------------------------------------------------
+
+    private fun ensureImportChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val channelId = IMPORT_CHANNEL_ID
+        if (nm.getNotificationChannel(channelId) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "Ledger Import", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Silent confirmation when a transaction is auto-imported in the background"
+                    setShowBadge(false)
+                    enableLights(false)
+                    enableVibration(false)
+                },
+            )
+        }
+    }
+
+    companion object {
+        const val IMPORT_CHANNEL_ID = "ledger_import"
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt
+
+```kotlin
+package com.semmyx.ledger.bank
 
 import android.Manifest
 import android.content.Intent
@@ -1995,6 +1475,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -2004,8 +1485,8 @@ import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
 import com.semmyx.ledger.domain.bank.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
 import kotlinx.coroutines.*
 import java.time.Instant
 import java.time.ZoneId
@@ -2137,19 +1618,57 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
             } }
             if (reviews.isNotEmpty()) item { Text(stringResource(R.string.bank_review_count, reviews.size), style = MaterialTheme.typography.titleLarge) }
             items(reviews, key = { "review-" + it.id }) { item -> ContentCard {
-                Text(Banks.name(item.bankId) + " · " + item.merchant)
-                Text(formatMoney(item.amountMinor, item.currency, language), style = MaterialTheme.typography.titleMedium)
-                Text(Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss", Locale.forLanguageTag(language.tag))))
-                item.cardLast4?.let { Text("•••• $it") }
-                if (!item.timeFromMessage) Text(stringResource(R.string.bank_time_received), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (item.status == "DUPLICATE_REVIEW") Text(stringResource(R.string.bank_duplicate), color = MaterialTheme.colorScheme.error)
-                if (item.transfer) Text(stringResource(R.string.bank_transfer_review))
+                // Bank name + merchant — can be long, allow 2 lines
+                Text(
+                    Banks.name(item.bankId) + " · " + item.merchant.ifBlank { "—" },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    formatMoney(item.amountMinor, item.currency, language),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = palette.type(item.type),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault())
+                        .format(DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss", Locale.forLanguageTag(language.tag))),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                item.cardLast4?.let { Text("•••• $it", style = MaterialTheme.typography.bodySmall) }
+                if (!item.timeFromMessage) Text(stringResource(R.string.bank_time_received), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                if (item.transfer) Text(stringResource(R.string.bank_transfer_review), style = MaterialTheme.typography.bodySmall)
+                // Duplicate warnings
+                when (item.status) {
+                    "DUPLICATE_REVIEW" -> Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.errorContainer,
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Warning, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.error)
+                            Text(stringResource(R.string.bank_duplicate), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    "CROSS_DUPLICATE_REVIEW" -> Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.SwapHoriz, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.tertiary)
+                            Text("Можливий дублікат з іншого банку/гаманця", color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { model.accept(item.id, EntryType.EXPENSE) }) { Text(stringResource(R.string.expenses), color = palette.type(EntryType.EXPENSE)) }
                     TextButton(onClick = { model.accept(item.id, EntryType.INCOME) }) { Text(stringResource(R.string.income), color = palette.type(EntryType.INCOME)) }
                     TextButton(onClick = { model.ignore(item.id) }) { Text(stringResource(R.string.bank_ignore)) }
                 }
             } }
+
             item { Text(stringResource(R.string.bank_recent), style = MaterialTheme.typography.titleLarge) }
             items(state.entries, key = { it.id }) { entry -> ContentCard(Modifier.clickable { onEdit(entry.id) }) {
                 Text(entry.title)
@@ -2243,10 +1762,46 @@ private fun importReason(code: String): Int = when (code) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/bank/BankViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.bank
+package com.semmyx.ledger.bank
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.provider.Telephony
+import com.semmyx.ledger.LedgerApplication
+import com.semmyx.ledger.domain.bank.Banks
+import kotlinx.coroutines.*
+
+/** Included in the legacyV7 sideload manifest only. Reads new messages, never the historical SMS inbox. */
+class BankSmsReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+        if (messages.isEmpty()) return
+        val sender = messages.first().originatingAddress.orEmpty()
+        val bank = Banks.bySender(sender) ?: return
+        val repository = (context.applicationContext as LedgerApplication).container.bankImport
+        if (!repository.enabled) return
+        val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
+        val at = messages.minOf { it.timestampMillis }
+        val pending = goAsync()
+        (context.applicationContext as LedgerApplication).applicationScope.launch(Dispatchers.IO) {
+            try { withTimeout(7000) { repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS") } }
+            catch (error: CancellationException) { throw error }
+            catch (_: Exception) { android.util.Log.w("BankImport", "Local SMS import failed; no message contents logged") }
+            finally { pending.finish() }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.bank
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -2303,12 +1858,292 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/common/Components.kt
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.common
+package com.semmyx.ledger.cat
+
+import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import com.semmyx.ledger.R
+import kotlinx.coroutines.isActive
+import kotlin.math.*
+
+/** Engine-neutral, stable rig channels. Realistic artwork is supplied separately, never fabricated. */
+data class CatPose(val breath: Float = 0f, val blink: Float = 0f, val yawDegrees: Float = 0f,
+    val pitchDegrees: Float = 0f, val pleased: Float = 0f, val serious: Float = 0f, val listening: Boolean = false)
+
+interface CatRig {
+    fun morph(name: String, weight: Float)
+    fun head(yawDegrees: Float, pitchDegrees: Float)
+}
+
+/** Complete mapping from controller output to a rig; a Filament adapter implements CatRig. */
+class CatRigDriver(private val rig: CatRig) {
+    fun apply(pose: CatPose) {
+        rig.morph("breath", pose.breath)
+        rig.morph("blinkLeft", pose.blink)
+        rig.morph("blinkRight", pose.blink)
+        rig.morph("pleased", pose.pleased)
+        rig.morph("serious", pose.serious)
+        rig.morph("earsForward", if (pose.listening) 1f else .2f)
+        rig.head(pose.yawDegrees, pose.pitchDegrees)
+    }
+}
+
+class CatMotionController {
+    private var yaw = 0f
+    private var pitch = 0f
+    private var happy = .5f
+    private var lastTime = 0.0
+    fun step(seconds: Double, balanceMinor: Long, listening: Boolean, target: Offset): CatPose {
+        val dt = if (lastTime == 0.0) 1.0 / 120 else (seconds - lastTime).coerceIn(0.0, .1)
+        lastTime = seconds
+        val smooth = (1.0 - exp(-9.0 * dt)).toFloat()
+        yaw += (target.x.coerceIn(-1f, 1f) * 18f - yaw) * smooth
+        pitch += (target.y.coerceIn(-1f, 1f) * -10f - pitch) * smooth
+        val destination = if (balanceMinor < 0) 0f else if (balanceMinor > 0) 1f else .5f
+        happy += (destination - happy) * smooth
+        val cycle = seconds % 4.7
+        val blink = if (cycle < .22) sin(cycle / .22 * PI).toFloat().coerceIn(0f, 1f) else 0f
+        return CatPose(((sin(seconds * 2 * PI / 3.6) + 1) / 2).toFloat(), blink, yaw, pitch,
+            happy, 1f - happy, listening)
+    }
+}
+
+/** Install a licensed asset-backed implementation at the composition root to enable real 3D. */
+fun interface CatAssetRenderer {
+    @Composable fun Render(pose: CatPose, modifier: Modifier)
+}
+object CatAssetRegistry {
+    var renderer: CatAssetRenderer? by mutableStateOf(null)
+}
+object CatTouchBus {
+    var target by mutableStateOf(Offset.Zero)
+}
+
+/** Observe, don't consume: ordinary taps, scrolling, editing and speech buttons still work. */
+fun Modifier.trackCatTouch(): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            event.changes.firstOrNull { it.pressed }?.let { change ->
+                CatTouchBus.target = Offset((change.position.x / size.width.coerceAtLeast(1) - .5f) * 2,
+                    (change.position.y / size.height.coerceAtLeast(1) - .5f) * 2)
+            }
+        }
+    }
+}
+
+@Composable
+fun LiveCatHost(balanceMinor: Long, listening: Boolean, skin: String, modifier: Modifier, motionEnabled: Boolean = true) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val controller = remember { CatMotionController() }
+    val balance by rememberUpdatedState(balanceMinor)
+    val hears by rememberUpdatedState(listening)
+    var pose by remember { mutableStateOf(CatPose()) }
+    LaunchedEffect(lifecycle, controller, motionEnabled) {
+        if (!motionEnabled) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (isActive) withFrameNanos { time ->
+                pose = controller.step(time / 1e9, balance, hears, CatTouchBus.target)
+            }
+        }
+    }
+    val renderer = CatAssetRegistry.renderer
+    if (renderer != null) renderer.Render(pose, modifier)
+    else CatMeshRenderer(if (motionEnabled) pose else CatPose(pleased = if (balanceMinor > 0) 1f else 0f), modifier, skin = skin)
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.dp
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.AppLanguage
+
+@Composable
+fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
+    modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
+    onText: (String) -> Unit = {}, balanceMinor: Long = 0) {
+    var text by remember { mutableStateOf("") }
+    var typing by remember { mutableStateOf(false) }
+    val label = stringResource(R.string.voice_assistant_button)
+    Surface(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(24.dp)) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
+                .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
+                .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
+            Text(if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
+            AnimatedVisibility(typing, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+                Column {
+                    OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
+                        label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)
+                    TextButton(enabled = text.isNotBlank() && !listening, onClick = { val value = text; text = ""; onText(value) }) {
+                        Text(stringResource(R.string.assistant_send))
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import kotlin.math.*
+
+/** One texture, continuously deformed vertices. No eye-open/closed resource switching. */
+class CatFaceMesh(val columns: Int = 80, val rows: Int = 80) {
+    val vertices = FloatArray((columns + 1) * (rows + 1) * 2)
+    private val xs = FloatArray(vertices.size / 2)
+    private val ys = FloatArray(xs.size)
+    private val head = FloatArray(xs.size)
+    private val depth = FloatArray(xs.size)
+    private val lids = FloatArray(xs.size)
+    private val body = FloatArray(xs.size)
+    init {
+        var i = 0
+        for (row in 0..rows) for (column in 0..columns) {
+            val x = column.toFloat() / columns; val y = row.toFloat() / rows
+            xs[i] = x; ys[i] = y
+            head[i] = exp(-(((x - .5f) / .35f).toDouble().pow(4) + ((y - .37f) / .30f).toDouble().pow(4))).toFloat()
+            depth[i] = .10f * exp(-(((x - .5f) / .26f).toDouble().pow(2) + ((y - .42f) / .25f).toDouble().pow(2))).toFloat()
+            // Actual eye landmarks measured on cat_amber_base.webp, in normalized texture coordinates.
+            val eyeY = .396f
+            val left = exp(-(((x - .404f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
+            val right = exp(-(((x - .611f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
+            lids[i] = -(y - eyeY) * maxOf(left, right) * .98f
+            body[i] = exp(-(((x - .5f) / .38f).toDouble().pow(4) + ((y - .72f) / .25f).toDouble().pow(4))).toFloat()
+            i++
+        }
+    }
+    fun update(pose: CatPose, textureWidth: Int, textureHeight: Int): FloatArray {
+        val yaw = pose.yawDegrees.coerceIn(-18f, 18f) * PI.toFloat() / 180f
+        val pitch = pose.pitchDegrees.coerceIn(-10f, 10f) * PI.toFloat() / 180f
+        val cosine = cos(yaw); val sine = sin(yaw)
+        val blink = pose.blink.coerceIn(0f, 1f)
+        val expression = (pose.pleased * .045f).coerceIn(0f, .045f)
+        for (i in xs.indices) {
+            val x = xs[i]; val y = ys[i]
+            val h = head[i]
+            val dx = h * ((x - .5f) * (cosine - 1) + depth[i] * sine)
+            val dy = h * depth[i] * sin(pitch)
+            // Upper/lower fur regions move together around the iris. The eye aperture closes continuously.
+            val lid = lids[i] * (blink + expression * (1 - blink))
+            val breathing = pose.breath * .010f * body[i]
+            vertices[i * 2] = (x + dx + (x - .5f) * breathing) * textureWidth
+            vertices[i * 2 + 1] = (y + dy + lid - breathing * .25f) * textureHeight
+        }
+        return vertices
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Paint
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalContext
+import com.semmyx.ledger.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/** A single decoded bitmap + a real-time mesh. Blink/yaw never change the resource. */
+@Composable
+fun CatMeshRenderer(pose: CatPose, modifier: Modifier, skin: String = "gray") {
+    val app = LocalContext.current.applicationContext
+    // Decode each appearance once. Frame updates and blinking only deform the shared mesh.
+    val textures by produceState<Pair<Bitmap?, Bitmap?>?>(initialValue = null, key1 = app) {
+        value = withContext(Dispatchers.IO) {
+            BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_base) to
+                BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_sky)
+        }
+    }
+    val bitmap = if (skin == "sky") textures?.second ?: textures?.first else textures?.first
+    val mesh = remember { CatFaceMesh() }
+    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG) }
+    Canvas(modifier) {
+        val image = bitmap ?: return@Canvas
+        val scale = minOf(size.width / image.width, size.height / image.height)
+        val left = (size.width - image.width * scale) / 2f
+        val top = (size.height - image.height * scale) / 2f
+        val verts = mesh.update(pose, image.width, image.height)
+        drawIntoCanvas { wrapper ->
+            val native = wrapper.nativeCanvas
+            val saved = native.save()
+            native.translate(left, top)
+            native.scale(scale, scale)
+            native.drawBitmapMesh(image, mesh.columns, mesh.rows, verts, 0, null, 0, paint)
+            native.restoreToCount(saved)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt
+
+```kotlin
+package com.semmyx.ledger.common
 
 import androidx.annotation.StringRes
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -2317,15 +2152,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
 import java.math.BigDecimal
@@ -2338,104 +2176,230 @@ import java.time.format.FormatStyle
 import java.util.Currency
 import java.util.Locale
 
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
 fun formatMoney(minor: Long, currency: LedgerCurrency, language: AppLanguage): String =
     NumberFormat.getCurrencyInstance(Locale.forLanguageTag(language.tag)).apply {
         this.currency = Currency.getInstance(currency.name)
-        minimumFractionDigits = 2; maximumFractionDigits = 2
+        minimumFractionDigits = 2
+        maximumFractionDigits = 2
     }.format(BigDecimal.valueOf(minor, 2))
 
 fun formatDate(date: LocalDate, language: AppLanguage): String =
     date.format(DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
 
 /** Used for the developer-activation expiry date, which is a real instant rather than a calendar day. */
-fun formatDateTime(epochMillis: Long, language: AppLanguage): String = Instant.ofEpochMilli(epochMillis)
-    .atZone(ZoneId.systemDefault())
-    .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
+fun formatDateTime(epochMillis: Long, language: AppLanguage): String =
+    Instant.ofEpochMilli(epochMillis)
+        .atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
+
+// ---------------------------------------------------------------------------
+// Category / message labels
+// ---------------------------------------------------------------------------
 
 @StringRes fun Category.label(): Int = when (this) {
-    Category.FOOD -> R.string.category_food; Category.TRANSPORT -> R.string.category_transport
-    Category.HOME -> R.string.category_home; Category.HEALTH -> R.string.category_health
-    Category.LEISURE -> R.string.category_leisure; Category.SALARY -> R.string.category_salary
-    Category.OTHER -> R.string.category_other
-    Category.TRANSFER -> R.string.category_transfer; Category.DINING -> R.string.category_dining; Category.CASHBACK -> R.string.category_cashback
+    Category.FOOD      -> R.string.category_food
+    Category.TRANSPORT -> R.string.category_transport
+    Category.HOME      -> R.string.category_home
+    Category.HEALTH    -> R.string.category_health
+    Category.LEISURE   -> R.string.category_leisure
+    Category.SALARY    -> R.string.category_salary
+    Category.OTHER     -> R.string.category_other
+    Category.TRANSFER  -> R.string.category_transfer
+    Category.DINING    -> R.string.category_dining
+    Category.CASHBACK  -> R.string.category_cashback
 }
+
 fun Category.icon(): ImageVector = when (this) {
-    Category.FOOD -> Icons.Default.ShoppingCart; Category.TRANSPORT -> Icons.Default.DirectionsBus
-    Category.HOME -> Icons.Default.Home; Category.HEALTH -> Icons.Default.FavoriteBorder
-    Category.LEISURE -> Icons.Default.LocalActivity; Category.SALARY -> Icons.Default.WorkOutline
-    Category.OTHER -> Icons.Default.ReceiptLong
-    Category.TRANSFER -> Icons.Default.DoubleArrow; Category.DINING -> Icons.Default.Restaurant; Category.CASHBACK -> Icons.Default.CurrencyExchange
+    Category.FOOD      -> Icons.Default.ShoppingCart
+    Category.TRANSPORT -> Icons.Default.DirectionsBus
+    Category.HOME      -> Icons.Default.Home
+    Category.HEALTH    -> Icons.Default.FavoriteBorder
+    Category.LEISURE   -> Icons.Default.LocalActivity
+    Category.SALARY    -> Icons.Default.WorkOutline
+    Category.OTHER     -> Icons.Default.ReceiptLong
+    Category.TRANSFER  -> Icons.Default.DoubleArrow
+    Category.DINING    -> Icons.Default.Restaurant
+    Category.CASHBACK  -> Icons.Default.CurrencyExchange
 }
+
 @StringRes fun UiMessage.label(): Int = when (this) {
-    UiMessage.STORAGE -> R.string.storage_error
-    UiMessage.SAVED -> R.string.saved
-    UiMessage.DELETED -> R.string.entry_deleted
-    UiMessage.UNDO_EXPIRED -> R.string.undo_expired
-    UiMessage.RATE_OFFLINE -> R.string.rate_offline
+    UiMessage.STORAGE              -> R.string.storage_error
+    UiMessage.SAVED                -> R.string.saved
+    UiMessage.DELETED              -> R.string.entry_deleted
+    UiMessage.UNDO_EXPIRED         -> R.string.undo_expired
+    UiMessage.RATE_OFFLINE         -> R.string.rate_offline
     UiMessage.BIOMETRIC_UNAVAILABLE -> R.string.biometric_unavailable
-    UiMessage.NAME_INVALID -> R.string.name_invalid
-    UiMessage.NOT_FOUND -> R.string.entry_not_found
-    UiMessage.PREMIUM_ACTIVATED -> R.string.premium_activated
-    UiMessage.ACTIVATION_INVALID -> R.string.activation_invalid
+    UiMessage.NAME_INVALID         -> R.string.name_invalid
+    UiMessage.NOT_FOUND            -> R.string.entry_not_found
+    UiMessage.PREMIUM_ACTIVATED    -> R.string.premium_activated
+    UiMessage.ACTIVATION_INVALID   -> R.string.activation_invalid
 }
+
 @StringRes fun BillingIssue.label(): Int = when (this) {
-    BillingIssue.UNAVAILABLE -> R.string.billing_unavailable
-    BillingIssue.CONFIGURATION -> R.string.billing_configuration
-    BillingIssue.NETWORK -> R.string.billing_network
-    BillingIssue.PENDING -> R.string.billing_pending
-    BillingIssue.VERIFICATION -> R.string.billing_verification
+    BillingIssue.UNAVAILABLE    -> R.string.billing_unavailable
+    BillingIssue.CONFIGURATION  -> R.string.billing_configuration
+    BillingIssue.NETWORK        -> R.string.billing_network
+    BillingIssue.PENDING        -> R.string.billing_pending
+    BillingIssue.VERIFICATION   -> R.string.billing_verification
     BillingIssue.ACKNOWLEDGEMENT -> R.string.billing_acknowledgement
     BillingIssue.ACTIVATION_CODE -> R.string.billing_activation_code
 }
+
+// ---------------------------------------------------------------------------
+// Brand mark
+// ---------------------------------------------------------------------------
 
 @Composable
 fun LedgerMark(modifier: Modifier = Modifier, color: Color = LocalAppearance.current.color("icons")) {
     Canvas(modifier.size(40.dp)) {
         val w = size.width / 5f
         listOf(0.42f, 0.68f, 1f).forEachIndexed { index, height ->
-            drawRoundRect(color, Offset(index * w * 1.6f, size.height * (1 - height)), Size(w, size.height * height), CornerRadius(w * .2f))
+            drawRoundRect(
+                color,
+                Offset(index * w * 1.6f, size.height * (1 - height)),
+                Size(w, size.height * height),
+                CornerRadius(w * .2f),
+            )
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Navigation bar
+// ---------------------------------------------------------------------------
 
 @Composable
 fun LedgerBottomBar(selected: Int, onSelect: (Int) -> Unit) {
-    val labels = listOf(R.string.overview, R.string.settings, R.string.help, R.string.analytics_title, R.string.bank_dashboard)
-    val icons = listOf(Icons.Default.SpaceDashboard, Icons.Default.Tune, Icons.Default.HelpOutline, Icons.Default.BarChart, Icons.Default.AccountBalance)
-    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+    val labels = listOf(
+        R.string.overview, R.string.settings, R.string.help,
+        R.string.analytics_title, R.string.bank_dashboard,
+    )
+    val icons = listOf(
+        Icons.Default.SpaceDashboard, Icons.Default.Tune, Icons.Default.HelpOutline,
+        Icons.Default.BarChart, Icons.Default.AccountBalance,
+    )
+    NavigationBar(
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
+    ) {
         labels.forEachIndexed { index, label ->
-            NavigationBarItem(selected = index == selected, onClick = { onSelect(index) }, icon = { Icon(icons[index], null, tint = LocalAppearance.current.color("icons").copy(alpha = if (index == selected) 1f else .65f)) }, label = { Text(stringResource(label)) })
+            val isSelected = index == selected
+            NavigationBarItem(
+                selected = isSelected,
+                onClick  = { onSelect(index) },
+                icon = {
+                    Icon(
+                        icons[index], null,
+                        tint = LocalAppearance.current.color("icons")
+                            .copy(alpha = if (isSelected) 1f else .55f),
+                    )
+                },
+                label = {
+                    Text(
+                        stringResource(label),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                },
+            )
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Content card  — used everywhere for grouped sections
+// ---------------------------------------------------------------------------
+
+/**
+ * Premium card with a subtle gradient tint on the top-left corner.
+ * Text inside never overflows: Columns use fillMaxWidth; callers must
+ * supply maxLines / overflow on individual Text composables as needed.
+ */
 @Composable
 fun ContentCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier.fillMaxWidth(), shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
+    Card(
+        modifier.fillMaxWidth(),
+        shape  = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp, pressedElevation = 4.dp),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+            content = content,
+        )
     }
 }
 
+// ---------------------------------------------------------------------------
+// Empty / loading states
+// ---------------------------------------------------------------------------
+
 @Composable
-fun EmptyState(title: String, description: String, action: String, onAction: () -> Unit, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxWidth().padding(vertical = 24.dp, horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Icon(Icons.Default.ReceiptLong, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
-        Text(title, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
-        Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        Button(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(action) }
+fun EmptyState(
+    title: String,
+    description: String,
+    action: String,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier.fillMaxWidth().padding(vertical = 32.dp, horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Surface(
+            shape = MaterialTheme.shapes.extraLarge,
+            color = MaterialTheme.colorScheme.primaryContainer,
+        ) {
+            Icon(
+                Icons.Default.ReceiptLong, null,
+                Modifier.padding(20.dp).size(36.dp),
+                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
+        Text(
+            title,
+            style     = MaterialTheme.typography.titleLarge,
+            textAlign = TextAlign.Center,
+            maxLines  = 3,
+            overflow  = TextOverflow.Ellipsis,
+        )
+        Text(
+            description,
+            color     = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            style     = MaterialTheme.typography.bodyMedium,
+            maxLines  = 5,
+            overflow  = TextOverflow.Ellipsis,
+        )
+        FilledTonalButton(
+            onClick   = onAction,
+            modifier  = Modifier.heightIn(min = 48.dp),
+        ) { Text(action, maxLines = 1, overflow = TextOverflow.Ellipsis) }
     }
 }
 
 @Composable
 fun LoadingState(modifier: Modifier = Modifier) {
-    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(
+            strokeWidth = 3.dp,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/common/ViewModelSupport.kt
+## app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.common
+package com.semmyx.ledger.common
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -2475,10 +2439,10 @@ enum class UiMessage {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/ActivityChart.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -2497,8 +2461,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.ContentCard
-import com.semmyx.ledger.presentation.common.formatMoney
+import com.semmyx.ledger.common.ContentCard
+import com.semmyx.ledger.common.formatMoney
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -2570,10 +2534,10 @@ fun ActivityChart(days: List<DailyActivity>, currency: LedgerCurrency, language:
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/CategoryDetails.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -2593,11 +2557,11 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.analytics.*
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.analytics.*
 
 /** Reference-style category cards on the MAIN screen, not hidden in a separate analytics route. */
 @Composable
@@ -2732,10 +2696,10 @@ fun CategoryDetails(state: DashboardState, initialType: EntryType, onClose: () -
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/DashboardScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import android.Manifest
 import android.content.Intent
@@ -2764,20 +2728,20 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.premium.AssistantCharacterCard
-import com.semmyx.ledger.presentation.premium.trackCatTouch
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.cat.CatAssistantCard
+import com.semmyx.ledger.cat.trackCatTouch
 import android.widget.Toast
 import com.semmyx.ledger.voice.OptionalVoiceAssistant
 import com.semmyx.ledger.voice.VoiceCommand
 import com.semmyx.ledger.voice.VoiceEntryParser
 import com.semmyx.ledger.voice.VoiceSmallTalk
 import java.time.LocalDate
-import com.semmyx.ledger.voice.FinanceQuery
-import com.semmyx.ledger.voice.SpokenMoney
+import com.semmyx.ledger.voice.VoiceFinanceQuery
+import com.semmyx.ledger.voice.SpokenMoneyFormatter
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2820,7 +2784,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
     speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
     setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit,
     onCategory: (Category?) -> Unit, onMoreCategory: () -> Unit,
-    onStatistics: (FinanceQuery.Statistics, (Long) -> Unit) -> Unit) {
+    onStatistics: (VoiceFinanceQuery.Statistics, (Long) -> Unit) -> Unit) {
     var categoryDetailType by remember { mutableStateOf(EntryType.EXPENSE) }
     if (state.selectedCategory != null) CategoryDetails(state, initialType = categoryDetailType,
         onClose = { onCategory(null) }, onDays = onDays, onMore = onMoreCategory,
@@ -2878,26 +2842,26 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                 listening = false
                 val assistant = ensureAssistant()
                 val language = state.preferences.language
-                val query = heard?.let { FinanceQuery.parse(it) }
+                val query = heard?.let { VoiceFinanceQuery.parse(it) }
                 val draft = if (query == null) heard?.let { VoiceEntryParser.parse(it) } else null
                 when {
-                    query == FinanceQuery.Balance -> {
+                    query == VoiceFinanceQuery.Balance -> {
                         val reply = voiceContext.getString(R.string.voice_reply_balance,
-                            SpokenMoney.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
+                            SpokenMoneyFormatter.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
                         lastReply = reply; assistant.speak(reply, language)
                     }
-                    query is FinanceQuery.Statistics -> onStatistics(query) { amount ->
+                    query is VoiceFinanceQuery.Statistics -> onStatistics(query) { amount ->
                         val period = voiceContext.getString(when (query.period) {
-                            FinanceQuery.Period.TODAY -> R.string.period_today
-                            FinanceQuery.Period.WEEK -> R.string.last_7_days
-                            FinanceQuery.Period.MONTH -> R.string.period_month
-                            FinanceQuery.Period.YEAR -> R.string.period_year
-                            FinanceQuery.Period.ALL -> R.string.all_time
+                            VoiceFinanceQuery.Period.TODAY -> R.string.period_today
+                            VoiceFinanceQuery.Period.WEEK -> R.string.last_7_days
+                            VoiceFinanceQuery.Period.MONTH -> R.string.period_month
+                            VoiceFinanceQuery.Period.YEAR -> R.string.period_year
+                            VoiceFinanceQuery.Period.ALL -> R.string.all_time
                         })
                         val category = query.category?.let { voiceContext.getString(it.label()) } ?: voiceContext.getString(R.string.all_categories)
                         val kind = voiceContext.getString(if (query.type == EntryType.EXPENSE) R.string.expenses else R.string.income)
                         val reply = voiceContext.getString(R.string.voice_statistics, kind, period, category,
-                            SpokenMoney.format(amount, state.preferences.currency, language))
+                            SpokenMoneyFormatter.format(amount, state.preferences.currency, language))
                         lastReply = reply; assistant.speak(reply, language)
                     }
                     draft != null -> {
@@ -2912,7 +2876,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                     heard != null -> when (OptionalVoiceAssistant.classify(heard)) {
                         VoiceCommand.ShowBalance -> {
                             val reply = voiceContext.getString(R.string.voice_reply_balance,
-                                SpokenMoney.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
+                                SpokenMoneyFormatter.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
                             lastReply = reply
                             assistant.speak(reply, language)
                         }
@@ -2987,7 +2951,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                 }
                 if (state.premium && state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
-                        AssistantCharacterCard(state.preferences.language, listening, lastReply, onTalk = onVoice,
+                        CatAssistantCard(state.preferences.language, listening, lastReply, onTalk = onVoice,
                             skin = state.preferences.mascotSkin, animations = state.preferences.mascotAnimations,
                             onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor)
                     }
@@ -3069,18 +3033,50 @@ private fun smallTalkReply(context: android.content.Context, heard: String): Str
 
 @Composable
 private fun BalanceCard(state: DashboardState) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface, contentColor = MaterialTheme.colorScheme.onSurface)) {
-        Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(stringResource(R.string.total_balance), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                Icon(Icons.Default.AccountBalanceWallet, null, tint = LocalAppearance.current.color("icons"))
+    Card(
+        modifier  = Modifier.fillMaxWidth(),
+        shape     = MaterialTheme.shapes.extraLarge,
+        colors    = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primary,
+            contentColor   = MaterialTheme.colorScheme.onPrimary,
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
+    ) {
+        Column(Modifier.fillMaxWidth().padding(28.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment     = Alignment.CenterVertically,
+            ) {
+                Text(
+                    stringResource(R.string.total_balance),
+                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .75f),
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Surface(
+                    shape = MaterialTheme.shapes.medium,
+                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .15f),
+                ) {
+                    Icon(Icons.Default.AccountBalanceWallet, null, Modifier.padding(8.dp).size(20.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary)
+                }
             }
-            Text(formatMoney(state.snapshot.balance.netMinor, state.preferences.currency, state.preferences.language),
-                style = MaterialTheme.typography.headlineLarge, modifier = Modifier.testTag("totalBalance"))
-            Text(stringResource(R.string.currency_scope, state.preferences.currency.name), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+            Text(
+                formatMoney(state.snapshot.balance.netMinor, state.preferences.currency, state.preferences.language),
+                style    = MaterialTheme.typography.headlineLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.testTag("totalBalance"),
+            )
+            Text(
+                stringResource(R.string.currency_scope, state.preferences.currency.name),
+                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .65f),
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }
+
 
 @Composable
 private fun BalanceBreakdown(state: DashboardState) {
@@ -3106,39 +3102,70 @@ private fun BalanceBreakdown(state: DashboardState) {
 @Composable
 private fun EntryRow(entry: LedgerEntry, language: AppLanguage, onEdit: () -> Unit, onDelete: () -> Unit) {
     val categoryTint = LocalAppearance.current.category(entry.category, entry.type == EntryType.INCOME)
-    OutlinedCard(Modifier.fillMaxWidth().testTag("entry:${entry.id}")) {
-        Column(Modifier.fillMaxWidth().clickable(onClick = onEdit).padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Surface(shape = MaterialTheme.shapes.small, color = categoryTint.copy(alpha = .16f)) {
-                    Icon(entry.category.icon(), null, Modifier.padding(10.dp).size(22.dp), tint = categoryTint)
-                }
-                Column(Modifier.weight(1f)) {
-                    Text(entry.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                    Text(stringResource(entry.category.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                }
-                IconButton(onClick = onDelete) { Icon(Icons.Default.DeleteOutline, stringResource(R.string.delete_named_entry, entry.title)) }
+    val isIncome = entry.type == EntryType.INCOME
+    Card(
+        modifier  = Modifier.fillMaxWidth().testTag("entry:${entry.id}"),
+        shape     = MaterialTheme.shapes.large,
+        colors    = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp, pressedElevation = 3.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onEdit)
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment     = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            // Category icon in a soft pill — fixed size, never squishes
+            Surface(shape = MaterialTheme.shapes.medium, color = categoryTint.copy(alpha = .14f)) {
+                Icon(entry.category.icon(), null, Modifier.padding(11.dp).size(22.dp), tint = categoryTint)
             }
-            Row(Modifier.fillMaxWidth().padding(top = 8.dp, end = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(formatDate(entry.date, language), Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                Text(stringResource(if (entry.type == EntryType.INCOME) R.string.positive_amount else R.string.negative_amount,
-                    formatMoney(entry.amountMinor, entry.currency, language)), Modifier.weight(1.2f), textAlign = TextAlign.End,
-                    fontWeight = FontWeight.SemiBold, color = if (entry.type == EntryType.INCOME) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
+            // Title + date — weight(1f) ensures it never pushes the amount off-screen
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(entry.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "${stringResource(entry.category.label())} · ${formatDate(entry.date, language)}",
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // Amount + delete icon — right-aligned, amounts never wrap
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    stringResource(
+                        if (isIncome) R.string.positive_amount else R.string.negative_amount,
+                        formatMoney(entry.amountMinor, entry.currency, language),
+                    ),
+                    style      = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color      = if (isIncome) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary,
+                    maxLines   = 1,
+                    overflow   = TextOverflow.Ellipsis,
+                )
+                Icon(
+                    Icons.Default.DeleteOutline,
+                    contentDescription = stringResource(R.string.delete_named_entry, entry.title),
+                    modifier = Modifier.size(16.dp).clickable(onClick = onDelete),
+                    tint     = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .45f),
+                )
             }
         }
     }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/DashboardViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import com.semmyx.ledger.voice.VoiceEntryDraft
 import java.time.Clock
 import java.time.LocalDate
@@ -3248,7 +3275,7 @@ class DashboardViewModel(
             ))
         }
     }
-    suspend fun answerStatistics(request: com.semmyx.ledger.voice.FinanceQuery.Statistics): Long {
+    suspend fun answerStatistics(request: com.semmyx.ledger.voice.VoiceFinanceQuery.Statistics): Long {
         val now = LocalDate.now(clock)
         return entries.statistics(state.value.preferences.currency, request.from(now), now, request.type, request.category)
     }
@@ -3256,10 +3283,68 @@ class DashboardViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/editor/EntryScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.editor
+package com.semmyx.ledger.diagnostics
+
+import android.content.Context
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Persists the most recent uncaught crash to app-internal storage so it survives the process
+ * dying, and can be viewed later from Settings -> Support without needing adb/logcat access.
+ *
+ * Only the exception class name, message, and stack trace (file/line/method names) are stored --
+ * never entry titles, PINs, purchase tokens, or other user data, matching the existing logging
+ * rule in LedgerApplication.
+ */
+object CrashLogger {
+    private const val FILE_NAME = "last_crash.txt"
+
+    /** Wraps the app's existing uncaught-exception handler so every fatal crash is saved first. */
+    fun install(context: Context) {
+        val appContext = context.applicationContext
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            try {
+                writeCrash(appContext, error)
+            } catch (_: Throwable) {
+                // The logger itself must never cause a second crash while handling the first.
+            }
+            previous?.uncaughtException(thread, error)
+        }
+    }
+
+    private fun writeCrash(context: Context, error: Throwable) {
+        val writer = StringWriter()
+        error.printStackTrace(PrintWriter(writer))
+        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val text = "TG Ledger crash - $timestamp\n\n$writer"
+        File(context.filesDir, FILE_NAME).writeText(text)
+    }
+
+    /** Returns the saved crash report, if any, or null when the app hasn't crashed since it was last cleared. */
+    fun readLastCrash(context: Context): String? {
+        val file = File(context.filesDir, FILE_NAME)
+        return if (file.exists()) file.readText() else null
+    }
+
+    fun clear(context: Context) {
+        File(context.filesDir, FILE_NAME).delete()
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt
+
+```kotlin
+package com.semmyx.ledger.editor
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
@@ -3277,10 +3362,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -3389,16 +3474,16 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/editor/EntryViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.editor
+package com.semmyx.ledger.editor
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import java.time.Clock
 import java.time.LocalDate
 import java.util.UUID
@@ -3489,10 +3574,10 @@ class EntryViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/history/HistoryScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.history
+package com.semmyx.ledger.history
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -3509,8 +3594,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.EntryType
 import com.semmyx.ledger.domain.bank.Banks
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -3546,10 +3631,10 @@ fun HistoryScreen(model: HistoryViewModel, onBack: () -> Unit, onEdit: (String) 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/history/HistoryViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.history
+package com.semmyx.ledger.history
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -3578,10 +3663,255 @@ class HistoryViewModel(repository: EntryRepository, preferences: PreferencesRepo
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/onboarding/OnboardingScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.onboarding
+package com.semmyx.ledger.navigation
+
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import com.semmyx.ledger.history.*
+import java.time.YearMonth
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import com.semmyx.ledger.platform.HighRefreshRate
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavType
+import androidx.navigation.compose.*
+import androidx.navigation.navArgument
+import com.semmyx.ledger.AppContainer
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.ThemeMode
+import com.semmyx.ledger.platform.BiometricUnlocker
+import com.semmyx.ledger.support.SupportNavigator
+import com.semmyx.ledger.auth.*
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.dashboard.*
+import com.semmyx.ledger.analytics.*
+import com.semmyx.ledger.bank.*
+import com.semmyx.ledger.editor.*
+import com.semmyx.ledger.onboarding.OnboardingScreen
+import com.semmyx.ledger.settings.*
+import com.semmyx.ledger.support.*
+import com.semmyx.ledger.theme.*
+
+@Composable
+fun AppRoot(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
+    CompositionLocalProvider(LocalActivityResultRegistryOwner provides host, LocalOnBackPressedDispatcherOwner provides host) {
+        AppRootContent(host, model, container)
+    }
+}
+
+@Composable
+private fun AppRootContent(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
+    val state by model.state.collectAsStateWithLifecycle()
+    LifecycleResumeEffect(state.preferences.refreshRateHz) {
+        HighRefreshRate.request(host, state.preferences.refreshRateHz)
+        onPauseOrDispose { }
+    }
+    var supportVisible by remember { mutableStateOf(false) }
+    // Registered unconditionally here, in AppRoot's very first composition (before the PIN
+    // screen even shows), never inside the Dashboard graph. An Activity Result launcher must be
+    // registered before the host Activity passes STARTED; the Dashboard route is only entered
+    // after the user unlocks with their PIN -- long after the Activity is already STARTED -- so
+    // registering it there always throws "LifecycleOwners must call register before they are
+    // STARTED", whether that registration sits inside a lazy list item or at the top of the
+    // screen. Only the *handling* of a result is Dashboard-specific, so that part is supplied
+    // later via a mutable callback the Dashboard route swaps in once it has real data.
+    var onSpeechResult by remember { mutableStateOf<(Intent?) -> Unit>({}) }
+    var onMicPermissionResult by remember { mutableStateOf<(Boolean) -> Unit>({}) }
+    val speechRecognizerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result -> onSpeechResult(result.data) }
+    val micPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> onMicPermissionResult(granted) }
+    LocalizedContent(state.preferences.language) {
+        LedgerTheme(state.preferences.theme, state.preferences.colorOverrides) {
+            val dark = when (state.preferences.theme) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false
+            }
+            SideEffect {
+                WindowCompat.getInsetsController(host.window, host.window.decorView).apply {
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
+                }
+            }
+            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                // Never cross-fade private content into a lock screen.
+                when {
+                    !state.ready -> LoadingState()
+                    state.failed -> Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.security_error), stringResource(R.string.retry), model::retry)
+                        TextButton(onClick = { supportVisible = true }) { Text(stringResource(R.string.need_help)) }
+                    }
+                    !state.preferences.onboardingComplete -> OnboardingScreen(model::completeOnboarding)
+                    !state.unlocked -> AuthenticationRoute(host, container, state, onUnlock = {
+                        if (host.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) model.unlock()
+                    }, onSupport = { supportVisible = true })
+                    else -> UnlockedGraph(host, container, state, model::lock, { container.billing.launchPurchase(host) }, { supportVisible = true },
+                        speechRecognizerLauncher, micPermissionLauncher, { onSpeechResult = it }, { onMicPermissionResult = it })
+                }
+                if (supportVisible) SupportSheet(onDismiss = { supportVisible = false }, onContact = {
+                    supportVisible = false
+                    SupportNavigator.open(host)
+                })
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuthenticationRoute(host: FragmentActivity, container: AppContainer, appState: AppState, onUnlock: () -> Unit, onSupport: () -> Unit) {
+    // The auth-attempt owner is disposed on background lock; cancellation wipes PIN buffers.
+    val store = remember(appState.lockEpoch) { ViewModelStore() }
+    val owner = remember(store) { object : ViewModelStoreOwner { override val viewModelStore = store } }
+    DisposableEffect(store) { onDispose { store.clear() } }
+    val model: AuthViewModel = viewModel(viewModelStoreOwner = owner, factory = LedgerViewModelFactory(AuthViewModel::class.java) {
+        AuthViewModel(!appState.hasPin, container.security)
+    })
+    val auth by model.state.collectAsStateWithLifecycle()
+    val unlocker = remember(store, host) { BiometricUnlocker(host, container.biometricKeys) }
+    DisposableEffect(unlocker) { onDispose { unlocker.cancel() } }
+    LaunchedEffect(model) { model.unlocked.collect { onUnlock() } }
+    val title = stringResource(R.string.biometric_title)
+    val subtitle = stringResource(R.string.biometric_subtitle)
+    val negative = stringResource(R.string.use_pin)
+    AuthenticationScreen(auth, appState.preferences.biometricsEnabled && container.biometricAvailable(), model::digit, model::erase,
+        model::startOver, onBiometric = { unlocker.authenticate(title, subtitle, negative, onUnlock, model::biometricFailed) }, onSupport = onSupport)
+}
+
+@Composable
+private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appState: AppState, onLock: () -> Unit, onPurchase: () -> Unit, onSupport: () -> Unit,
+    speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
+    setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit) {
+    val nav = rememberNavController()
+    val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
+    val onNavigate: (Int) -> Unit = { index ->
+        nav.navigate(routes[index]) {
+            popUpTo("dashboard") { saveState = true }
+            launchSingleTop = true
+            restoreState = true
+        }
+    }
+    NavHost(navController = nav, startDestination = "dashboard") {
+        composable("dashboard") {
+            val model: DashboardViewModel = viewModel(factory = LedgerViewModelFactory(DashboardViewModel::class.java) {
+                DashboardViewModel(container.entries, container.preferences, container.premium, container.observeDashboard, container.clock, container.saveEntry)
+            })
+            DashboardRoute(model, host, onNavigate, onAdd = { nav.navigate("entry/new") }, onEdit = { nav.navigate("entry/$it") },
+                speechRecognizerLauncher = speechRecognizerLauncher, micPermissionLauncher = micPermissionLauncher,
+                setOnSpeechResult = setOnSpeechResult, setOnMicPermissionResult = setOnMicPermissionResult)
+        }
+        composable("settings") {
+            val model: SettingsViewModel = viewModel(factory = LedgerViewModelFactory(SettingsViewModel::class.java) {
+                SettingsViewModel(container.preferences, container.premium, container.rates, container::configureBiometrics)
+            })
+            SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
+        }
+        composable("help") { HelpScreen(onNavigate, onSupport) }
+        composable("analytics") {
+            val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
+                AnalyticsViewModel(container.entries, container.preferences, container.clock)
+            })
+            AnalyticsRoute(model, onBack = { onNavigate(0) }, onCurrency = { onNavigate(1) },
+                onEdit = { nav.navigate("entry/$it") },
+                onHistory = { month -> nav.navigate(if (month == null) "history" else "history?month=$month") })
+        }
+        composable("history?month={month}", arguments = listOf(navArgument("month") { type = NavType.StringType; nullable = true; defaultValue = null })) { backStack ->
+            val month = backStack.arguments?.getString("month")?.let { value -> runCatching { YearMonth.parse(value) }.getOrNull() }
+            val historyModel: HistoryViewModel = viewModel(factory = LedgerViewModelFactory(HistoryViewModel::class.java) {
+                HistoryViewModel(container.entries, container.preferences, container.clock, month)
+            })
+            HistoryScreen(historyModel, onBack = { nav.popBackStack() }, onEdit = { nav.navigate("entry/$it") })
+        }
+        composable("banks") {
+            val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
+                BankViewModel(container.bankImport, container.preferences, container.clock)
+            })
+            BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
+                onEdit = { nav.navigate("entry/$it") })
+        }
+        composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
+            val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }
+            val model: EntryViewModel = viewModel(factory = LedgerViewModelFactory(EntryViewModel::class.java) {
+                EntryViewModel(id, container.entries, container.preferences, container.saveEntry, container.clock)
+            })
+            val categories by container.bankImport.categories().collectAsStateWithLifecycle(initialValue = emptyList())
+            EntryRoute(model, appState.preferences.language, onBack = { nav.popBackStack() }, customCategories = categories)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.navigation
+
+import androidx.lifecycle.ViewModel
+import com.semmyx.ledger.domain.PreferencesRepository
+import com.semmyx.ledger.domain.SecurityRepository
+import com.semmyx.ledger.domain.UserPreferences
+import com.semmyx.ledger.common.guarded
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+data class AppState(
+    val ready: Boolean = false,
+    val preferences: UserPreferences = UserPreferences(),
+    val hasPin: Boolean = false,
+    val unlocked: Boolean = false,
+    val failed: Boolean = false,
+    val lockEpoch: Long = 0,
+)
+
+class AppViewModel(private val preferences: PreferencesRepository, private val security: SecurityRepository) : ViewModel() {
+    private val mutableState = MutableStateFlow(AppState())
+    val state = mutableState.asStateFlow()
+    private var bootstrap: Job? = null
+    init { retry() }
+
+    fun retry() {
+        bootstrap?.cancel()
+        mutableState.value = AppState()
+        bootstrap = guarded(onError = { mutableState.update { it.copy(ready = true, failed = true, unlocked = false) } }) {
+            val configured = security.hasPin()
+            mutableState.update { it.copy(hasPin = configured) }
+            preferences.preferences.collect { prefs ->
+                mutableState.update { it.copy(ready = true, preferences = prefs, failed = false) }
+            }
+        }
+    }
+    fun completeOnboarding() {
+        guarded(onError = { mutableState.update { it.copy(failed = true) } }) { preferences.completeOnboarding() }
+    }
+    /** Called only by the PIN verifier event or a successful crypto-bound biometric callback. */
+    fun unlock() { mutableState.update { it.copy(unlocked = true, hasPin = true) } }
+    fun lock() { mutableState.update { it.copy(unlocked = false, lockEpoch = it.lockEpoch + 1) } }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt
+
+```kotlin
+package com.semmyx.ledger.onboarding
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Image
@@ -3604,7 +3934,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
-import com.semmyx.ledger.presentation.common.LedgerMark
+import com.semmyx.ledger.common.LedgerMark
 import kotlinx.coroutines.launch
 
 @Composable
@@ -3656,288 +3986,132 @@ fun OnboardingScreen(onComplete: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/CatFaceMesh.kt
+## app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.premium
+package com.semmyx.ledger.platform
 
-import kotlin.math.*
-
-/** One texture, continuously deformed vertices. No eye-open/closed resource switching. */
-class CatFaceMesh(val columns: Int = 80, val rows: Int = 80) {
-    val vertices = FloatArray((columns + 1) * (rows + 1) * 2)
-    private val xs = FloatArray(vertices.size / 2)
-    private val ys = FloatArray(xs.size)
-    private val head = FloatArray(xs.size)
-    private val depth = FloatArray(xs.size)
-    private val lids = FloatArray(xs.size)
-    private val body = FloatArray(xs.size)
-    init {
-        var i = 0
-        for (row in 0..rows) for (column in 0..columns) {
-            val x = column.toFloat() / columns; val y = row.toFloat() / rows
-            xs[i] = x; ys[i] = y
-            head[i] = exp(-(((x - .5f) / .35f).toDouble().pow(4) + ((y - .37f) / .30f).toDouble().pow(4))).toFloat()
-            depth[i] = .10f * exp(-(((x - .5f) / .26f).toDouble().pow(2) + ((y - .42f) / .25f).toDouble().pow(2))).toFloat()
-            // Actual eye landmarks measured on cat_amber_base.webp, in normalized texture coordinates.
-            val eyeY = .396f
-            val left = exp(-(((x - .404f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
-            val right = exp(-(((x - .611f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
-            lids[i] = -(y - eyeY) * maxOf(left, right) * .98f
-            body[i] = exp(-(((x - .5f) / .38f).toDouble().pow(4) + ((y - .72f) / .25f).toDouble().pow(4))).toFloat()
-            i++
-        }
-    }
-    fun update(pose: CatPose, textureWidth: Int, textureHeight: Int): FloatArray {
-        val yaw = pose.yawDegrees.coerceIn(-18f, 18f) * PI.toFloat() / 180f
-        val pitch = pose.pitchDegrees.coerceIn(-10f, 10f) * PI.toFloat() / 180f
-        val cosine = cos(yaw); val sine = sin(yaw)
-        val blink = pose.blink.coerceIn(0f, 1f)
-        val expression = (pose.pleased * .045f).coerceIn(0f, .045f)
-        for (i in xs.indices) {
-            val x = xs[i]; val y = ys[i]
-            val h = head[i]
-            val dx = h * ((x - .5f) * (cosine - 1) + depth[i] * sine)
-            val dy = h * depth[i] * sin(pitch)
-            // Upper/lower fur regions move together around the iris. The eye aperture closes continuously.
-            val lid = lids[i] * (blink + expression * (1 - blink))
-            val breathing = pose.breath * .010f * body[i]
-            vertices[i * 2] = (x + dx + (x - .5f) * breathing) * textureWidth
-            vertices[i * 2 + 1] = (y + dy + lid - breathing * .25f) * textureHeight
-        }
-        return vertices
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/LiveCatMotion.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import androidx.compose.foundation.Image
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.repeatOnLifecycle
-import com.semmyx.ledger.R
-import kotlinx.coroutines.isActive
-import kotlin.math.*
+import com.semmyx.ledger.data.security.BiometricKeys
+import java.security.SecureRandom
 
-/** Engine-neutral, stable rig channels. Realistic artwork is supplied separately, never fabricated. */
-data class CatPose(val breath: Float = 0f, val blink: Float = 0f, val yawDegrees: Float = 0f,
-    val pitchDegrees: Float = 0f, val pleased: Float = 0f, val serious: Float = 0f, val listening: Boolean = false)
-
-interface CatRig {
-    fun morph(name: String, weight: Float)
-    fun head(yawDegrees: Float, pitchDegrees: Float)
-}
-
-/** Complete mapping from controller output to a rig; a Filament adapter implements CatRig. */
-class CatRigDriver(private val rig: CatRig) {
-    fun apply(pose: CatPose) {
-        rig.morph("breath", pose.breath)
-        rig.morph("blinkLeft", pose.blink)
-        rig.morph("blinkRight", pose.blink)
-        rig.morph("pleased", pose.pleased)
-        rig.morph("serious", pose.serious)
-        rig.morph("earsForward", if (pose.listening) 1f else .2f)
-        rig.head(pose.yawDegrees, pose.pitchDegrees)
-    }
-}
-
-class CatMotionController {
-    private var yaw = 0f
-    private var pitch = 0f
-    private var happy = .5f
-    private var lastTime = 0.0
-    fun step(seconds: Double, balanceMinor: Long, listening: Boolean, target: Offset): CatPose {
-        val dt = if (lastTime == 0.0) 1.0 / 120 else (seconds - lastTime).coerceIn(0.0, .1)
-        lastTime = seconds
-        val smooth = (1.0 - exp(-9.0 * dt)).toFloat()
-        yaw += (target.x.coerceIn(-1f, 1f) * 18f - yaw) * smooth
-        pitch += (target.y.coerceIn(-1f, 1f) * -10f - pitch) * smooth
-        val destination = if (balanceMinor < 0) 0f else if (balanceMinor > 0) 1f else .5f
-        happy += (destination - happy) * smooth
-        val cycle = seconds % 4.7
-        val blink = if (cycle < .22) sin(cycle / .22 * PI).toFloat().coerceIn(0f, 1f) else 0f
-        return CatPose(((sin(seconds * 2 * PI / 3.6) + 1) / 2).toFloat(), blink, yaw, pitch,
-            happy, 1f - happy, listening)
-    }
-}
-
-/** Install a licensed asset-backed implementation at the composition root to enable real 3D. */
-fun interface CatAssetRenderer {
-    @Composable fun Render(pose: CatPose, modifier: Modifier)
-}
-object CatAssetRegistry {
-    var renderer: CatAssetRenderer? by mutableStateOf(null)
-}
-object CatTouchBus {
-    var target by mutableStateOf(Offset.Zero)
-}
-
-/** Observe, don't consume: ordinary taps, scrolling, editing and speech buttons still work. */
-fun Modifier.trackCatTouch(): Modifier = pointerInput(Unit) {
-    awaitPointerEventScope {
-        while (true) {
-            val event = awaitPointerEvent(PointerEventPass.Initial)
-            event.changes.firstOrNull { it.pressed }?.let { change ->
-                CatTouchBus.target = Offset((change.position.x / size.width.coerceAtLeast(1) - .5f) * 2,
-                    (change.position.y / size.height.coerceAtLeast(1) - .5f) * 2)
-            }
-        }
-    }
-}
-
-@Composable
-fun LiveCatHost(balanceMinor: Long, listening: Boolean, skin: String, modifier: Modifier, motionEnabled: Boolean = true) {
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val controller = remember { CatMotionController() }
-    val balance by rememberUpdatedState(balanceMinor)
-    val hears by rememberUpdatedState(listening)
-    var pose by remember { mutableStateOf(CatPose()) }
-    LaunchedEffect(lifecycle, controller, motionEnabled) {
-        if (!motionEnabled) return@LaunchedEffect
-        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            while (isActive) withFrameNanos { time ->
-                pose = controller.step(time / 1e9, balance, hears, CatTouchBus.target)
-            }
-        }
-    }
-    val renderer = CatAssetRegistry.renderer
-    if (renderer != null) renderer.Render(pose, modifier)
-    else MeshCatRenderer(if (motionEnabled) pose else CatPose(pleased = if (balanceMinor > 0) 1f else 0f), modifier, skin = skin)
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/MeshCatRenderer.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Paint
-import androidx.compose.foundation.Canvas
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.platform.LocalContext
-import com.semmyx.ledger.R
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-
-/** A single decoded bitmap + a real-time mesh. Blink/yaw never change the resource. */
-@Composable
-fun MeshCatRenderer(pose: CatPose, modifier: Modifier, skin: String = "gray") {
-    val app = LocalContext.current.applicationContext
-    // Decode each appearance once. Frame updates and blinking only deform the shared mesh.
-    val textures by produceState<Pair<Bitmap?, Bitmap?>?>(initialValue = null, key1 = app) {
-        value = withContext(Dispatchers.IO) {
-            BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_base) to
-                BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_sky)
-        }
-    }
-    val bitmap = if (skin == "sky") textures?.second ?: textures?.first else textures?.first
-    val mesh = remember { CatFaceMesh() }
-    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG) }
-    Canvas(modifier) {
-        val image = bitmap ?: return@Canvas
-        val scale = minOf(size.width / image.width, size.height / image.height)
-        val left = (size.width - image.width * scale) / 2f
-        val top = (size.height - image.height * scale) / 2f
-        val verts = mesh.update(pose, image.width, image.height)
-        drawIntoCanvas { wrapper ->
-            val native = wrapper.nativeCanvas
-            val saved = native.save()
-            native.translate(left, top)
-            native.scale(scale, scale)
-            native.drawBitmapMesh(image, mesh.columns, mesh.rows, verts, 0, null, 0, paint)
-            native.restoreToCount(saved)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/PremiumMascotAssistant.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.AppLanguage
-
-@Composable
-fun AssistantCharacterCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
-    modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
-    onText: (String) -> Unit = {}, balanceMinor: Long = 0) {
-    var text by remember { mutableStateOf("") }
-    var typing by remember { mutableStateOf(false) }
-    val label = stringResource(R.string.voice_assistant_button)
-    Surface(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(24.dp)) {
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
-                .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
-                .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
-            Text(if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
-                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
-            AnimatedVisibility(typing, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
-                Column {
-                    OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
-                        label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)
-                    TextButton(enabled = text.isNotBlank() && !listening, onClick = { val value = text; text = ""; onText(value) }) {
-                        Text(stringResource(R.string.assistant_send))
+/** A callback without the crypto object is never sufficient to unlock. */
+class BiometricUnlocker(
+    private val activity: FragmentActivity,
+    private val keys: BiometricKeys,
+) {
+    private var prompt: BiometricPrompt? = null
+    fun authenticate(title: String, subtitle: String, negative: String, success: () -> Unit, failure: () -> Unit) {
+        try {
+            val cipher = keys.authenticationCipher()
+            val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val biometricPrompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity),
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        try {
+                            val authenticated = requireNotNull(result.cryptoObject?.cipher)
+                            require(authenticated === cipher)
+                            authenticated.doFinal(challenge) // Keystore enforces a fresh strong-biometric auth.
+                            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) success()
+                        } catch (_: Exception) { failure() }
+                        finally { challenge.fill(0) }
                     }
-                }
-            }
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        challenge.fill(0)
+                        if (errorCode != BiometricPrompt.ERROR_USER_CANCELED && errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON && errorCode != BiometricPrompt.ERROR_CANCELED) failure()
+                    }
+                    override fun onAuthenticationFailed() { failure() }
+                })
+            prompt = biometricPrompt
+            val info = BiometricPrompt.PromptInfo.Builder().setTitle(title).setSubtitle(subtitle)
+                .setNegativeButtonText(negative).setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .setConfirmationRequired(true).build()
+            biometricPrompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        } catch (_: Exception) {
+            // Invalidated enrollment keys are not recreated at the lock screen; use the PIN.
+            failure()
+        }
+    }
+    fun cancel() { prompt?.cancelAuthentication(); prompt = null }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt
+
+```kotlin
+package com.semmyx.ledger.platform
+
+import android.app.Activity
+import android.view.Display
+import kotlin.math.abs
+
+object HighRefreshRate {
+    fun supported(display: Display?): Set<Int> {
+        if (display == null) return setOf(60)
+        val current = display.mode
+        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        return listOf(60, 90, 120).filter { rate -> modes.any { abs(it.refreshRate - rate) <= 1.1f } }.toSet()
+    }
+    fun request(activity: Activity, requestedHz: Int = 0) {
+        val display = activity.window.decorView.display ?: return
+        val current = display.mode
+        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        val exact = modes.filter { requestedHz > 0 && abs(it.refreshRate - requestedHz) <= 1.1f }.firstOrNull()
+        val selected = if (requestedHz == 0) null else (exact
+            ?: modes.filter { it.refreshRate <= requestedHz + 1.1f }.maxByOrNull { it.refreshRate }
+            ?: modes.minByOrNull { it.refreshRate })
+        activity.window.attributes = activity.window.attributes.apply {
+            // Auto releases the override back to Android, rather than forcing the maximum forever.
+            preferredDisplayModeId = selected?.modeId ?: 0
+            preferredRefreshRate = selected?.refreshRate ?: 0f
         }
     }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/ColorSettings.kt
+## app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.platform
+
+import android.content.Context
+import androidx.work.*
+import com.semmyx.ledger.LedgerApplication
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+
+/** Only public rates are refreshed in the background; personal entries never leave Room. */
+class RateRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        val container = (applicationContext as LedgerApplication).container
+        return try {
+            container.entries.purgeDeletedBefore(container.clock.millis() - TimeUnit.DAYS.toMillis(1))
+            container.rates.refresh()
+            Result.success()
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            if (runAttemptCount >= 4) Result.failure() else Result.retry()
+        }
+    }
+    companion object {
+        fun schedule(context: Context) {
+            val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).setRequiresBatteryNotLow(true).build()
+            val periodic = PeriodicWorkRequestBuilder<RateRefreshWorker>(24, TimeUnit.HOURS)
+                .setConstraints(constraints).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build()
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork("reference-rates", ExistingPeriodicWorkPolicy.UPDATE, periodic)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt
+
+```kotlin
+package com.semmyx.ledger.settings
 
 import android.graphics.Color as AndroidColor
 import androidx.compose.foundation.background
@@ -3956,9 +4130,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
-import com.semmyx.ledger.presentation.theme.readableOn
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
+import com.semmyx.ledger.theme.readableOn
 import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -4076,10 +4250,10 @@ private fun roleLabel(role: String): Int = when (role) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/SettingsScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.settings
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -4104,7 +4278,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.semmyx.ledger.R
 import com.semmyx.ledger.diagnostics.CrashLogger
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import java.text.NumberFormat
 import java.util.Locale
 import kotlinx.coroutines.launch
@@ -4348,16 +4522,16 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/SettingsViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 
@@ -4432,10 +4606,10 @@ class SettingsViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/support/HelpScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.support
+package com.semmyx.ledger.support
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -4446,8 +4620,8 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
-import com.semmyx.ledger.presentation.common.ContentCard
-import com.semmyx.ledger.presentation.common.LedgerBottomBar
+import com.semmyx.ledger.common.ContentCard
+import com.semmyx.ledger.common.LedgerBottomBar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -4481,10 +4655,50 @@ fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/support/SupportSheet.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.support
+package com.semmyx.ledger.support
+
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+
+object SupportNavigator {
+    const val HANDLE = "@semmyxth"
+    const val WEB_URL = "https://t.me/semmyxth"
+    private val officialPackages = listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram")
+
+    fun open(activity: Activity) {
+        if (!openTelegram(activity)) activity.startActivity(Intent(activity, SupportWebActivity::class.java))
+    }
+    fun openTelegram(activity: Activity): Boolean {
+        for (packageName in officialPackages) {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=semmyxth")).setPackage(packageName)
+            @Suppress("DEPRECATION")
+            val resolved = activity.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo
+            if (resolved == null || !resolved.exported || resolved.packageName != packageName) continue
+            intent.component = ComponentName(resolved.packageName, resolved.name) // Explicit, not a hijackable chooser.
+            try {
+                activity.startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+                // App could have been removed between resolution and launch; try the next official client.
+                continue
+            } catch (_: SecurityException) { continue }
+        }
+        return false
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt
+
+```kotlin
+package com.semmyx.ledger.support
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -4504,8 +4718,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
-import com.semmyx.ledger.platform.SupportNavigator
-import com.semmyx.ledger.presentation.common.ContentCard
+import com.semmyx.ledger.common.ContentCard
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -4541,10 +4754,119 @@ fun SupportSheet(onDismiss: () -> Unit, onContact: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/theme/AppearancePalette.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.theme
+package com.semmyx.ledger.support
+
+import android.annotation.SuppressLint
+import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.semmyx.ledger.LedgerApplication
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.UserPreferences
+import com.semmyx.ledger.theme.LedgerTheme
+import com.semmyx.ledger.theme.LocalizedContent
+
+/** Non-exported HTTPS-only fallback. No JS bridge, file access, SSL bypass, or arbitrary URL input. */
+class SupportWebActivity : ComponentActivity() {
+    @OptIn(ExperimentalMaterial3Api::class)
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            val prefs by (application as LedgerApplication).container.preferences.preferences
+                .collectAsStateWithLifecycle(initialValue = UserPreferences())
+            LocalizedContent(prefs.language) {
+                LedgerTheme(prefs.theme) {
+                    var error by remember { mutableStateOf(false) }
+                    var loading by remember { mutableStateOf(true) }
+                    var webView by remember { mutableStateOf<WebView?>(null) }
+                    BackHandler { if (webView?.canGoBack() == true) webView?.goBack() else finish() }
+                    DisposableEffect(Unit) {
+                        onDispose {
+                            webView?.let { view ->
+                                view.stopLoading()
+                                (view.parent as? ViewGroup)?.removeView(view)
+                                view.destroy()
+                            }
+                            webView = null
+                        }
+                    }
+                    Scaffold(topBar = {
+                        TopAppBar(title = { Text(stringResource(R.string.telegram_support)) }, navigationIcon = {
+                            IconButton(onClick = { finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
+                        })
+                    }) { padding ->
+                        Column(Modifier.fillMaxSize().padding(padding)) {
+                            if (loading && !error) LinearProgressIndicator(Modifier.fillMaxWidth())
+                            if (error) {
+                                Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                    Text(stringResource(R.string.support_network_error))
+                                    Button(onClick = { error = false; loading = true; webView?.loadUrl(SupportNavigator.WEB_URL) }) {
+                                        Text(stringResource(R.string.retry))
+                                    }
+                                }
+                            }
+                            AndroidView(modifier = Modifier.fillMaxWidth().weight(1f), factory = { context ->
+                                WebView(context).apply {
+                                    settings.javaScriptEnabled = false
+                                    settings.allowFileAccess = false
+                                    settings.allowContentAccess = false
+                                    settings.domStorageEnabled = false
+                                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                                    settings.safeBrowsingEnabled = true
+                                    webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                                            val uri = request.url
+                                            if (uri.scheme == "tg" && request.hasGesture()) {
+                                                SupportNavigator.openTelegram(this@SupportWebActivity)
+                                                return true
+                                            }
+                                            return uri.scheme != "https" || uri.host != "t.me"
+                                        }
+                                        override fun onPageFinished(view: WebView, url: String) { loading = false }
+                                        override fun onReceivedError(view: WebView, request: WebResourceRequest, failure: WebResourceError) {
+                                            if (request.isForMainFrame) { error = true; loading = false }
+                                        }
+                                    }
+                                    webView = this
+                                    loadUrl(SupportNavigator.WEB_URL)
+                                }
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt
+
+```kotlin
+package com.semmyx.ledger.theme
 
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
@@ -4569,10 +4891,10 @@ val LocalAppearance = staticCompositionLocalOf { AppearancePalette() }
 fun readableOn(background: Color): Color = if (background.luminance() > .179f) Color.Black else Color.White
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/theme/Theme.kt
+## app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.theme
+package com.semmyx.ledger.theme
 
 import android.content.res.Configuration
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -4593,64 +4915,174 @@ import com.semmyx.ledger.domain.AppLanguage
 import com.semmyx.ledger.domain.ThemeMode
 import java.util.Locale
 
+// ---------------------------------------------------------------------------
+// Premium color palette
+// Light: warm white surfaces + deep indigo primary + emerald income
+// Dark : pure OLED black + soft periwinkle + vivid emerald — no grey wash
+// ---------------------------------------------------------------------------
+
 private val LightColors = lightColorScheme(
-    primary = Color(0xFF1665C8), onPrimary = Color.White,
-    primaryContainer = Color(0xFFE7F0FF), onPrimaryContainer = Color(0xFF123460),
-    secondary = Color(0xFF216D56), onSecondary = Color.White,
-    secondaryContainer = Color(0xFFE2F2EA), onSecondaryContainer = Color(0xFF15533D),
-    background = Color(0xFFF6F8FC), onBackground = Color(0xFF142238),
-    surface = Color.White, onSurface = Color(0xFF142238),
-    surfaceVariant = Color(0xFFEAF0F7), onSurfaceVariant = Color(0xFF526175),
-    outline = Color(0xFF788697), outlineVariant = Color(0xFFDCE4EE),
-    error = Color(0xFFB3261E), onError = Color.White,
-)
-private val DarkColors = darkColorScheme(
-    primary = Color(0xFF6FAEFF), onPrimary = Color(0xFF061D3C),
-    primaryContainer = Color(0xFF152C49), onPrimaryContainer = Color(0xFFD0E4FF),
-    secondary = Color(0xFF35CB77), onSecondary = Color(0xFF002D15),
-    secondaryContainer = Color(0xFF0C3321), onSecondaryContainer = Color(0xFFB5F5CE),
-    background = Color.Black, onBackground = Color(0xFFF5F5F6),
-    surface = Color(0xFF1C1D1D), onSurface = Color(0xFFF5F5F6),
-    surfaceVariant = Color(0xFF252626), onSurfaceVariant = Color(0xFFA1A4A2),
-    outline = Color(0xFF6C706D), outlineVariant = Color(0xFF333633),
-    error = Color(0xFFFF6683), onError = Color(0xFF320009),
-)
-private val LedgerTypography = Typography(
-    headlineLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 32.sp, lineHeight = 40.sp),
-    headlineMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 28.sp, lineHeight = 36.sp),
-    titleLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
-    titleMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 24.sp),
-    bodyLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp),
-    bodyMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp),
-    labelLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp),
+    primary            = Color(0xFF3D5AFE),   // Indigo A400 — vibrant but not garish
+    onPrimary          = Color.White,
+    primaryContainer   = Color(0xFFE8EAFF),
+    onPrimaryContainer = Color(0xFF001480),
+
+    secondary            = Color(0xFF00875A),   // Emerald — income
+    onSecondary          = Color.White,
+    secondaryContainer   = Color(0xFFD7F5E8),
+    onSecondaryContainer = Color(0xFF00391F),
+
+    tertiary            = Color(0xFFFF5252),    // Crimson — expense
+    onTertiary          = Color.White,
+    tertiaryContainer   = Color(0xFFFFDEDE),
+    onTertiaryContainer = Color(0xFF7F0000),
+
+    background   = Color(0xFFF5F6FF),           // Slightly blue-tinted white
+    onBackground = Color(0xFF0D0E1A),
+
+    surface        = Color(0xFFFFFFFF),
+    onSurface      = Color(0xFF0D0E1A),
+    surfaceVariant = Color(0xFFEDEEFF),
+    onSurfaceVariant = Color(0xFF4A4C6B),
+
+    outline        = Color(0xFF9496B4),
+    outlineVariant = Color(0xFFD8D9F0),
+
+    error   = Color(0xFFB00020),
+    onError = Color.White,
 )
 
+private val DarkColors = darkColorScheme(
+    primary            = Color(0xFF8EA7FF),   // Soft periwinkle on pure black
+    onPrimary          = Color(0xFF001480),
+    primaryContainer   = Color(0xFF1A237E),
+    onPrimaryContainer = Color(0xFFCDD5FF),
+
+    secondary            = Color(0xFF2ECC71),   // Bright emerald
+    onSecondary          = Color(0xFF00391F),
+    secondaryContainer   = Color(0xFF00512E),
+    onSecondaryContainer = Color(0xFFA7F3C6),
+
+    tertiary            = Color(0xFFFF6E6E),    // Bright red
+    onTertiary          = Color(0xFF7F0000),
+    tertiaryContainer   = Color(0xFF5C0000),
+    onTertiaryContainer = Color(0xFFFFCDD2),
+
+    background   = Color(0xFF000000),           // Pure OLED
+    onBackground = Color(0xFFF0F0FF),
+
+    surface        = Color(0xFF111218),         // Very dark blue-grey
+    onSurface      = Color(0xFFF0F0FF),
+    surfaceVariant = Color(0xFF1C1E30),
+    onSurfaceVariant = Color(0xFFB0B3D8),
+
+    outline        = Color(0xFF5C5E80),
+    outlineVariant = Color(0xFF2A2C46),
+
+    error   = Color(0xFFFF6680),
+    onError = Color(0xFF4A0010),
+)
+
+// ---------------------------------------------------------------------------
+// Typography — slightly larger line-heights prevent text clipping
+// ---------------------------------------------------------------------------
+
+private val LedgerTypography = Typography(
+    displayLarge  = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold,     fontSize = 57.sp, lineHeight = 64.sp, letterSpacing = (-0.25).sp),
+    displayMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold,     fontSize = 45.sp, lineHeight = 52.sp),
+    headlineLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 32.sp, lineHeight = 42.sp),
+    headlineMedium= TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 28.sp, lineHeight = 38.sp),
+    headlineSmall = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 24.sp, lineHeight = 32.sp),
+    titleLarge    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 30.sp),
+    titleMedium   = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.15.sp),
+    titleSmall    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    bodyLarge     = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 16.sp, lineHeight = 26.sp, letterSpacing = 0.5.sp),
+    bodyMedium    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 14.sp, lineHeight = 22.sp, letterSpacing = 0.25.sp),
+    bodySmall     = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 12.sp, lineHeight = 18.sp, letterSpacing = 0.4.sp),
+    labelLarge    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    labelMedium   = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 12.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp),
+    labelSmall    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 11.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp),
+)
+
+// ---------------------------------------------------------------------------
+// Premium shape scale — softer corners everywhere
+// ---------------------------------------------------------------------------
+
+private val LedgerShapes = Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small      = RoundedCornerShape(12.dp),
+    medium     = RoundedCornerShape(16.dp),
+    large      = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+)
+
+// ---------------------------------------------------------------------------
+// Theme entry point
+// ---------------------------------------------------------------------------
+
 @Composable
-fun LedgerTheme(mode: ThemeMode = ThemeMode.SYSTEM, overrides: Map<String, String> = emptyMap(), content: @Composable () -> Unit) {
-    val dark = when (mode) { ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false }
-    val palette = remember(overrides, dark) { AppearancePalette(overrides,
-        if (dark) emptyMap() else mapOf("background" to "#F6F8FC", "surface" to "#FFFFFF", "text" to "#142238", "muted" to "#526175")) }
-    val base = if (dark) DarkColors else LightColors
+fun LedgerTheme(
+    mode: ThemeMode = ThemeMode.SYSTEM,
+    overrides: Map<String, String> = emptyMap(),
+    content: @Composable () -> Unit,
+) {
+    val dark = when (mode) {
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+        ThemeMode.DARK   -> true
+        ThemeMode.LIGHT  -> false
+    }
+    val palette = remember(overrides, dark) {
+        AppearancePalette(
+            overrides,
+            if (dark) emptyMap()
+            else mapOf(
+                "background" to "#F5F6FF",
+                "surface"    to "#FFFFFF",
+                "text"       to "#0D0E1A",
+                "muted"      to "#4A4C6B",
+            ),
+        )
+    }
+    val base   = if (dark) DarkColors else LightColors
     val accent = palette.color("accent")
-    val scheme = base.copy(primary = accent, onPrimary = readableOn(accent),
-        primaryContainer = accent.copy(alpha = .18f), onPrimaryContainer = accent,
-        secondary = palette.color("income"), onSecondary = readableOn(palette.color("income")),
-        secondaryContainer = palette.color("income").copy(alpha = .18f), onSecondaryContainer = palette.color("income"),
-        surfaceTint = accent, error = palette.color("error"), onError = readableOn(palette.color("error")),
-        tertiaryContainer = palette.color("expense").copy(alpha = .18f), onTertiaryContainer = palette.color("expense"),
-        tertiary = palette.color("expense"), onTertiary = readableOn(palette.color("expense")),
-        background = if (dark || overrides.containsKey("background")) palette.color("background") else base.background,
-        surface = if (dark || overrides.containsKey("surface")) palette.color("surface") else base.surface,
-        onBackground = if (dark || overrides.containsKey("text")) palette.color("text") else base.onBackground,
-        onSurface = if (dark || overrides.containsKey("text")) palette.color("text") else base.onSurface,
-        surfaceVariant = if (dark || overrides.containsKey("surface")) palette.color("surface") else base.surfaceVariant,
-        onSurfaceVariant = if (dark || overrides.containsKey("muted")) palette.color("muted") else base.onSurfaceVariant,
-        outline = palette.color("grid"), outlineVariant = palette.color("grid"))
+    val scheme = base.copy(
+        primary              = accent,
+        onPrimary            = readableOn(accent),
+        primaryContainer     = accent.copy(alpha = .18f),
+        onPrimaryContainer   = accent,
+        secondary            = palette.color("income"),
+        onSecondary          = readableOn(palette.color("income")),
+        secondaryContainer   = palette.color("income").copy(alpha = .18f),
+        onSecondaryContainer = palette.color("income"),
+        surfaceTint          = accent,
+        error                = palette.color("error"),
+        onError              = readableOn(palette.color("error")),
+        tertiaryContainer    = palette.color("expense").copy(alpha = .18f),
+        onTertiaryContainer  = palette.color("expense"),
+        tertiary             = palette.color("expense"),
+        onTertiary           = readableOn(palette.color("expense")),
+        background           = if (dark || overrides.containsKey("background")) palette.color("background") else base.background,
+        surface              = if (dark || overrides.containsKey("surface"))    palette.color("surface")    else base.surface,
+        onBackground         = if (dark || overrides.containsKey("text"))       palette.color("text")       else base.onBackground,
+        onSurface            = if (dark || overrides.containsKey("text"))       palette.color("text")       else base.onSurface,
+        surfaceVariant       = if (dark || overrides.containsKey("surface"))    palette.color("surface")    else base.surfaceVariant,
+        onSurfaceVariant     = if (dark || overrides.containsKey("muted"))      palette.color("muted")      else base.onSurfaceVariant,
+        outline              = palette.color("grid"),
+        outlineVariant       = palette.color("grid"),
+    )
     CompositionLocalProvider(LocalAppearance provides palette) {
-        MaterialTheme(colorScheme = scheme, typography = LedgerTypography,
-            shapes = Shapes(small = RoundedCornerShape(10.dp), medium = RoundedCornerShape(14.dp), large = RoundedCornerShape(20.dp)), content = content)
+        MaterialTheme(
+            colorScheme = scheme,
+            typography  = LedgerTypography,
+            shapes      = LedgerShapes,
+            content     = content,
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Localization
+// ---------------------------------------------------------------------------
 
 /**
  * Compose-scoped configuration avoids Activity.recreate() and a process restart.
@@ -4660,72 +5092,18 @@ fun LedgerTheme(mode: ThemeMode = ThemeMode.SYSTEM, overrides: Map<String, Strin
  */
 @Composable
 fun LocalizedContent(language: AppLanguage, content: @Composable () -> Unit) {
-    val base = LocalContext.current
+    val base     = LocalContext.current
     val original = LocalConfiguration.current
-    val config = remember(original, language) {
+    val config   = remember(original, language) {
         Configuration(original).apply { setLocale(Locale.forLanguageTag(language.tag)) }
     }
     val localizedContext = remember(base, config) { base.createConfigurationContext(config) }
-    CompositionLocalProvider(LocalContext provides localizedContext, LocalConfiguration provides config,
-        LocalLayoutDirection provides LayoutDirection.Ltr, content = content)
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/voice/FinanceQuery.kt
-
-```kotlin
-package com.semmyx.ledger.voice
-
-import com.semmyx.ledger.domain.*
-import java.time.LocalDate
-
-/** Structured intent resolver. Queries are resolved BEFORE monetary entries, never saved as purchases. */
-sealed interface FinanceQuery {
-    data object Balance : FinanceQuery
-    enum class Period { TODAY, WEEK, MONTH, YEAR, ALL }
-    data class Statistics(val period: Period, val type: EntryType, val category: Category?) : FinanceQuery {
-        fun from(today: LocalDate): LocalDate = when (period) {
-            Period.TODAY -> today
-            Period.WEEK -> today.minusDays(6)
-            Period.MONTH -> today.withDayOfMonth(1)
-            Period.YEAR -> today.withDayOfYear(1)
-            Period.ALL -> FinanceWindow.EARLIEST
-        }
-    }
-    companion object {
-        fun parse(heard: String): FinanceQuery? {
-            val text = heard.lowercase().trim()
-            val balance = listOf("баланс", "balance", "скільки грошей", "сколько денег").any { it in text }
-            val hasNumber = Regex("\\d").containsMatchIn(text)
-            if (balance && !hasNumber) return Balance
-            val expense = listOf("витрат", "потрат", "расход", "spent", "spend", "expense").any { it in text }
-            val income = listOf("дохід", "доход", "заробив", "income", "earned").any { it in text }
-            if (!expense && !income) return null
-            val period = when {
-                listOf("весь час", "все время", "all time", "увесь час").any { it in text } -> Period.ALL
-                listOf("місяц", "месяц", "month").any { it in text } -> Period.MONTH
-                listOf("тиж", "недел", "week").any { it in text } -> Period.WEEK
-                listOf("за рік", "за год", "year").any { it in text } -> Period.YEAR
-                listOf("сьогодні", "сегодня", "today").any { it in text } -> Period.TODAY
-                else -> return null
-            }
-            // "I spent 100 today" describes an entry, not a statistics request.
-            if (hasNumber) return null
-            return Statistics(period, if (income) EntryType.INCOME else EntryType.EXPENSE, category(text))
-        }
-        fun category(text: String): Category? = listOf(
-            Category.TRANSFER to listOf("переказ", "перевод", "transfer"),
-            Category.DINING to listOf("ресторан", "restaurant", "кафе", "cafe"),
-            Category.CASHBACK to listOf("кешбек", "кэшбек", "cashback"),
-            Category.FOOD to listOf("продукт", "їж", "еду", "питан", "food", "grocer"),
-            Category.TRANSPORT to listOf("транспорт", "таксі", "такси", "transport", "fuel"),
-            Category.HOME to listOf("дім", "житло", "дом", "оренд", "комунал", "home", "rent"),
-            Category.HEALTH to listOf("здоров", "ліки", "лекар", "health", "medicine"),
-            Category.LEISURE to listOf("розваг", "развлеч", "leisure", "entertainment"),
-            Category.SALARY to listOf("зарплат", "salary"),
-            Category.OTHER to listOf("інше", "прочее", "other")
-        ).firstOrNull { (_, words) -> words.any { it in text } }?.first
-    }
+    CompositionLocalProvider(
+        LocalContext          provides localizedContext,
+        LocalConfiguration   provides config,
+        LocalLayoutDirection  provides LayoutDirection.Ltr,
+        content               = content,
+    )
 }
 ```
 
@@ -4873,7 +5251,7 @@ sealed interface VoiceCommand {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoney.kt
+## app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt
 
 ```kotlin
 package com.semmyx.ledger.voice
@@ -4884,7 +5262,7 @@ import java.text.NumberFormat
 import java.util.Locale
 
 /** Explicit words for minus and currency: TTS must never depend on pronunciation of '-' or ₴. */
-object SpokenMoney {
+object SpokenMoneyFormatter {
     fun format(minor: Long, currency: LedgerCurrency, language: AppLanguage): String {
         val uk = language == AppLanguage.UKRAINIAN
         val value = BigDecimal.valueOf(minor, 2).abs()
@@ -5045,6 +5423,64 @@ object VoiceEntryParser {
     // Explicit Unicode letter/number boundaries keep behavior consistent across Android/JVM.
     private val FILLER_PATTERNS = FILLER_WORDS.map {
         Regex("(?i)(?<![\\p{L}\\p{N}])" + Regex.escape(it) + "(?![\\p{L}\\p{N}])")
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt
+
+```kotlin
+package com.semmyx.ledger.voice
+
+import com.semmyx.ledger.domain.*
+import java.time.LocalDate
+
+/** Structured intent resolver. Queries are resolved BEFORE monetary entries, never saved as purchases. */
+sealed interface VoiceFinanceQuery {
+    data object Balance : VoiceFinanceQuery
+    enum class Period { TODAY, WEEK, MONTH, YEAR, ALL }
+    data class Statistics(val period: Period, val type: EntryType, val category: Category?) : VoiceFinanceQuery {
+        fun from(today: LocalDate): LocalDate = when (period) {
+            Period.TODAY -> today
+            Period.WEEK -> today.minusDays(6)
+            Period.MONTH -> today.withDayOfMonth(1)
+            Period.YEAR -> today.withDayOfYear(1)
+            Period.ALL -> FinanceWindow.EARLIEST
+        }
+    }
+    companion object {
+        fun parse(heard: String): VoiceFinanceQuery? {
+            val text = heard.lowercase().trim()
+            val balance = listOf("баланс", "balance", "скільки грошей", "сколько денег").any { it in text }
+            val hasNumber = Regex("\\d").containsMatchIn(text)
+            if (balance && !hasNumber) return Balance
+            val expense = listOf("витрат", "потрат", "расход", "spent", "spend", "expense").any { it in text }
+            val income = listOf("дохід", "доход", "заробив", "income", "earned").any { it in text }
+            if (!expense && !income) return null
+            val period = when {
+                listOf("весь час", "все время", "all time", "увесь час").any { it in text } -> Period.ALL
+                listOf("місяц", "месяц", "month").any { it in text } -> Period.MONTH
+                listOf("тиж", "недел", "week").any { it in text } -> Period.WEEK
+                listOf("за рік", "за год", "year").any { it in text } -> Period.YEAR
+                listOf("сьогодні", "сегодня", "today").any { it in text } -> Period.TODAY
+                else -> return null
+            }
+            // "I spent 100 today" describes an entry, not a statistics request.
+            if (hasNumber) return null
+            return Statistics(period, if (income) EntryType.INCOME else EntryType.EXPENSE, category(text))
+        }
+        fun category(text: String): Category? = listOf(
+            Category.TRANSFER to listOf("переказ", "перевод", "transfer"),
+            Category.DINING to listOf("ресторан", "restaurant", "кафе", "cafe"),
+            Category.CASHBACK to listOf("кешбек", "кэшбек", "cashback"),
+            Category.FOOD to listOf("продукт", "їж", "еду", "питан", "food", "grocer"),
+            Category.TRANSPORT to listOf("транспорт", "таксі", "такси", "transport", "fuel"),
+            Category.HOME to listOf("дім", "житло", "дом", "оренд", "комунал", "home", "rent"),
+            Category.HEALTH to listOf("здоров", "ліки", "лекар", "health", "medicine"),
+            Category.LEISURE to listOf("розваг", "развлеч", "leisure", "entertainment"),
+            Category.SALARY to listOf("зарплат", "salary"),
+            Category.OTHER to listOf("інше", "прочее", "other")
+        ).firstOrNull { (_, words) -> words.any { it in text } }?.first
     }
 }
 ```
@@ -6016,10 +6452,10 @@ object VoiceSmallTalk {
 </network-security-config>
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/presentation/MainDispatcherRule.kt
+## app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation
+package com.semmyx.ledger
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -6034,14 +6470,15 @@ class MainDispatcherRule(val dispatcher: TestDispatcher = StandardTestDispatcher
 }
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/presentation/ViewModelTest.kt
+## app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation
+package com.semmyx.ledger
 
 import androidx.lifecycle.ViewModelStore
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.auth.AuthViewModel
+import com.semmyx.ledger.auth.AuthViewModel
+import com.semmyx.ledger.navigation.AppViewModel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -6116,13 +6553,11 @@ private class TestPreferences : PreferencesRepository {
 }
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/voice/CatFaceMeshTest.kt
+## app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt
 
 ```kotlin
-package com.semmyx.ledger.voice
+package com.semmyx.ledger.cat
 
-import com.semmyx.ledger.presentation.premium.CatFaceMesh
-import com.semmyx.ledger.presentation.premium.CatPose
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -6167,28 +6602,28 @@ import org.junit.Test
 class FinanceUpgradeTest {
     private val today = LocalDate.of(2026, 10, 4)
     @Test fun monthlyQueryResolvesCurrentCalendarMonth() {
-        val query = FinanceQuery.parse("Скай витрати за місяць") as FinanceQuery.Statistics
+        val query = VoiceFinanceQuery.parse("Скай витрати за місяць") as VoiceFinanceQuery.Statistics
         assertEquals(EntryType.EXPENSE, query.type)
         assertEquals(LocalDate.of(2026, 10, 1), query.from(today))
         assertNull(query.category)
     }
     @Test fun monthlyFoodQuery() {
-        val query = FinanceQuery.parse("Скай витрати за місяць за продукти") as FinanceQuery.Statistics
+        val query = VoiceFinanceQuery.parse("Скай витрати за місяць за продукти") as VoiceFinanceQuery.Statistics
         assertEquals(Category.FOOD, query.category)
-        assertEquals(FinanceQuery.Period.MONTH, query.period)
+        assertEquals(VoiceFinanceQuery.Period.MONTH, query.period)
     }
     @Test fun russianAndEnglishQueries() {
-        assertEquals(Category.TRANSPORT, (FinanceQuery.parse("расходы за месяц на транспорт") as FinanceQuery.Statistics).category)
-        assertEquals(Category.FOOD, (FinanceQuery.parse("expenses this month for food") as FinanceQuery.Statistics).category)
+        assertEquals(Category.TRANSPORT, (VoiceFinanceQuery.parse("расходы за месяц на транспорт") as VoiceFinanceQuery.Statistics).category)
+        assertEquals(Category.FOOD, (VoiceFinanceQuery.parse("expenses this month for food") as VoiceFinanceQuery.Statistics).category)
     }
     @Test fun periodsAndIncome() {
-        assertEquals(today.minusDays(6), (FinanceQuery.parse("витрати за тиждень") as FinanceQuery.Statistics).from(today))
-        assertEquals(FinanceWindow.EARLIEST, (FinanceQuery.parse("витрати за весь час") as FinanceQuery.Statistics).from(today))
-        assertEquals(EntryType.INCOME, (FinanceQuery.parse("дохід за місяць") as FinanceQuery.Statistics).type)
-        assertEquals(today.withDayOfYear(1), (FinanceQuery.parse("витрати за рік") as FinanceQuery.Statistics).from(today))
+        assertEquals(today.minusDays(6), (VoiceFinanceQuery.parse("витрати за тиждень") as VoiceFinanceQuery.Statistics).from(today))
+        assertEquals(FinanceWindow.EARLIEST, (VoiceFinanceQuery.parse("витрати за весь час") as VoiceFinanceQuery.Statistics).from(today))
+        assertEquals(EntryType.INCOME, (VoiceFinanceQuery.parse("дохід за місяць") as VoiceFinanceQuery.Statistics).type)
+        assertEquals(today.withDayOfYear(1), (VoiceFinanceQuery.parse("витрати за рік") as VoiceFinanceQuery.Statistics).from(today))
     }
     @Test fun aPurchaseIsNotAStatisticsQuestion() {
-        assertNull(FinanceQuery.parse("я витратив 100 грн сьогодні"))
+        assertNull(VoiceFinanceQuery.parse("я витратив 100 грн сьогодні"))
         assertEquals(10000L, VoiceEntryParser.parse("я витратив 100 грн сьогодні")!!.amountMinor)
     }
     @Test fun missingCurrencyNeverIndexesMissingRegexGroup() {
@@ -6214,13 +6649,13 @@ class FinanceUpgradeTest {
         assertEquals(VoiceSmallTalk.Topic.GREETING, VoiceSmallTalk.classify("привет"))
     }
     @Test fun spokenNegativeHasAnExplicitMinusWord() {
-        assertEquals("мінус 2000 гривень", SpokenMoney.format(-200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
-        assertEquals("minus 2000 hryvnias", SpokenMoney.format(-200000, LedgerCurrency.UAH, AppLanguage.ENGLISH))
-        assertFalse(SpokenMoney.format(200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN).contains("мінус"))
-        assertTrue(SpokenMoney.format(Long.MIN_VALUE, LedgerCurrency.UAH, AppLanguage.ENGLISH).startsWith("minus "))
+        assertEquals("мінус 2000 гривень", SpokenMoneyFormatter.format(-200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
+        assertEquals("minus 2000 hryvnias", SpokenMoneyFormatter.format(-200000, LedgerCurrency.UAH, AppLanguage.ENGLISH))
+        assertFalse(SpokenMoneyFormatter.format(200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN).contains("мінус"))
+        assertTrue(SpokenMoneyFormatter.format(Long.MIN_VALUE, LedgerCurrency.UAH, AppLanguage.ENGLISH).startsWith("minus "))
     }
     @Test fun zeroIsNotDebt() {
-        assertEquals("0 гривень", SpokenMoney.format(0, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
+        assertEquals("0 гривень", SpokenMoneyFormatter.format(0, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
     }
 }
 ```
@@ -6482,6 +6917,437 @@ internal fun versionedProductParams(details: ProductDetails): BillingFlowParams.
 
 ```xml
 <manifest />
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import androidx.room.*
+import com.semmyx.ledger.data.local.EntryEntity
+import kotlinx.coroutines.flow.Flow
+
+@Entity(tableName = "custom_categories")
+data class CustomCategoryEntity(@PrimaryKey val id: String, val name: String, val colorHex: String)
+
+/**
+ * [groupKey] — SHA-256(amountMinor + currency + type + 5-minute epoch bucket).
+ * Two rows with the same groupKey represent the same physical card tap arriving
+ * from different source apps (e.g. wallet widget + issuing bank). The second row
+ * is flagged CROSS_DUPLICATE_REVIEW instead of REVIEW.
+ */
+@Entity(
+    tableName = "bank_inbox",
+    indices = [
+        Index(value = ["eventKey"], unique = true),
+        Index(value = ["groupKey"]),
+    ],
+)
+data class BankInboxEntity(
+    @PrimaryKey val id: String,
+    val eventKey: String,
+    val bankId: String,
+    val amountMinor: Long,
+    val currency: String,
+    val type: String,
+    val merchant: String,
+    val cardLast4: String?,
+    val eventAtMillis: Long,
+    val receivedAtMillis: Long,
+    val timeFromMessage: Boolean,
+    val transfer: Boolean,
+    val category: String,
+    val origin: String,
+    val status: String,
+    val entryId: String? = null,
+    /** nullable so existing rows (DB v2) are compatible without migration breakage. */
+    val groupKey: String? = null,
+)
+
+data class SourceSpendRow(val sourceType: String, val bankId: String?, val totalMinor: Long)
+data class DetailedCategoryRow(
+    val category: String,
+    val customCategoryId: String?,
+    val customName: String?,
+    val customColor: String?,
+    val totalMinor: Long,
+)
+
+@Dao
+interface BankDao {
+    @Query("SELECT * FROM custom_categories ORDER BY name")
+    fun categories(): Flow<List<CustomCategoryEntity>>
+
+    @Insert
+    suspend fun addCategory(category: CustomCategoryEntity)
+
+    @Query(
+        "SELECT * FROM bank_inbox WHERE status IN ('REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')" +
+            " ORDER BY receivedAtMillis DESC LIMIT 100",
+    )
+    fun inbox(): Flow<List<BankInboxEntity>>
+
+    @Query("SELECT * FROM bank_inbox WHERE id=:id")
+    suspend fun inboxItem(id: String): BankInboxEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertInbox(item: BankInboxEntity): Long
+
+    @Query("UPDATE bank_inbox SET status=:status,entryId=:entryId WHERE id=:id")
+    suspend fun status(id: String, status: String, entryId: String?)
+
+    /**
+     * Same-bank duplicate: same card OR same merchant, within ±90 s.
+     * Guards against push re-delivery from the same issuing bank.
+     */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE bankId=:bank AND amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=90000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')
+        AND ((cardLast4 IS NOT NULL AND cardLast4=:card) OR (merchant<>'' AND LOWER(merchant)=LOWER(:merchant)))""",
+    )
+    suspend fun similar(
+        bank: String, amount: Long, currency: String, type: String,
+        time: Long, card: String?, merchant: String,
+    ): Int
+
+    /**
+     * Cross-source duplicate: same amount + currency + type from **any** bank or wallet app
+     * within a ±180 s sliding window.
+     *
+     * Catches the common double-fire pattern:
+     *   1. Google Pay / gаманець fires first.
+     *   2. Issuing bank (PrivatBank, mono…) fires 0–120 s later.
+     * Without this check both events would be recorded as separate ledger entries.
+     */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=180000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')""",
+    )
+    suspend fun similarCrossSource(amount: Long, currency: String, type: String, time: Long): Int
+
+    @Query(
+        """SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
+        WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
+        GROUP BY sourceType,bankId ORDER BY totalMinor DESC""",
+    )
+    fun sources(currency: String, from: Long, through: Long): Flow<List<SourceSpendRow>>
+
+    @Query(
+        """SELECT e.category,e.customCategoryId,c.name AS customName,c.colorHex AS customColor,SUM(e.amountMinor) AS totalMinor
+        FROM entries e LEFT JOIN custom_categories c ON e.customCategoryId=c.id
+        WHERE e.deletedAtMillis IS NULL AND e.type='EXPENSE' AND e.currency=:currency AND e.epochDay BETWEEN :from AND :through
+        AND (:source IS NULL OR e.sourceType=:source) AND (:bank IS NULL OR e.bankId=:bank)
+        GROUP BY e.category,e.customCategoryId,c.name,c.colorHex ORDER BY totalMinor DESC""",
+    )
+    fun detailCategories(
+        currency: String, from: Long, through: Long, source: String?, bank: String?,
+    ): Flow<List<DetailedCategoryRow>>
+
+    @Query(
+        """SELECT * FROM entries WHERE deletedAtMillis IS NULL AND currency=:currency
+        AND epochDay BETWEEN :from AND :through AND (:source IS NULL OR sourceType=:source) AND (:bank IS NULL OR bankId=:bank)
+        ORDER BY COALESCE(eventAtMillis,createdAtMillis) DESC LIMIT 100""",
+    )
+    fun recent(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<EntryEntity>>
+
+    @Query("SELECT * FROM entries WHERE deletedAtMillis IS NULL ORDER BY epochDay DESC,createdAtMillis DESC")
+    suspend fun exportEntries(): List<EntryEntity>
+
+    @Query("DELETE FROM bank_inbox")
+    suspend fun clearInbox()
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.room.withTransaction
+import com.semmyx.ledger.data.local.*
+import com.semmyx.ledger.data.repository.toDomain
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.security.MessageDigest
+import java.time.*
+import java.util.UUID
+import java.util.Locale
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+/**
+ * Imports and acknowledgements are atomic with the existing ledger.
+ * No HTTP, no raw text storage, no PAN storage.
+ *
+ * ## Cross-source deduplication
+ *
+ * A single physical card payment typically generates **two** push notifications:
+ *   1. The wallet/payment app (Google Pay, Apple Pay) fires almost instantly.
+ *   2. The issuing bank (PrivatBank, mono…) fires 30–120 s later.
+ *
+ * Both carry the same amount / currency / type.  Without cross-source dedup the
+ * ledger would record UAH 100 twice.
+ *
+ * Strategy (two-tier, both run inside the same Room transaction):
+ *   - Tier 1 [same-bank, ±90 s]: prevents re-delivery of the exact same push.
+ *   - Tier 2 [cross-bank, ±180 s]: matches any inbox row with identical
+ *     (amount, currency, type) regardless of which bank sent it.
+ *     If a cross-source match exists the new row status = CROSS_DUPLICATE_REVIEW
+ *     so the user can still inspect and accept/reject it.  If auto-import is on,
+ *     cross-duplicates are silently ignored to avoid double-counting.
+ */
+class BankImportRepository(private val db: LedgerDatabase, context: Context) : BankRepository {
+
+    private val ctx = context.applicationContext
+    private val config = ctx.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
+    private val diagnosticState = MutableStateFlow(ImportDiagnostics())
+    override val diagnostics = diagnosticState.asStateFlow()
+
+    fun connected(value: Boolean) { diagnosticState.update { it.copy(connected = value) } }
+
+    fun note(code: String, packageName: String = "", notification: Boolean = false, bankMessage: Boolean = false) {
+        diagnosticState.update { old ->
+            old.copy(
+                lastCode = code,
+                lastPackage = packageName.ifBlank { old.lastPackage },
+                lastAtMillis = System.currentTimeMillis(),
+                notificationCount = old.notificationCount + if (notification) 1 else 0,
+                bankMessageCount = old.bankMessageCount + if (bankMessage) 1 else 0,
+            )
+        }
+    }
+
+    override fun configuredPackage(bankId: String): String =
+        config.getString("package_$bankId", null)
+            ?: Banks.all.firstOrNull { it.id == bankId }?.packages?.firstOrNull().orEmpty()
+
+    override fun setPackage(bankId: String, packageName: String) {
+        require(Banks.all.any { it.id == bankId })
+        require(packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")))
+        config.edit().putString("package_$bankId", packageName.trim()).apply()
+    }
+
+    fun bankForPackage(packageName: String): Bank? =
+        Banks.all.firstOrNull { config.getString("package_${it.id}", null) == packageName }
+            ?: Banks.byPackage(packageName)
+
+    override suspend fun importText(bankId: String, text: String): Boolean {
+        val bank = Banks.all.firstOrNull { it.id == bankId } ?: return false
+        if (BankParser.parse(bank, text, System.currentTimeMillis()) == null) { note("UNRECOGNIZED"); return false }
+        receive(bank, text, "MANUAL_TEXT:$bankId:${UUID.randomUUID()}", System.currentTimeMillis(), "MANUAL_TEXT", manual = true)
+        return true
+    }
+
+    private val dao = db.bankDao()
+
+    override fun categories() = dao.categories().map { rows -> rows.map { CustomBankCategory(it.id, it.name, it.colorHex) } }
+
+    override fun reviews() = dao.inbox().map { rows ->
+        rows.map {
+            ImportReview(
+                it.id, it.bankId, it.amountMinor, LedgerCurrency.valueOf(it.currency),
+                EntryType.valueOf(it.type), it.merchant, it.cardLast4, it.eventAtMillis,
+                it.timeFromMessage, it.transfer, it.status,
+            )
+        }
+    }
+
+    override fun sources(currency: LedgerCurrency, from: LocalDate, through: LocalDate) =
+        dao.sources(currency.name, from.toEpochDay(), through.toEpochDay()).map { rows ->
+            rows.map { BankSourceSpend(it.sourceType, it.bankId, it.totalMinor) }
+        }
+
+    override fun categorySpending(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
+        dao.detailCategories(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows ->
+            rows.map { BankCategorySpend(Category.valueOf(it.category), it.customCategoryId, it.customName, it.customColor, it.totalMinor) }
+        }
+
+    override fun recent(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
+        dao.recent(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map { it.toDomain() } }
+
+    override suspend fun exportEntries() = dao.exportEntries().map { it.toDomain() }
+    override suspend fun clearHistory() { dao.clearInbox() }
+    override fun budget(currency: LedgerCurrency): Long = config.getLong("budget_${currency.name}", 0L)
+    override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_${currency.name}", minor).apply() }
+
+    override var enabled: Boolean
+        get() = config.getBoolean("enabled", false)
+        set(value) { config.edit().putBoolean("enabled", value).apply() }
+
+    override var autoImport: Boolean
+        get() = config.getBoolean("auto", false)
+        set(value) { config.edit().putBoolean("auto", value).apply() }
+
+    // -------------------------------------------------------------------------
+    // Core receive path
+    // -------------------------------------------------------------------------
+
+    suspend fun receive(
+        bank: Bank, text: String, eventKey: String, at: Long,
+        origin: String, manual: Boolean = false,
+    ) {
+        if (!enabled && !manual) { note("DISABLED"); return }
+        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return }
+
+        var result = "QUEUED"
+        db.withTransaction {
+            // --- Tier 1: same-bank re-delivery guard ---
+            val sameBankDup = dao.similar(
+                parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
+                parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant,
+            ) > 0
+
+            // --- Tier 2: cross-source dedup (wallet + bank for the same tap) ---
+            // Only applies when the same-bank check didn't already flag it.
+            val crossSourceDup = !sameBankDup && dao.similarCrossSource(
+                parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
+            ) > 0
+
+            val status = when {
+                sameBankDup   -> "DUPLICATE_REVIEW"
+                crossSourceDup -> "CROSS_DUPLICATE_REVIEW"
+                else          -> "REVIEW"
+            }
+
+            // groupKey: SHA-256(amount|currency|type|5-min bucket) — links twin events
+            val bucket = parsed.happenedAtMillis / 300_000L   // 5-minute windows
+            val groupKey = digest("${parsed.amountMinor}|${parsed.currency}|${parsed.type}|$bucket")
+
+            val item = BankInboxEntity(
+                id = UUID.randomUUID().toString(),
+                eventKey = digest(eventKey),
+                bankId = parsed.bankId,
+                amountMinor = parsed.amountMinor,
+                currency = parsed.currency.name,
+                type = parsed.type.name,
+                merchant = parsed.merchant,
+                cardLast4 = parsed.cardLast4,
+                eventAtMillis = parsed.happenedAtMillis,
+                receivedAtMillis = at,
+                timeFromMessage = parsed.timeFromMessage,
+                transfer = parsed.transfer,
+                category = parsed.category.name,
+                origin = origin,
+                status = status,
+                groupKey = groupKey,
+            )
+
+            if (dao.insertInbox(item) == -1L) { result = "REDELIVERED"; return@withTransaction }
+            result = status
+
+            // Auto-import: only for confident single-source entries.
+            // Cross-source duplicates are NEVER auto-imported — the user must review.
+            if (!manual && autoImport && parsed.confident && !sameBankDup && !crossSourceDup) {
+                acceptInside(item, parsed.type)
+                result = "AUTO_IMPORTED"
+                postImportNotification(parsed)
+            }
+        }
+        note(result)
+    }
+
+    // -------------------------------------------------------------------------
+    // Accept / ignore
+    // -------------------------------------------------------------------------
+
+    override suspend fun accept(id: String, type: EntryType) {
+        db.withTransaction {
+            val item = dao.inboxItem(id) ?: return@withTransaction
+            if (item.status !in listOf("REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW")) return@withTransaction
+            acceptInside(item, type)
+        }
+    }
+
+    private suspend fun acceptInside(item: BankInboxEntity, type: EntryType) {
+        val id = "bank-${item.id}"
+        val date = Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).toLocalDate()
+        val title = item.merchant.ifBlank { Banks.name(item.bankId) }.take(60)
+        val entity = EntryEntity(
+            id, title, item.amountMinor, item.currency, type.name, item.category,
+            date.toEpochDay(),
+            if (item.transfer) "Confirmed external transfer" else "",
+            title.lowercase(Locale.ROOT),
+            item.receivedAtMillis,
+            sourceType = "CARD",
+            bankId = item.bankId,
+            cardLast4 = item.cardLast4,
+            eventAtMillis = item.eventAtMillis,
+            origin = item.origin,
+        )
+        db.ledgerDao().insert(entity)
+        dao.status(item.id, "IMPORTED", id)
+    }
+
+    override suspend fun ignore(id: String) {
+        db.withTransaction {
+            val item = dao.inboxItem(id) ?: return@withTransaction
+            if (item.status in listOf("REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW"))
+                dao.status(id, "IGNORED", null)
+        }
+    }
+
+    override suspend fun createCategory(name: String, hex: String) {
+        require(name.trim().length in 1..40)
+        val color = ColorPreferences.normalizeHex(hex) ?: error("Invalid color")
+        dao.addCategory(CustomCategoryEntity(UUID.randomUUID().toString(), name.trim(), color))
+    }
+
+    // -------------------------------------------------------------------------
+    // Background notification
+    // -------------------------------------------------------------------------
+
+    /**
+     * Posts a silent notification so the user knows something was auto-imported
+     * while the app was in the background.  The channel is created lazily; on
+     * Android < O the call is a no-op.
+     */
+    private fun postImportNotification(parsed: ParsedBankOperation) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val channelId = "ledger_import"
+        if (nm.getNotificationChannel(channelId) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "Ledger Import", NotificationManager.IMPORTANCE_LOW).apply {
+                    description = "Background bank import events"
+                    setShowBadge(false)
+                },
+            )
+        }
+        val amountText = Money.editable(parsed.amountMinor)
+        val title = "${parsed.bankId.replaceFirstChar { it.uppercase() }}: ${parsed.merchant.ifBlank { parsed.bankId }}"
+        val body = "${if (parsed.type == EntryType.EXPENSE) "−" else "+"} $amountText ${parsed.currency.name}"
+        val notification = NotificationCompat.Builder(ctx, channelId)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        // Use a stable ID derived from the amount+time so rapid arrivals don't stack
+        val notifId = (parsed.amountMinor xor parsed.happenedAtMillis).toInt()
+        try { nm.notify(notifId, notification) } catch (_: Exception) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    companion object {
+        fun digest(value: String): String =
+            MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+                .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+}
 ```
 
 ## data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt
@@ -6919,99 +7785,6 @@ class PurchaseSignatureVerifier(base64PublicKey: String) {
 }
 ```
 
-## data/src/main/kotlin/com/semmyx/ledger/data/local/BankEntities.kt
-
-```kotlin
-package com.semmyx.ledger.data.local
-
-import androidx.room.*
-import kotlinx.coroutines.flow.Flow
-
-@Entity(tableName = "custom_categories")
-data class CustomCategoryEntity(@PrimaryKey val id: String, val name: String, val colorHex: String)
-@Entity(tableName = "bank_inbox", indices = [Index(value = ["eventKey"], unique = true)])
-data class BankInboxEntity(@PrimaryKey val id: String, val eventKey: String, val bankId: String,
-    val amountMinor: Long, val currency: String, val type: String, val merchant: String, val cardLast4: String?,
-    val eventAtMillis: Long, val receivedAtMillis: Long, val timeFromMessage: Boolean,
-    val transfer: Boolean, val category: String, val origin: String, val status: String,
-    val entryId: String? = null)
-data class SourceSpendRow(val sourceType: String, val bankId: String?, val totalMinor: Long)
-data class DetailedCategoryRow(val category: String, val customCategoryId: String?, val customName: String?, val customColor: String?, val totalMinor: Long)
-@Dao
-interface BankDao {
-    @Query("SELECT * FROM custom_categories ORDER BY name") fun categories(): Flow<List<CustomCategoryEntity>>
-    @Insert suspend fun addCategory(category: CustomCategoryEntity)
-    @Query("SELECT * FROM bank_inbox WHERE status IN ('REVIEW','DUPLICATE_REVIEW') ORDER BY receivedAtMillis DESC LIMIT 100") fun inbox(): Flow<List<BankInboxEntity>>
-    @Query("SELECT * FROM bank_inbox WHERE id=:id") suspend fun inboxItem(id: String): BankInboxEntity?
-    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertInbox(item: BankInboxEntity): Long
-    @Query("UPDATE bank_inbox SET status=:status,entryId=:entryId WHERE id=:id") suspend fun status(id: String, status: String, entryId: String?)
-    @Query("""SELECT COUNT(*) FROM bank_inbox WHERE bankId=:bank AND amountMinor=:amount
-        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=90000
-        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW')
-        AND ((cardLast4 IS NOT NULL AND cardLast4=:card) OR (merchant<>'' AND LOWER(merchant)=LOWER(:merchant)))""")
-    suspend fun similar(bank: String, amount: Long, currency: String, type: String, time: Long, card: String?, merchant: String): Int
-    @Query("""SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
-        WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
-        GROUP BY sourceType,bankId ORDER BY totalMinor DESC""")
-    fun sources(currency: String, from: Long, through: Long): Flow<List<SourceSpendRow>>
-    @Query("""SELECT e.category,e.customCategoryId,c.name AS customName,c.colorHex AS customColor,SUM(e.amountMinor) AS totalMinor
-        FROM entries e LEFT JOIN custom_categories c ON e.customCategoryId=c.id
-        WHERE e.deletedAtMillis IS NULL AND e.type='EXPENSE' AND e.currency=:currency AND e.epochDay BETWEEN :from AND :through
-        AND (:source IS NULL OR e.sourceType=:source) AND (:bank IS NULL OR e.bankId=:bank)
-        GROUP BY e.category,e.customCategoryId,c.name,c.colorHex ORDER BY totalMinor DESC""")
-    fun detailCategories(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<DetailedCategoryRow>>
-    @Query("""SELECT * FROM entries WHERE deletedAtMillis IS NULL AND currency=:currency
-        AND epochDay BETWEEN :from AND :through AND (:source IS NULL OR sourceType=:source) AND (:bank IS NULL OR bankId=:bank)
-        ORDER BY COALESCE(eventAtMillis,createdAtMillis) DESC LIMIT 100""")
-    fun recent(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<EntryEntity>>
-    @Query("SELECT * FROM entries WHERE deletedAtMillis IS NULL ORDER BY epochDay DESC,createdAtMillis DESC") suspend fun exportEntries(): List<EntryEntity>
-    @Query("DELETE FROM bank_inbox") suspend fun clearInbox()
-}
-```
-
-## data/src/main/kotlin/com/semmyx/ledger/data/local/Entities.kt
-
-```kotlin
-package com.semmyx.ledger.data.local
-
-import androidx.room.Entity
-import androidx.room.Index
-import androidx.room.PrimaryKey
-
-@Entity(tableName = "entries", indices = [Index(value = ["currency", "deletedAtMillis", "epochDay", "createdAtMillis"])])
-data class EntryEntity(
-    @PrimaryKey val id: String,
-    val title: String,
-    val amountMinor: Long,
-    val currency: String,
-    val type: String,
-    val category: String,
-    val epochDay: Long,
-    val note: String,
-    val searchText: String,
-    val createdAtMillis: Long,
-    val deletedAtMillis: Long? = null,
-    @androidx.room.ColumnInfo(defaultValue = "'UNKNOWN'") val sourceType: String = "UNKNOWN",
-    val bankId: String? = null,
-    val cardLast4: String? = null,
-    val eventAtMillis: Long? = null,
-    val customCategoryId: String? = null,
-    @androidx.room.ColumnInfo(defaultValue = "'MANUAL'") val origin: String = "MANUAL",
-)
-
-data class BalanceRow(val incomeMinor: Long, val expenseMinor: Long, val entryCount: Int)
-data class CategoryTotalRow(val category: String, val incomeMinor: Long, val expenseMinor: Long, val count: Int, val incomeCount: Int, val expenseCount: Int)
-data class ActivityRow(val epochDay: Long, val incomeMinor: Long, val expenseMinor: Long)
-
-@Entity(tableName = "rates")
-data class RateEntity(
-    @PrimaryKey val currency: String,
-    val uahPerUnit: Double,
-    val epochDay: Long,
-    val fetchedAtMillis: Long,
-)
-```
-
 ## data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt
 
 ```kotlin
@@ -7101,8 +7874,15 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.semmyx.ledger.data.bank.BankDao
+import com.semmyx.ledger.data.bank.BankInboxEntity
+import com.semmyx.ledger.data.bank.CustomCategoryEntity
 
-@Database(entities = [EntryEntity::class, RateEntity::class, CustomCategoryEntity::class, BankInboxEntity::class], version = 2, exportSchema = true)
+@Database(
+    entities = [EntryEntity::class, RateEntity::class, CustomCategoryEntity::class, BankInboxEntity::class],
+    version = 3,
+    exportSchema = true,
+)
 abstract class LedgerDatabase : RoomDatabase() {
     abstract fun ledgerDao(): LedgerDao
     abstract fun rateDao(): RateDao
@@ -7122,13 +7902,71 @@ abstract class LedgerDatabase : RoomDatabase() {
                 db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_bank_inbox_eventKey ON bank_inbox(eventKey)")
             }
         }
+
+        /**
+         * v2 → v3: adds [groupKey] column and its index to bank_inbox.
+         * groupKey links wallet-app + issuing-bank notifications for the same card tap
+         * to support cross-source deduplication. NULL for existing rows is safe.
+         */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE bank_inbox ADD COLUMN groupKey TEXT")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_bank_inbox_groupKey ON bank_inbox(groupKey)")
+            }
+        }
+
         fun create(context: Context): LedgerDatabase = Room.databaseBuilder(
-            context.applicationContext, LedgerDatabase::class.java, "ledger.db"
-        ).addMigrations(MIGRATION_1_2).setJournalMode(JournalMode.WRITE_AHEAD_LOGGING).build()
-        // v1 -> v2 preserves all ledger rows. Every future schema must register explicit migrations;
-        // deliberately no fallbackToDestructiveMigration that could erase financial records.
+            context.applicationContext, LedgerDatabase::class.java, "ledger.db",
+        )
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
+            .build()
+        // No fallbackToDestructiveMigration — financial records must never be erased automatically.
     }
 }
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt
+
+```kotlin
+package com.semmyx.ledger.data.local
+
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "entries", indices = [Index(value = ["currency", "deletedAtMillis", "epochDay", "createdAtMillis"])])
+data class EntryEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val amountMinor: Long,
+    val currency: String,
+    val type: String,
+    val category: String,
+    val epochDay: Long,
+    val note: String,
+    val searchText: String,
+    val createdAtMillis: Long,
+    val deletedAtMillis: Long? = null,
+    @androidx.room.ColumnInfo(defaultValue = "'UNKNOWN'") val sourceType: String = "UNKNOWN",
+    val bankId: String? = null,
+    val cardLast4: String? = null,
+    val eventAtMillis: Long? = null,
+    val customCategoryId: String? = null,
+    @androidx.room.ColumnInfo(defaultValue = "'MANUAL'") val origin: String = "MANUAL",
+)
+
+data class BalanceRow(val incomeMinor: Long, val expenseMinor: Long, val entryCount: Int)
+data class CategoryTotalRow(val category: String, val incomeMinor: Long, val expenseMinor: Long, val count: Int, val incomeCount: Int, val expenseCount: Int)
+data class ActivityRow(val epochDay: Long, val incomeMinor: Long, val expenseMinor: Long)
+
+@Entity(tableName = "rates")
+data class RateEntity(
+    @PrimaryKey val currency: String,
+    val uahPerUnit: Double,
+    val epochDay: Long,
+    val fetchedAtMillis: Long,
+)
 ```
 
 ## data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt
@@ -7165,121 +8003,6 @@ data class RateDto(
     @SerializedName("rate") val rate: Double?,
     @SerializedName("exchangedate") val exchangeDate: String?,
 )
-```
-
-## data/src/main/kotlin/com/semmyx/ledger/data/repository/BankImportRepository.kt
-
-```kotlin
-package com.semmyx.ledger.data.repository
-
-import android.content.Context
-import androidx.room.withTransaction
-import com.semmyx.ledger.data.local.*
-import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.domain.bank.*
-import java.security.MessageDigest
-import java.time.*
-import java.util.UUID
-import java.util.Locale
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-
-/** Imports and acknowledgements are atomic with the existing ledger. No HTTP, raw text or PAN storage. */
-class BankImportRepository(private val db: LedgerDatabase, context: Context) : BankRepository {
-    private val config = context.applicationContext.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
-    private val diagnosticState = MutableStateFlow(ImportDiagnostics())
-    override val diagnostics = diagnosticState.asStateFlow()
-    fun connected(value: Boolean) { diagnosticState.update { it.copy(connected = value) } }
-    fun note(code: String, packageName: String = "", notification: Boolean = false, bankMessage: Boolean = false) {
-        diagnosticState.update { old -> old.copy(lastCode = code, lastPackage = packageName.ifBlank { old.lastPackage },
-            lastAtMillis = System.currentTimeMillis(), notificationCount = old.notificationCount + if (notification) 1 else 0,
-            bankMessageCount = old.bankMessageCount + if (bankMessage) 1 else 0) }
-    }
-    override fun configuredPackage(bankId: String): String = config.getString("package_" + bankId, null)
-        ?: Banks.all.firstOrNull { it.id == bankId }?.packages?.firstOrNull().orEmpty()
-    override fun setPackage(bankId: String, packageName: String) {
-        require(Banks.all.any { it.id == bankId })
-        require(packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")))
-        config.edit().putString("package_" + bankId, packageName.trim()).apply()
-    }
-    fun bankForPackage(packageName: String): Bank? = Banks.all.firstOrNull { config.getString("package_" + it.id, null) == packageName }
-        ?: Banks.byPackage(packageName)
-    override suspend fun importText(bankId: String, text: String): Boolean {
-        val bank = Banks.all.firstOrNull { it.id == bankId } ?: return false
-        if (BankParser.parse(bank, text, System.currentTimeMillis()) == null) { note("UNRECOGNIZED"); return false }
-        receive(bank, text, "MANUAL_TEXT:" + bankId + ":" + UUID.randomUUID(), System.currentTimeMillis(), "MANUAL_TEXT", manual = true)
-        return true
-    }
-    private val dao = db.bankDao()
-    override fun categories() = dao.categories().map { rows -> rows.map { CustomBankCategory(it.id, it.name, it.colorHex) } }
-    override fun reviews() = dao.inbox().map { rows -> rows.map { ImportReview(it.id, it.bankId, it.amountMinor,
-        LedgerCurrency.valueOf(it.currency), EntryType.valueOf(it.type), it.merchant, it.cardLast4, it.eventAtMillis,
-        it.timeFromMessage, it.transfer, it.status) } }
-    override fun sources(currency: LedgerCurrency, from: LocalDate, through: LocalDate) =
-        dao.sources(currency.name, from.toEpochDay(), through.toEpochDay()).map { rows -> rows.map { BankSourceSpend(it.sourceType, it.bankId, it.totalMinor) } }
-    override fun categorySpending(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
-        dao.detailCategories(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map {
-            BankCategorySpend(Category.valueOf(it.category), it.customCategoryId, it.customName, it.customColor, it.totalMinor) } }
-    override fun recent(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
-        dao.recent(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map { it.toDomain() } }
-    override suspend fun exportEntries() = dao.exportEntries().map { it.toDomain() }
-    override suspend fun clearHistory() { dao.clearInbox() }
-    override fun budget(currency: LedgerCurrency): Long = config.getLong("budget_" + currency.name, 0L)
-    override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_" + currency.name, minor).apply() }
-    override var enabled: Boolean
-        get() = config.getBoolean("enabled", false)
-        set(value) { config.edit().putBoolean("enabled", value).apply() }
-    override var autoImport: Boolean
-        get() = config.getBoolean("auto", false)
-        set(value) { config.edit().putBoolean("auto", value).apply() }
-    suspend fun receive(bank: Bank, text: String, eventKey: String, at: Long, origin: String, manual: Boolean = false) {
-        if (!enabled && !manual) { note("DISABLED"); return }
-        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return }
-        var result = "QUEUED"
-        db.withTransaction {
-            val duplicate = dao.similar(parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
-                parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant) > 0
-            val status = if (duplicate) "DUPLICATE_REVIEW" else "REVIEW"
-            val item = BankInboxEntity(UUID.randomUUID().toString(), digest(eventKey), parsed.bankId, parsed.amountMinor,
-                parsed.currency.name, parsed.type.name, parsed.merchant, parsed.cardLast4, parsed.happenedAtMillis, at,
-                parsed.timeFromMessage, parsed.transfer, parsed.category.name, origin, status)
-            if (dao.insertInbox(item) == -1L) { result = "REDELIVERED"; return@withTransaction }
-            if (duplicate) result = "DUPLICATE_REVIEW"
-            if (!manual && autoImport && parsed.confident && !duplicate) { acceptInside(item, parsed.type); result = "AUTO_IMPORTED" }
-        }
-        note(result)
-    }
-    override suspend fun accept(id: String, type: EntryType) { db.withTransaction {
-        val item = dao.inboxItem(id) ?: return@withTransaction
-        if (item.status !in listOf("REVIEW", "DUPLICATE_REVIEW")) return@withTransaction
-        acceptInside(item, type)
-    } }
-    private suspend fun acceptInside(item: BankInboxEntity, type: EntryType) {
-        val id = "bank-" + item.id
-        val date = Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).toLocalDate()
-        val title = item.merchant.ifBlank { Banks.name(item.bankId) }.take(60)
-        val entity = EntryEntity(id, title, item.amountMinor, item.currency, type.name, item.category, date.toEpochDay(),
-            if (item.transfer) "Confirmed external transfer" else "", title.lowercase(Locale.ROOT), item.receivedAtMillis,
-            sourceType = "CARD", bankId = item.bankId, cardLast4 = item.cardLast4, eventAtMillis = item.eventAtMillis, origin = item.origin)
-        db.ledgerDao().insert(entity)
-        dao.status(item.id, "IMPORTED", id)
-    }
-    override suspend fun ignore(id: String) { db.withTransaction {
-        val item = dao.inboxItem(id) ?: return@withTransaction
-        if (item.status in listOf("REVIEW", "DUPLICATE_REVIEW")) dao.status(id, "IGNORED", null)
-    } }
-    override suspend fun createCategory(name: String, hex: String) {
-        require(name.trim().length in 1..40)
-        val color = ColorPreferences.normalizeHex(hex) ?: error("Invalid color")
-        dao.addCategory(CustomCategoryEntity(UUID.randomUUID().toString(), name.trim(), color))
-    }
-    companion object {
-        fun digest(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
-            .joinToString("") { "%02x".format(it.toInt() and 255) }
-    }
-}
 ```
 
 ## data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt
@@ -8421,50 +9144,6 @@ interface BankRepository {
 }
 ```
 
-## domain/src/test/kotlin/com/semmyx/ledger/domain/BankParserTest.kt
-
-```kotlin
-package com.semmyx.ledger.domain
-
-import com.semmyx.ledger.domain.bank.*
-import java.time.Instant
-import java.time.ZoneId
-import org.junit.Assert.*
-import org.junit.Test
-
-class BankParserTest {
-    private val bank = Banks.all.first { it.id == "mono" }
-    private val at = Instant.parse("2026-10-07T20:00:00Z").toEpochMilli()
-    @Test fun debitExtractsAmountShopCardAndDate() {
-        val parsed = BankParser.parse(bank, "Оплата 1 200,50 грн у АТБ; картка *1234; 07.10.2026 22:59", at, ZoneId.of("Europe/Kyiv"))!!
-        assertEquals(120050L, parsed.amountMinor)
-        assertEquals(EntryType.EXPENSE, parsed.type)
-        assertEquals("1234", parsed.cardLast4)
-        assertEquals(Category.FOOD, parsed.category)
-        assertTrue(parsed.confident)
-        assertTrue(parsed.timeFromMessage)
-    }
-    @Test fun ignoresBalanceOtpAndDeclined() {
-        assertNull(BankParser.parse(bank, "Баланс 1200 грн", at))
-        assertNull(BankParser.parse(bank, "Код підтвердження оплати 100 грн 123456", at))
-        assertNull(BankParser.parse(bank, "Payment declined 10 EUR at Steam", at))
-    }
-    @Test fun doesNotChooseBalanceAsPurchase() {
-        assertEquals(10000L, BankParser.parse(bank, "Оплата 100 грн у АТБ; баланс 900 грн", at)!!.amountMinor)
-    }
-    @Test fun transfersRequireReview() { assertFalse(BankParser.parse(bank, "Переказ 100 грн", at)!!.confident) }
-    @Test fun currencyPrefixAndIncome() {
-        assertEquals(1250L, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.amountMinor)
-        assertEquals(LedgerCurrency.USD, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.currency)
-        assertEquals(EntryType.INCOME, BankParser.parse(bank, "Зараховано 2000 грн", at)!!.type)
-    }
-    @Test fun receiptTimeIsNotInventedBankTime() {
-        val value = BankParser.parse(bank, "Оплата 100 грн у АТБ", at)!!
-        assertEquals(at, value.happenedAtMillis); assertFalse(value.timeFromMessage)
-    }
-}
-```
-
 ## domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt
 
 ```kotlin
@@ -8739,6 +9418,53 @@ class UpgradePolicyTest {
 }
 ```
 
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+import com.semmyx.ledger.domain.Category
+import com.semmyx.ledger.domain.EntryType
+import com.semmyx.ledger.domain.LedgerCurrency
+import com.semmyx.ledger.domain.bank.*
+import java.time.Instant
+import java.time.ZoneId
+import org.junit.Assert.*
+import org.junit.Test
+
+class BankParserTest {
+    private val bank = Banks.all.first { it.id == "mono" }
+    private val at = Instant.parse("2026-10-07T20:00:00Z").toEpochMilli()
+    @Test fun debitExtractsAmountShopCardAndDate() {
+        val parsed = BankParser.parse(bank, "Оплата 1 200,50 грн у АТБ; картка *1234; 07.10.2026 22:59", at, ZoneId.of("Europe/Kyiv"))!!
+        assertEquals(120050L, parsed.amountMinor)
+        assertEquals(EntryType.EXPENSE, parsed.type)
+        assertEquals("1234", parsed.cardLast4)
+        assertEquals(Category.FOOD, parsed.category)
+        assertTrue(parsed.confident)
+        assertTrue(parsed.timeFromMessage)
+    }
+    @Test fun ignoresBalanceOtpAndDeclined() {
+        assertNull(BankParser.parse(bank, "Баланс 1200 грн", at))
+        assertNull(BankParser.parse(bank, "Код підтвердження оплати 100 грн 123456", at))
+        assertNull(BankParser.parse(bank, "Payment declined 10 EUR at Steam", at))
+    }
+    @Test fun doesNotChooseBalanceAsPurchase() {
+        assertEquals(10000L, BankParser.parse(bank, "Оплата 100 грн у АТБ; баланс 900 грн", at)!!.amountMinor)
+    }
+    @Test fun transfersRequireReview() { assertFalse(BankParser.parse(bank, "Переказ 100 грн", at)!!.confident) }
+    @Test fun currencyPrefixAndIncome() {
+        assertEquals(1250L, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.amountMinor)
+        assertEquals(LedgerCurrency.USD, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.currency)
+        assertEquals(EntryType.INCOME, BankParser.parse(bank, "Зараховано 2000 грн", at)!!.type)
+    }
+    @Test fun receiptTimeIsNotInventedBankTime() {
+        val value = BankParser.parse(bank, "Оплата 100 грн у АТБ", at)!!
+        assertEquals(at, value.happenedAtMillis); assertFalse(value.timeFromMessage)
+    }
+}
+```
+
 ## gradle.properties
 
 ```properties
@@ -8758,6 +9484,9 @@ android.overridePathCheck=true
 # tools/developer_private_key.pem, is git-ignored, and must never be shared with anyone;
 # only you (the developer) use it, with tools/issue_activation_code.py, to mint codes.
 DEVELOPER_SUBSCRIPTION_PUBLIC_KEY=MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsOk68sCOTVl/4WCNZuvCidKZy4b3zz+ZjB4TsJOs07fRk/IolFxIOC1vrL55ncwzLeQlRpmWWKLkRIwEV0tbOu56+3NHuHF8Jcfq07VOyXplWT7kxzd+bTjmcZsXhO3J7z4kJtbYY3X3Fo465/8RuXHSQLyFkrHjS0FepclHDgnaZB/7qz6diLtLbOk7so4rScuIl7W362Vz71bDp/OD6UkDW6W+niGlQQKhKNJI7XnBA2AVl1W/4ZFY4v+7kNyztRcIzazJlbnrVjX9kLZiC9Sbk7+R+ZXssWXNvu7JytHTb+A8rWjkqu7GWvspJmvieWoj1dGB5PL/k+17s8BtyvDm7CNiG7lhKn0Lq7x/oMRDW5hu2HnYtmd8DqJjks2peUTsewkUGL3UrnDPgDnIXud1YJuyI0SWZN/P2RqTo40sMHPjGYd4esUk6R5/ATgKfSf01kPN2oabZzeC7rYpecP0QLCM0lDVMVGpxVaiegDxsKajGLyy67XVx29V72ShAgMBAAE=
+
+# Enabled parallel sync for Gradle 9.4+
+org.gradle.tooling.parallel=true
 ```
 
 ## gradle/bootstrap.ps1
@@ -8783,10 +9512,11 @@ if ((Get-FileHash $jar -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected)
 ## gradle/wrapper/gradle-wrapper.properties
 
 ```properties
+#Fri Oct 09 23:39:28 EEST 2026
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
-distributionUrl=https\://services.gradle.org/distributions/gradle-8.11.1-bin.zip
-distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6
+distributionSha256Sum=bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip
 networkTimeout=10000
 validateDistributionUrl=true
 zipStoreBase=GRADLE_USER_HOME
@@ -8850,6 +9580,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TGLedger"
 include(":app", ":domain", ":data")
+include(":app")
 ```
 
 ## tools/audit_project.py
@@ -8923,7 +9654,7 @@ for file in kotlin:
             check(name in en, f'Resolved app string: {name}')
     if path.startswith('domain/src/main/'):
         check(not re.search(r'import (android\.|androidx\.|com\.semmyx\.ledger\.(data|presentation))', source), f'Pure domain boundary: {path}')
-    if '/presentation/' in path and path.endswith('ViewModel.kt'):
+    if path.startswith('app/src/main/') and path.endswith('ViewModel.kt'):
         check('com.semmyx.ledger.data.' not in source, f'Domain-only ViewModel dependencies: {path}')
     stack = []
     valid = True
@@ -8943,7 +9674,7 @@ for match in re.finditer(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:sus
     quoted, name = match.groups()
     query_map[name] = quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 
-entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/Entities.kt').read_text()
+entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt').read_text()
 body = re.search(r'data class EntryEntity\(([\s\S]*?)\n\)', entities).group(1)
 columns = re.findall(r'val (\w+): (\w+)(\?)?', body)
 types = {'String':'TEXT','Long':'INTEGER','Int':'INTEGER','Double':'REAL'}
@@ -9227,7 +9958,7 @@ def check(test,label):
 old=c.execute("SELECT * FROM entries WHERE id='old'").fetchone()
 check(old['sourceType']=='UNKNOWN' and old['amountMinor']==100,'Migration preserves entries and does not invent cash/card attribution')
 check(len(c.execute('PRAGMA table_info(entries)').fetchall())==17,'All six metadata columns migrated')
-s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/local/BankEntities.kt').read_text()
+s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt').read_text()
 queries={}
 for quoted,name in re.findall(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:suspend\s+)?fun\s+(\w+)',s):queries[name]=quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 def insert(id,amount,source,bank,currency='UAH',kind='EXPENSE',category='FOOD',custom=None,deleted=None):
@@ -9265,10 +9996,10 @@ from pathlib import Path
 import json
 R=Path(__file__).resolve().parents[1]
 A=R/'app/src/main/kotlin/com/semmyx/ledger'
-root=(A/'presentation/AppRoot.kt').read_text()
-analytics=(A/'presentation/analytics/AnalyticsScreen.kt').read_text()
-bank=(A/'presentation/bank/BankScreen.kt').read_text()
-repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/repository/BankImportRepository.kt').read_text()
+root=(A/'navigation/AppRoot.kt').read_text()
+analytics=(A/'analytics/AnalyticsScreen.kt').read_text()
+bank=(A/'bank/BankScreen.kt').read_text()
+repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt').read_text()
 checks=[]
 def check(condition,label):
  assert condition,label
@@ -9396,4 +10127,3 @@ with tempfile.TemporaryDirectory() as folder:
     print(result.stdout.strip())
     (R/'verification/voice-regex-jvm.json').write_text(json.dumps({'kind':'exact-source-regex-on-JVM','passed':7,'compiled_kotlin':False,'compiled_android':False,'output':result.stdout.strip()},indent=2)+'\n')
 ```
-

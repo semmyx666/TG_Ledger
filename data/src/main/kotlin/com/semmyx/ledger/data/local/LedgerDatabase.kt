@@ -6,6 +6,9 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.semmyx.ledger.data.bank.BankDao
+import com.semmyx.ledger.data.bank.BankInboxEntity
+import com.semmyx.ledger.data.bank.CustomCategoryEntity
 
 @Database(
     entities = [EntryEntity::class, RateEntity::class, CustomCategoryEntity::class, BankInboxEntity::class],

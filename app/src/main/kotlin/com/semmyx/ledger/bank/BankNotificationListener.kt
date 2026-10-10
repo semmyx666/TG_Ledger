@@ -13,7 +13,7 @@ import kotlinx.coroutines.*
 
 /**
  * Listens to posted notifications from registered bank/wallet apps and routes them
- * to [com.semmyx.ledger.data.repository.BankImportRepository].
+ * to [com.semmyx.ledger.data.bank.BankImportRepository].
  *
  * Works entirely in the background: the service is bound by the OS (no Activity
  * needed) and uses the application's long-lived [LedgerApplication.applicationScope].
