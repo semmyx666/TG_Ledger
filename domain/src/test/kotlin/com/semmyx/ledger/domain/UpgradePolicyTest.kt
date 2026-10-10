@@ -8,8 +8,8 @@ import org.junit.Test
 
 class UpgradePolicyTest {
     @Test fun trialDurationsAndBoundary() {
-        assertTrue(TrialPolicy.validDays(7)); assertTrue(TrialPolicy.validDays(14))
-        assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
+        assertTrue(TrialPolicy.validDays(14)); assertEquals(14, TrialPolicy.DAYS)
+        assertFalse(TrialPolicy.validDays(7)); assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
         assertTrue(TrialPolicy.active(100, 200, 199, 150))
         assertFalse(TrialPolicy.active(100, 200, 200, 150))
         assertFalse(TrialPolicy.active(100, 200, 149, 150))

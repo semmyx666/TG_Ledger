@@ -228,8 +228,7 @@
     <string name="assistant_send">Send to Sky</string>
     <string name="premium_source_trial">Free trial · no automatic charges</string>
     <string name="premium_local_notice">Access is checked locally. No automatic renewal or charges.</string>
-    <string name="trial_explanation">Choose ONE trial: 7 or 14 days. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
-    <string name="trial_7">Try free · 7 days</string>
+    <string name="trial_explanation">One free 14-day trial. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
     <string name="trial_14">Try free · 14 days</string>
     <string name="mascot_style">Assistant appearance</string>
     <string name="mascot_gray">Gray cat</string>

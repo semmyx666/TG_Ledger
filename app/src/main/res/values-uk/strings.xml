@@ -228,8 +228,7 @@
     <string name="assistant_send">Надіслати Скай</string>
     <string name="premium_source_trial">Пробний доступ · без автоматичних списань</string>
     <string name="premium_local_notice">Доступ перевіряється локально. Без автоматичного продовження чи списань.</string>
-    <string name="trial_explanation">Вибери ОДИН пробний період: 7 або 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення базовий облік залишається безкоштовним.</string>
-    <string name="trial_7">Безкоштовно · 7 днів</string>
+    <string name="trial_explanation">Один безкоштовний пробний період — 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення основний облік лишається безкоштовним.</string>
     <string name="trial_14">Безкоштовно · 14 днів</string>
     <string name="mascot_style">Вигляд помічника</string>
     <string name="mascot_gray">Сірий кіт</string>

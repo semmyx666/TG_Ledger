@@ -165,10 +165,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 }
                 if (!state.premium.entitled && state.premium.trialAvailable) {
                     Text(stringResource(R.string.trial_explanation))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { model.startTrial(7) }) { Text(stringResource(R.string.trial_7)) }
-                        OutlinedButton(onClick = { model.startTrial(14) }) { Text(stringResource(R.string.trial_14)) }
-                    }
+                    OutlinedButton(onClick = { model.startTrial(TrialPolicy.DAYS) }) { Text(stringResource(R.string.trial_14)) }
                 }
                 if (state.premium.entitled) {
                     Text(stringResource(R.string.mascot_style))

@@ -1,4 +1,4 @@
-# TG Ledger 3.2.0 — cat appearance fix — complete file-by-file source
+# TG Ledger 3.3.0 — complete file-by-file source
 
 132 implementation, configuration and test files, included without truncation.
 
@@ -120,8 +120,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 13
-        versionName = "3.2.0"
+        versionCode = 14
+        versionName = "3.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -4488,10 +4488,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 }
                 if (!state.premium.entitled && state.premium.trialAvailable) {
                     Text(stringResource(R.string.trial_explanation))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { model.startTrial(7) }) { Text(stringResource(R.string.trial_7)) }
-                        OutlinedButton(onClick = { model.startTrial(14) }) { Text(stringResource(R.string.trial_14)) }
-                    }
+                    OutlinedButton(onClick = { model.startTrial(TrialPolicy.DAYS) }) { Text(stringResource(R.string.trial_14)) }
                 }
                 if (state.premium.entitled) {
                     Text(stringResource(R.string.mascot_style))
@@ -5976,8 +5973,7 @@ object VoiceSmallTalk {
     <string name="assistant_send">Надіслати Скай</string>
     <string name="premium_source_trial">Пробний доступ · без автоматичних списань</string>
     <string name="premium_local_notice">Доступ перевіряється локально. Без автоматичного продовження чи списань.</string>
-    <string name="trial_explanation">Вибери ОДИН пробний період: 7 або 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення базовий облік залишається безкоштовним.</string>
-    <string name="trial_7">Безкоштовно · 7 днів</string>
+    <string name="trial_explanation">Один безкоштовний пробний період — 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення основний облік лишається безкоштовним.</string>
     <string name="trial_14">Безкоштовно · 14 днів</string>
     <string name="mascot_style">Вигляд помічника</string>
     <string name="mascot_gray">Сірий кіт</string>
@@ -6348,8 +6344,7 @@ object VoiceSmallTalk {
     <string name="assistant_send">Send to Sky</string>
     <string name="premium_source_trial">Free trial · no automatic charges</string>
     <string name="premium_local_notice">Access is checked locally. No automatic renewal or charges.</string>
-    <string name="trial_explanation">Choose ONE trial: 7 or 14 days. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
-    <string name="trial_7">Try free · 7 days</string>
+    <string name="trial_explanation">One free 14-day trial. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
     <string name="trial_14">Try free · 14 days</string>
     <string name="mascot_style">Assistant appearance</string>
     <string name="mascot_gray">Gray cat</string>
@@ -8757,7 +8752,9 @@ object FinanceWindow {
 }
 
 object TrialPolicy {
-    fun validDays(days: Int) = days == 7 || days == 14
+    /** One trial only: 14 days. */
+    const val DAYS = 14
+    fun validDays(days: Int) = days == DAYS
     fun active(start: Long, end: Long, now: Long, lastSeen: Long): Boolean =
         start > 0 && end > start && now >= start && now >= lastSeen && now < end
 }
@@ -9472,8 +9469,8 @@ import org.junit.Test
 
 class UpgradePolicyTest {
     @Test fun trialDurationsAndBoundary() {
-        assertTrue(TrialPolicy.validDays(7)); assertTrue(TrialPolicy.validDays(14))
-        assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
+        assertTrue(TrialPolicy.validDays(14)); assertEquals(14, TrialPolicy.DAYS)
+        assertFalse(TrialPolicy.validDays(7)); assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
         assertTrue(TrialPolicy.active(100, 200, 199, 150))
         assertFalse(TrialPolicy.active(100, 200, 200, 150))
         assertFalse(TrialPolicy.active(100, 200, 149, 150))

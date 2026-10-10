@@ -39,3 +39,9 @@ Android SDK 36: `:app:assemblePlayDebug`, `:app:compileLegacyV7DebugKotlin`, `:a
 files were unchanged. Two problems exist in the original code and are unrelated to the restructure:
 `data/src/play/.../BillingVersionAdapter.kt:18` does not compile as written (`offerToken` is `String?` in Billing 8.0.0; it was
 compiled here only with a temporary local `!!`), and `OptionalVoiceAssistantParserTest.recognizesAddEntryRequests` fails.
+
+## 3.3.0 check
+
+Gradle build (`:app:assemblePlayDebug`, `:app:assembleLegacyV7Debug`, `:app:compilePlayDebugAndroidTestKotlin`, `:domain:test`) was run after the
+background-import, form, navigation and single 14-day trial changes. Not run: instrumented tests, any on-device behaviour (notification listener,
+SMS catch-up, battery restrictions).
