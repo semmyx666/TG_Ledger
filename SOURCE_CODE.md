@@ -1,6 +1,6 @@
-# TG Ledger 3.3.0 — complete file-by-file source
+# TG Ledger 3.3.1 — complete file-by-file source
 
-132 implementation, configuration and test files, included without truncation.
+134 implementation, configuration and test files, included without truncation.
 
 The same files are editable at the paths below. Build instructions, architectural notes, visual references and verification limitations are in README.md and docs/.
 
@@ -24,6 +24,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
@@ -33,6 +35,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: app/build/outputs/apk/*/debug/*.apk
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -54,6 +60,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Enable emulator acceleration
         run: |
@@ -120,8 +128,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 14
-        versionName = "3.3.0"
+        versionCode = 15
+        versionName = "3.3.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -198,6 +206,7 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
@@ -210,6 +219,83 @@ dependencies {
 # Retrofit / Gson consumer rules come from the data module and their libraries.
 # Room and Compose ship their own shrinker rules. Do not globally keep the app.
 -keepattributes Signature,InnerClasses,EnclosingMethod
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import android.os.ParcelFileDescriptor
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Assume.assumeTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * End-to-end test of the real background path: a notification posted by another app is read by the
+ * system-bound [com.semmyx.ledger.bank.BankNotificationListener] while no Activity is on screen, parsed and
+ * written to the ledger. "com.android.shell" plays the role of the bank app (its package is mapped to monobank).
+ */
+@RunWith(AndroidJUnit4::class)
+class BankBackgroundImportTest {
+    private val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+    private val repo get() = app.container.bankImport
+    private val automation get() = InstrumentationRegistry.getInstrumentation().uiAutomation
+    private val listener get() = "${app.packageName}/com.semmyx.ledger.bank.BankNotificationListener"
+
+    private fun shell(command: String): String {
+        val fd = automation.executeShellCommand(command)
+        return ParcelFileDescriptor.AutoCloseInputStream(fd).use { it.readBytes().toString(Charsets.UTF_8) }
+    }
+
+    private fun waitFor(timeoutMs: Long, check: () -> Boolean): Boolean {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) { if (check()) return true; Thread.sleep(500) }
+        return check()
+    }
+
+    private fun entries() = runBlocking { repo.exportEntries() }
+
+    @Before fun setUp() {
+        repo.enabled = true
+        repo.autoImport = true
+        repo.setPackage("mono", "com.android.shell")
+        shell("cmd notification allow_listener $listener")
+        val current = shell("settings get secure enabled_notification_listeners").trim()
+        if (!current.contains(listener)) {
+            shell("settings put secure enabled_notification_listeners ${if (current.isBlank() || current == "null") listener else "$current:$listener"}")
+        }
+        assertTrue("Notification listener did not bind", waitFor(30_000) { repo.diagnostics.value.connected })
+    }
+
+    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono") }
+
+    @Test fun bankPushIsImportedInBackgroundAndRepeatIsIgnored() {
+        // No spaces: UiAutomation tokenises the command line without quote handling.
+        val probe = shell("cmd notification post -t Probe probe_tag probe_text")
+        assumeTrue("cmd notification post unsupported on this API: $probe", probe.isNotBlank() && !probe.contains("Unknown", true) && !probe.contains("Exception", true))
+
+        shell("cmd notification post -t Сільпо bank_a −125,50₴|Залишок:1000,00₴")
+        assertTrue("Bank push was not imported in the background; last=${repo.diagnostics.value.lastCode}",
+            waitFor(30_000) { entries().any { it.amountMinor == 12550L } })
+        val imported = entries().first { it.amountMinor == 12550L }
+        assertEquals("Сільпо", imported.title)
+        assertEquals(com.semmyx.ledger.domain.EntryType.EXPENSE, imported.type)
+        assertEquals(com.semmyx.ledger.domain.Category.FOOD, imported.category)
+
+        // The same push delivered again must not create a second entry.
+        shell("cmd notification post -t Сільпо bank_b −125,50₴|Залишок:1000,00₴")
+        Thread.sleep(5_000)
+        assertEquals(1, entries().count { it.amountMinor == 12550L })
+    }
+}
 ```
 
 ## app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt
@@ -445,6 +531,7 @@ class LedgerApplication : Application() {
         // Installed first so it wraps (and runs before) the fatal handler below, saving the
         // stack trace to app-internal storage. Settings -> Support can then show it, since we
         // otherwise have no way to see what actually crashed without adb/logcat access.
+        com.semmyx.ledger.platform.OwnershipSeal.register()
         CrashLogger.install(this)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
@@ -1267,7 +1354,7 @@ fun AuthenticationScreen(
         Text(stringResource(heading), style = MaterialTheme.typography.headlineMedium)
         Text(stringResource(if (state.setup) R.string.pin_setup_subtitle else R.string.pin_unlock_subtitle),
             color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-        Row(Modifier.padding(vertical = 8.dp).clearAndSetSemantics { contentDescription = description }.testTag("pinDots"),
+        Row(Modifier.padding(vertical = 8.dp).testTag("pinDots").clearAndSetSemantics { contentDescription = description },
             horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             repeat(6) { index ->
                 Box(Modifier.size(16.dp).clip(CircleShape).background(if (index < state.digits) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
@@ -1348,9 +1435,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
             if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
-                runCatching {
-                    NotificationListenerService.requestRebind(ComponentName(applicationContext, BankNotificationListener::class.java))
-                }
+                ensureListenerBound(applicationContext, repository)
             }
             BankSmsCatchUp.run(applicationContext, repository)
             Result.success()
@@ -1361,6 +1446,23 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
     }
 
     companion object {
+        /**
+         * The system sometimes leaves a notification listener unbound after an app update, a crash or aggressive
+         * battery management. First ask politely; if it is still not connected, toggle the component, which makes
+         * Android bind it again (and it then replays the notifications still in the shade).
+         */
+        suspend fun ensureListenerBound(context: Context, repository: com.semmyx.ledger.data.bank.BankImportRepository) {
+            val component = ComponentName(context, BankNotificationListener::class.java)
+            runCatching { NotificationListenerService.requestRebind(component) }
+            kotlinx.coroutines.delay(3_000)
+            if (repository.diagnostics.value.connected) return
+            val pm = context.packageManager
+            runCatching {
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+            }
+        }
+
         fun schedule(context: Context) {
             val work = WorkManager.getInstance(context)
             work.enqueueUniquePeriodicWork("bank-import-keepalive", ExistingPeriodicWorkPolicy.UPDATE,
@@ -1425,6 +1527,8 @@ class BankNotificationListener : NotificationListenerService() {
     }
 
     private fun handle(sbn: StatusBarNotification) {
+        // Our own "imported" confirmations must never be re-read as bank messages.
+        if (sbn.packageName == packageName) return
         val repository = repository()
         val bank = repository.bankForPackage(sbn.packageName)
         repository.note(
@@ -1437,16 +1541,12 @@ class BankNotificationListener : NotificationListenerService() {
         // Group summaries carry no transaction data.
         if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
 
-        val extras = notification.extras
-        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
-            ?.toString().orEmpty()
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = "$title\n$body".take(8001)
-
-        if (body.isBlank()) { repository.note("EMPTY_TEXT"); return }
+        val text = readText(notification)
+        if (text.isBlank()) { repository.note("EMPTY_TEXT"); return }
         if (!repository.enabled) { repository.note("DISABLED"); return }
 
-        scope.launch {
+        // NonCancellable: a started import must finish even if the service is being torn down.
+        scope.launch(NonCancellable) {
             try {
                 repository.receive(
                     bank, text,
@@ -1461,6 +1561,27 @@ class BankNotificationListener : NotificationListenerService() {
                 android.util.Log.w("BankImport", "Background import failed; no message contents logged")
             }
         }
+    }
+
+    /**
+     * Banks put the shop into the title and the amount into the text, or use big/inbox styles.
+     * Everything readable is joined, first line = title, duplicates removed.
+     */
+    private fun readText(notification: Notification): String {
+        val extras = notification.extras ?: return ""
+        val parts = LinkedHashSet<String>()
+        fun add(value: CharSequence?) { value?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(parts::add) }
+        add(extras.getCharSequence(Notification.EXTRA_TITLE_BIG) ?: extras.getCharSequence(Notification.EXTRA_TITLE))
+        add(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_TEXT))
+        extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach(::add)
+        add(extras.getCharSequence(Notification.EXTRA_SUB_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT))
+        if (parts.size < 2) add(notification.tickerText)
+        // Remove parts that are entirely contained in a longer part (BIG_TEXT repeats TEXT).
+        val list = parts.toList()
+        return list.filter { part -> list.none { other -> other !== part && other.length > part.length && other.contains(part) } }
+            .joinToString("\n").take(8001)
     }
 
     override fun onDestroy() {
@@ -3474,7 +3595,7 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
             LaunchedEffect(state.loading) { if (!state.editing) runCatching { amountFocus.requestFocus() } }
             Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                // Minimal form: type, amount, category, (date), save. Title falls back to the category name.
+                // Form: type, amount, optional title, category, date, save. Empty title falls back to the category name.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
                         label = { Text(stringResource(R.string.expense)) })
@@ -3486,10 +3607,9 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
                     isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
                     modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
                     supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
-                if (state.editing) {
-                    OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
-                        isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
-                }
+                OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
+                    placeholder = { Text(fallbackTitle) }, supportingText = { Text(stringResource(R.string.title_optional_hint)) },
+                    isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Category.entries.forEach { category ->
                         FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
@@ -4138,6 +4258,27 @@ object HighRefreshRate {
             preferredRefreshRate = selected?.refreshRate ?: 0f
         }
     }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt
+
+```kotlin
+package com.semmyx.ledger.platform
+
+/**
+ * Copyright (c) 2026 Semmyx (semmyx666). All rights reserved. See LICENSE.
+ *
+ * Ownership seal: SHA-256("TG Ledger|semmyx666|semmyxofficial666@gmail.com|2026"), first 32 hex chars.
+ * It is published in docs/OWNERSHIP.md and is present in every build (APK/AAB), so a copy of the app can be
+ * traced back to this project even after it is renamed or re-signed.
+ */
+object OwnershipSeal {
+    const val OWNER = "Semmyx (semmyx666)"
+    const val ID = "11b3e1bb7fc072422cf2d25d258c65c8"
+
+    /** Keeps the seal referenced so that shrinking/obfuscation can never strip it from release builds. */
+    fun register() { System.setProperty("com.semmyx.ledger.seal", "$OWNER|$ID") }
 }
 ```
 
@@ -5831,6 +5972,7 @@ object VoiceSmallTalk {
     <string name="entry_currency_notice">Валюта: %1$s. Наявні записи зберігають початкову валюту. Змініть типову валюту в налаштуваннях перед додаванням нового запису.</string>
     <string name="amount">Сума</string>
     <string name="amount_invalid">Введіть від 0,01 до 99 999 999,99 з не більш ніж двома десятковими знаками, без роздільників тисяч.</string>
+    <string name="title_optional_hint">Необов’язково — якщо порожньо, буде назва категорії</string>
     <string name="entry_title">Назва</string>
     <string name="title_invalid">Введіть назву від 1 до 60 символів.</string>
     <string name="title_hint">Наприклад: продукти або зарплата</string>
@@ -6202,6 +6344,7 @@ object VoiceSmallTalk {
     <string name="entry_currency_notice">Currency: %1$s. Existing entries keep their original currency. Change the default in Settings before adding a new entry.</string>
     <string name="amount">Amount</string>
     <string name="amount_invalid">Enter 0.01–99,999,999.99 with at most two decimal places; do not use thousands separators.</string>
+    <string name="title_optional_hint">Optional — the category name is used if empty</string>
     <string name="entry_title">Title</string>
     <string name="title_invalid">Enter a title of 1–60 characters.</string>
     <string name="title_hint">For example: groceries or salary</string>
@@ -7100,6 +7243,14 @@ interface BankDao {
     )
     suspend fun similarCrossSource(amount: Long, currency: String, type: String, time: Long): Int
 
+    /** A wallet-app row for the same amount/time exists (wallet + issuing bank announce one tap). */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE bankId='wallet' AND amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=180000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')""",
+    )
+    suspend fun walletTwin(amount: Long, currency: String, type: String, time: Long): Int
+
     @Query(
         """SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
         WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
@@ -7285,7 +7436,13 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
             ) > 0
 
+            // With auto-import on, repeats are dropped silently: a bank re-posting the same push, or a wallet
+            // app and the issuing bank announcing the same tap. Otherwise they wait in the review queue.
+            val walletInvolved = Banks.WALLET_ID == parsed.bankId || crossSourceDup && dao.walletTwin(
+                parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis) > 0
+            val silentDrop = !manual && autoImport && (sameBankDup || (crossSourceDup && walletInvolved))
             val status = when {
+                silentDrop -> "DUPLICATE_IGNORED"
                 sameBankDup   -> "DUPLICATE_REVIEW"
                 crossSourceDup -> "CROSS_DUPLICATE_REVIEW"
                 else          -> "REVIEW"
@@ -7319,7 +7476,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
 
             // Auto-import: only for confident single-source entries.
             // Cross-source duplicates are NEVER auto-imported — the user must review.
-            if (!manual && autoImport && parsed.confident && !sameBankDup && !crossSourceDup) {
+            if (!manual && autoImport && parsed.confident && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
                 postImportNotification(parsed)
@@ -7347,7 +7504,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
         val entity = EntryEntity(
             id, title, item.amountMinor, item.currency, type.name, item.category,
             date.toEpochDay(),
-            if (item.transfer) "Confirmed external transfer" else "",
+            "",
             title.lowercase(Locale.ROOT),
             item.receivedAtMillis,
             sourceType = "CARD",
@@ -7396,7 +7553,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
             )
         }
         val amountText = Money.editable(parsed.amountMinor)
-        val title = "${parsed.bankId.replaceFirstChar { it.uppercase() }}: ${parsed.merchant.ifBlank { parsed.bankId }}"
+        val title = "${Banks.name(parsed.bankId)}: ${parsed.merchant.ifBlank { Banks.name(parsed.bankId) }}"
         val body = "${if (parsed.type == EntryType.EXPENSE) "−" else "+"} $amountText ${parsed.currency.name}"
         val notification = NotificationCompat.Builder(ctx, channelId)
             .setSmallIcon(android.R.drawable.ic_menu_save)
@@ -9090,89 +9247,251 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.*
 import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
 import java.util.Locale
 
 enum class PaymentSource { UNKNOWN, CASH, CARD }
-data class Bank(val id: String, val name: String, val packages: Set<String>, val senders: Set<String>)
+
+/**
+ * [packages] are exact Android package names; [packageHints] are fragments that identify the same app
+ * when the vendor ships it under a different id (regional builds, beta channels).
+ */
+data class Bank(
+    val id: String, val name: String, val packages: Set<String>, val senders: Set<String>,
+    val packageHints: Set<String> = emptySet(),
+)
+
 object Banks {
+    const val WALLET_ID = "wallet"
     val all = listOf(
-        Bank("privat", "ПриватБанк", setOf("com.pb", "com.privatbank.ap24"), setOf("privatbank", "privat", "privat24", "3700")),
-        Bank("mono", "monobank", setOf("com.ftband.mono"), setOf("monobank", "mono")),
-        Bank("sense", "Sense Bank", setOf("ua.alfabank.mobile.android", "ua.sensebank.mobile.android"), setOf("sensebank", "sense", "alfabank")),
-        Bank("abank", "А-Банк", setOf("ua.com.abank", "ua.com.abank.android"), setOf("abank", "a-bank", "а-банк")),
-        Bank("oschad", "Ощадбанк", setOf("ua.oschadbank.online"), setOf("oschadbank", "oschad", "ощадбанк")),
-        Bank("pumb", "ПУМБ", setOf("com.fuib.android.spot.online"), setOf("pumb", "fuib", "пумб")),
-        Bank("revolut", "Revolut", setOf("com.revolut.revolut"), setOf("revolut")),
-        Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise")),
-        Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"))
+        Bank("privat", "ПриватБанк", setOf("ua.privatbank.ap24", "com.privatbank.ap24", "com.pb"), setOf("privatbank", "privat", "privat24", "3700"), setOf("privatbank", "ap24")),
+        Bank("mono", "monobank", setOf("com.ftband.mono"), setOf("monobank", "mono"), setOf("ftband", "monobank")),
+        Bank("sense", "Sense Bank", setOf("ua.alfabank.mobile.android", "ua.sensebank.mobile.android"), setOf("sensebank", "sense", "alfabank"), setOf("alfabank", "sensebank")),
+        Bank("abank", "А-Банк", setOf("ua.com.abank", "ua.com.abank.android"), setOf("abank", "a-bank", "а-банк"), setOf("abank")),
+        Bank("oschad", "Ощадбанк", setOf("ua.oschadbank.online"), setOf("oschadbank", "oschad", "ощадбанк"), setOf("oschad")),
+        Bank("pumb", "ПУМБ", setOf("com.fuib.android.spot.online"), setOf("pumb", "fuib", "пумб"), setOf("fuib", "pumb")),
+        Bank("revolut", "Revolut", setOf("com.revolut.revolut"), setOf("revolut"), setOf("revolut")),
+        Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise"), setOf("transferwise")),
+        Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"), setOf("number26")),
+        // Wallet apps announce the same tap as the issuing bank; the pair is collapsed by cross-source deduplication.
+        Bank(WALLET_ID, "Google Wallet", setOf("com.google.android.apps.walletnfcrel", "com.samsung.android.spay"), emptySet(), setOf("walletnfcrel")),
     )
-    fun byPackage(value: String) = all.firstOrNull { value in it.packages }
+    fun byPackage(value: String): Bank? =
+        all.firstOrNull { value in it.packages } ?: all.firstOrNull { bank -> bank.packageHints.any { value.contains(it, ignoreCase = true) } }
     fun bySender(value: String) = all.firstOrNull { value.trim().lowercase(Locale.ROOT) in it.senders }
     fun name(id: String?) = all.firstOrNull { it.id == id }?.name ?: id.orEmpty()
 }
+
 data class ParsedBankOperation(val bankId: String, val amountMinor: Long, val currency: LedgerCurrency,
     val type: EntryType, val merchant: String, val cardLast4: String?, val happenedAtMillis: Long,
     val timeFromMessage: Boolean, val transfer: Boolean, val confident: Boolean, val category: Category)
 
-/** Pure offline parser. OTP/ads/refusals are ignored; ambiguous texts never become automatic expenses. */
+/**
+ * Pure offline parser for bank push / SMS texts (Ukrainian, Russian, English and transliterated).
+ *
+ * A message becomes an operation only when it carries an amount **and** a clear direction (sign or
+ * keyword). OTP codes, declines, ads, balance-only texts and conversion amounts are ignored.
+ * `confident` means: single amount, known direction -> safe to save without asking.
+ */
 object BankParser {
-    private val amount = Regex("([+-]?[0-9]{1,3}(?:[ \\u00A0\\u202F][0-9]{3})+(?:[.,][0-9]{1,2})?|[+-]?[0-9]+(?:[.,][0-9]{1,2})?)\\s*(UAH|USD|EUR|грн\\.?|гривень|гривні|₴|\\$|€)", RegexOption.IGNORE_CASE)
-    private val amountPrefix = Regex("(UAH|USD|EUR|\\$|€|₴)\\s*([+-]?[0-9]+(?:[.,][0-9]{1,2})?)", RegexOption.IGNORE_CASE)
-    private val expense = Regex("(?:списан[оі]?|витрат[аи]|оплат[аи]|покупк[аи]|купівл[яі]|purchase|paid|payment|spent|debit(?:ed)?)", RegexOption.IGNORE_CASE)
-    private val income = Regex("(?:зарахован[оі]?|поповнення|пополнение|надходження|зачислен[оа]?|received|credited|top[ -]?up|refund|повернення)", RegexOption.IGNORE_CASE)
-    private val transfer = Regex("(?:переказ|перевод|transfer|p2p)", RegexOption.IGNORE_CASE)
-    private val otp = Regex("(?:одноразов|one[ -]?time|verification code|код\\s+(?:входу|підтвердження|подтверждения)|otp|пароль|password)", RegexOption.IGNORE_CASE)
-    private val declined = Regex("(?:відхилен|отклонен|declined|failed|невдал|недостатньо|insufficient)", RegexOption.IGNORE_CASE)
-    private val card = Regex("(?:карт[аикоуі]*|card|[＊*•]{2,})\\s*[:№#*•-]*\\s*([0-9]{4})(?![0-9])", RegexOption.IGNORE_CASE)
-    private val merchant = Regex("(?:merchant|магазин|мерчант|торговець|at|у|в)\\s*[:=-]?\\s+([^;\\n]+)", RegexOption.IGNORE_CASE)
-    private val time = Regex("([0-9]{2}[./][0-9]{2}[./][0-9]{4})[ ,T]+([0-9]{2}:[0-9]{2}(?::[0-9]{2})?)")
-    fun parse(bank: Bank, text: String, receivedAt: Long, zone: ZoneId = ZoneId.systemDefault()): ParsedBankOperation? {
-        if (text.length > 8000 || otp.containsMatchIn(text) || declined.containsMatchIn(text)) return null
-        val matches = amount.findAll(text).filter { found ->
-            val prefix = text.substring(maxOf(0, found.range.first - 35), found.range.first)
-            !Regex("(?:баланс|залишок|остаток|balance|available|ліміт|limit)\\s*[:=-]?\\s*$", RegexOption.IGNORE_CASE).containsMatchIn(prefix)
-        }.toList()
-        val prefixes = amountPrefix.findAll(text).filter { found ->
-            val prefix = text.substring(maxOf(0, found.range.first - 35), found.range.first)
-            !Regex("(?:баланс|залишок|остаток|balance|available|ліміт|limit)\\s*[:=-]?\\s*$", RegexOption.IGNORE_CASE).containsMatchIn(prefix)
-        }.toList()
-        if (matches.isEmpty() && prefixes.isEmpty()) return null
-        val debit = expense.containsMatchIn(text); val credit = income.containsMatchIn(text); val moving = transfer.containsMatchIn(text)
-        if (!debit && !credit && !moving && !text.contains(Regex("[+-]\\s*[0-9]"))) return null
-        val selected = matches.firstOrNull()
-        val rawAmount = (selected?.groupValues?.get(1) ?: prefixes.first().groupValues[2]).replace(Regex("[ \\u00A0\\u202F]"), "").replace(',', '.')
-        val money = try { BigDecimal(rawAmount).abs().setScale(2, RoundingMode.UNNECESSARY).movePointRight(2).longValueExact() } catch (_: Exception) { return null }
-        if (money <= 0 || money > Money.MAX_ENTRY_MINOR) return null
-        val cur = (selected?.groupValues?.get(2) ?: prefixes.first().groupValues[1]).uppercase(Locale.ROOT)
-        val currency = when (cur) { "USD", "$" -> LedgerCurrency.USD; "EUR", "€" -> LedgerCurrency.EUR; else -> LedgerCurrency.UAH }
-        val type = if (credit && !debit || rawAmount.startsWith("+")) EntryType.INCOME else EntryType.EXPENSE
-        var shop = merchant.find(text)?.groupValues?.getOrNull(1)?.let {
-            it.replace(Regex("(?:баланс|залишок|balance|карт[аикоуі]*|card|[0-9]{2}[./][0-9]{2}[./][0-9]{4}).*$", RegexOption.IGNORE_CASE), "").trim().take(60)
-        }.orEmpty()
-        if (shop.isBlank()) {
-            val excluded = Regex("(?:баланс|залишок|остаток|balance|available|карт[аикоуі]*|card|[0-9]{2}:[0-9]{2})", RegexOption.IGNORE_CASE)
-            shop = text.lines().map { line -> amount.replace(amountPrefix.replace(line, ""), "").trim(' ', ':', '-', '+') }
-                .firstOrNull { line -> line.length in 2..60 && !line.equals(bank.name, ignoreCase = true) && !excluded.containsMatchIn(line) &&
-                    !expense.matches(line) && !income.matches(line) && !transfer.matches(line) && !line.all { it.isDigit() || it.isWhitespace() } }.orEmpty()
-        }
-        val timestamp = time.find(text)?.let { match ->
-            try {
-                val date = LocalDate.parse(match.groupValues[1].replace('/', '.'), DateTimeFormatter.ofPattern("dd.MM.uuuu").withResolverStyle(java.time.format.ResolverStyle.STRICT))
-                val clock = LocalTime.parse(match.groupValues[2])
-                date.atTime(clock).atZone(zone).toInstant().toEpochMilli().takeIf { it <= receivedAt + 300_000L && it >= receivedAt - 366L * 86400000L }
-            } catch (_: Exception) { null }
-        }
-        return ParsedBankOperation(bank.id, money, currency, type, shop, card.find(text)?.groupValues?.getOrNull(1),
-            timestamp ?: receivedAt, timestamp != null, moving, matches.size + prefixes.size == 1 && debit != credit && !moving && shop.isNotBlank() && (merchant.containsMatchIn(text) || categorize(shop) != Category.OTHER), categorize(shop))
+    private const val NUM = "(?:[0-9]{1,3}(?:[ .,][0-9]{3})+(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)"
+    private const val WORD_CUR = "(?:UAH|USD|EUR|GBP|PLN|грн\\.?|гривень|гривні|гривня|zł|zl)(?![\\p{L}])"
+    private const val SYMBOL_CUR = "[₴$€£]"
+    private val suffixAmount = Regex("([+-])?\\s*($NUM)\\s*($SYMBOL_CUR|$WORD_CUR)", RegexOption.IGNORE_CASE)
+    private val prefixAmount = Regex("(?<![\\p{L}])($SYMBOL_CUR|UAH|USD|EUR|GBP|PLN)\\s*([+-])?\\s*($NUM)", RegexOption.IGNORE_CASE)
+
+    private val nonTransactionAmount = Regex(
+        "(?:баланс|бал\\.?|залишок|остаток|доступн\\w*|available|balance|bal\\.?|ліміт|лимит|limit|кредитн\\w*|кешбек\\w*|кэшбэк\\w*|cashback|комісі\\w*|комиссия|fee|commission|до сплати|мін\\w*\\s+платіж|минимальный платеж)\\s*[:=-]?\\s*$",
+        RegexOption.IGNORE_CASE)
+    private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
+    private val expense = Regex(
+        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|pokupk|kupivl|platizh)",
+        RegexOption.IGNORE_CASE)
+    private val income = Regex(
+        "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",
+        RegexOption.IGNORE_CASE)
+    private val transfer = Regex("(?:переказ|перевод|transfer|p2p|perekaz|perevod)", RegexOption.IGNORE_CASE)
+    private val transferIn = Regex("(?:від\\s|от\\s|from\\s|отримано|получен|received|зарахован|зачислен)", RegexOption.IGNORE_CASE)
+    private val transferOut = Regex("(?:\\sна\\s|\\sto\\s|відправлен|отправлен|sent|списан|знят)", RegexOption.IGNORE_CASE)
+    private val otp = Regex("(?:одноразов|one[ -]?time|verification code|код\\s+(?:входу|підтвердження|подтверждения|безпеки)|otp|пароль|password|cvv)", RegexOption.IGNORE_CASE)
+    private val declined = Regex("(?:відхилен|отклонен|declined|failed|невдал|недостатньо|insufficient|не вдалос|заблоковано)", RegexOption.IGNORE_CASE)
+    private val promo = Regex("(?:кредит до|кредит на|до \\d[\\d ]*\\s*(?:грн|₴)\\s+(?:на|під|без)|акці[яї]|знижк|пропозиці|промо|promo|розіграш|виграй|вигра|реклам|оформи|отримай)", RegexOption.IGNORE_CASE)
+    private val card = Regex("(?:карт[аикоуі]*|card|[＊*•·]{1,})\\s*[:№#*•·.-]*\\s*([0-9]{4})(?![0-9])", RegexOption.IGNORE_CASE)
+    private val label = Regex("(?:merchant|магазин|мерчант|торговець|торгова точка|місце|место|place|details|description|опис|описание|призначення|назначение)\\s*[:=]\\s*([^;\\n]+)", RegexOption.IGNORE_CASE)
+    private val preposition = Regex("(?<![\\p{L}\\p{N}])(?:at|у|в|in)\\s+([^;\\n,]+)", RegexOption.IGNORE_CASE)
+    private val dateTime = Regex("([0-9]{2}[./][0-9]{2}[./][0-9]{4})[ ,T]+([0-9]{2}:[0-9]{2}(?::[0-9]{2})?)")
+    private val clockOnly = Regex("(?<![0-9:.])([0-9]{1,2}:[0-9]{2})(?![0-9:])")
+    private val trailer = Regex(
+        "\\s*(?:[;|•·]|(?:баланс|залишок|остаток|бал\\.|balance|bal\\.|карт[аикоуі]*|card|рахунок|доступно)(?![\\p{L}\\p{N}])|[0-9]{2}[./][0-9]{2}[./][0-9]{2,4}|[0-9]{1,2}:[0-9]{2}|[＊*•]{1,}\\s*[0-9]{4}).*$",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+    private val genericTitle = Regex(
+        "(?:оплата|покупка|купівля|списання|списано|зарахування|зараховано|поповнення|переказ|платіж|транзакці\\w*|нова транзакція|операці\\w*|витрата|надходження|payment|purchase|transaction|new transaction|transfer|debit|credit|card payment|оплата карткою|apple pay|google pay|google wallet|samsung pay|карт[аиок]*|card|\\p{P}|\\s)+",
+        RegexOption.IGNORE_CASE)
+    private val emoji = Regex("[\\p{So}\\p{Cs}\\u200d\\uFE0F]+")
+
+    private data class Hit(val range: IntRange, val minor: Long, val currency: LedgerCurrency, val sign: Char?)
+
+    private fun normalize(text: String) = text
+        .replace(Regex("[\\u2212\\u2012\\u2013\\u2014\\u2796\\uFE63\\uFF0D]"), "-")
+        .replace(Regex("[\\u00A0\\u202F\\u2009\\u2007\\u200B]"), " ")
+        .replace("\r", "")
+
+    private fun currencyOf(token: String): LedgerCurrency? = when (token.trim().trimEnd('.').uppercase(Locale.ROOT)) {
+        "USD", "$" -> LedgerCurrency.USD
+        "EUR", "€" -> LedgerCurrency.EUR
+        "GBP", "£" -> LedgerCurrency.GBP
+        "PLN", "ZŁ", "ZL" -> LedgerCurrency.PLN
+        "UAH", "₴", "ГРН", "ГРИВЕНЬ", "ГРИВНІ", "ГРИВНЯ" -> LedgerCurrency.UAH
+        else -> null
     }
+
+    /** "1 200,50" "1,200.50" "1200.5" "1.200,50" -> minor units, or null. */
+    internal fun minorOf(raw: String): Long? {
+        var value = raw.replace(" ", "")
+        val lastComma = value.lastIndexOf(','); val lastDot = value.lastIndexOf('.')
+        value = when {
+            lastComma >= 0 && lastDot >= 0 -> if (lastComma > lastDot) value.replace(".", "").replace(',', '.') else value.replace(",", "")
+            lastComma >= 0 || lastDot >= 0 -> {
+                val sep = if (lastComma >= 0) ',' else '.'
+                val parts = value.split(sep)
+                if (parts.size > 2) value.replace(sep.toString(), "")
+                else if (parts[1].length == 3 && parts[0].length in 1..3 && parts[0] != "0") parts[0] + parts[1]
+                else parts[0] + "." + parts[1]
+            }
+            else -> value
+        }
+        return try { BigDecimal(value).abs().setScale(2, RoundingMode.UNNECESSARY).movePointRight(2).longValueExact() } catch (_: Exception) {
+            try { BigDecimal(value).abs().setScale(2, RoundingMode.HALF_UP).movePointRight(2).longValueExact() } catch (_: Exception) { null }
+        }
+    }
+
+    private fun hits(text: String): List<Hit> {
+        val found = mutableListOf<Hit>()
+        suffixAmount.findAll(text).forEach { m ->
+            val minor = minorOf(m.groupValues[2]) ?: return@forEach
+            val currency = currencyOf(m.groupValues[3]) ?: return@forEach
+            found += Hit(m.range, minor, currency, m.groupValues[1].firstOrNull())
+        }
+        prefixAmount.findAll(text).forEach { m ->
+            if (found.any { it.range.first <= m.range.last && m.range.first <= it.range.last }) return@forEach
+            val minor = minorOf(m.groupValues[3]) ?: return@forEach
+            val currency = currencyOf(m.groupValues[1]) ?: return@forEach
+            found += Hit(m.range, minor, currency, m.groupValues[2].firstOrNull())
+        }
+        return found.sortedBy { it.range.first }.map { hit ->
+            // The sign may sit just before the currency token ("$-12.50") or before a gap ("- 100").
+            if (hit.sign != null) hit else {
+                val before = text.substring(maxOf(0, hit.range.first - 2), hit.range.first).trimEnd()
+                hit.copy(sign = before.lastOrNull()?.takeIf { it == '-' || it == '+' })
+            }
+        }
+    }
+
+    fun parse(bank: Bank, rawText: String, receivedAt: Long, zone: ZoneId = ZoneId.systemDefault()): ParsedBankOperation? {
+        if (rawText.length > 8000) return null
+        val text = normalize(rawText)
+        if (otp.containsMatchIn(text) || declined.containsMatchIn(text)) return null
+
+        val primary = hits(text).filter { hit ->
+            val prefix = text.substring(maxOf(0, hit.range.first - 28), hit.range.first)
+            !nonTransactionAmount.containsMatchIn(prefix)
+        }
+        val first = primary.firstOrNull() ?: return null
+        // Other amounts in the same currency are ambiguous; other currencies are conversions of the same payment.
+        val ambiguous = primary.drop(1).any { it.currency == first.currency && it.minor != first.minor }
+        if (first.minor <= 0 || first.minor > Money.MAX_ENTRY_MINOR) return null
+
+        val isRefund = refund.containsMatchIn(text)
+        val debit = expense.containsMatchIn(text) && !isRefund
+        val credit = income.containsMatchIn(text) || isRefund
+        val moving = transfer.containsMatchIn(text)
+        val signed = first.sign
+        if (!debit && !credit && !moving && signed == null) return null
+        if (promo.containsMatchIn(text) && signed == null && !debit && !credit) return null
+
+        var directionKnown = true
+        val type: EntryType = when {
+            signed == '+' -> EntryType.INCOME
+            signed == '-' -> EntryType.EXPENSE
+            isRefund -> EntryType.INCOME
+            credit && !debit -> EntryType.INCOME
+            debit && !credit -> EntryType.EXPENSE
+            debit && credit -> { directionKnown = false; if ((income.find(text)?.range?.first ?: Int.MAX_VALUE) < (expense.find(text)?.range?.first ?: Int.MAX_VALUE)) EntryType.INCOME else EntryType.EXPENSE }
+            moving && transferIn.containsMatchIn(text) && !transferOut.containsMatchIn(text) -> EntryType.INCOME
+            moving && transferOut.containsMatchIn(text) && !transferIn.containsMatchIn(text) -> EntryType.EXPENSE
+            else -> { directionKnown = false; EntryType.EXPENSE }
+        }
+
+        val shop = merchant(bank, text, first)
+        val timestamp = timestamp(text, receivedAt, zone)
+        val category = when {
+            moving -> Category.TRANSFER
+            type == EntryType.INCOME && Regex("зарплат|salary", RegexOption.IGNORE_CASE).containsMatchIn(text) -> Category.SALARY
+            else -> categorize(shop)
+        }
+        return ParsedBankOperation(
+            bank.id, first.minor, first.currency, type, shop, card.find(text)?.groupValues?.getOrNull(1),
+            timestamp ?: receivedAt, timestamp != null, moving, directionKnown && !ambiguous, category,
+        )
+    }
+
+    private fun timestamp(text: String, receivedAt: Long, zone: ZoneId): Long? {
+        dateTime.find(text)?.let { match ->
+            try {
+                val date = LocalDate.parse(match.groupValues[1].replace('/', '.'), DateTimeFormatter.ofPattern("dd.MM.uuuu").withResolverStyle(ResolverStyle.STRICT))
+                val clock = LocalTime.parse(match.groupValues[2])
+                return date.atTime(clock).atZone(zone).toInstant().toEpochMilli().takeIf { it <= receivedAt + 300_000L && it >= receivedAt - 366L * 86400000L }
+            } catch (_: Exception) { return null }
+        }
+        // "HH:mm" alone: take today's date if that moment is not in the future (otherwise yesterday).
+        clockOnly.find(text)?.let { match ->
+            try {
+                val clock = LocalTime.parse(match.groupValues[1].padStart(5, '0'))
+                val today = Instant.ofEpochMilli(receivedAt).atZone(zone).toLocalDate()
+                var moment = today.atTime(clock).atZone(zone).toInstant().toEpochMilli()
+                if (moment > receivedAt + 300_000L) moment -= 86_400_000L
+                return moment.takeIf { receivedAt - moment <= 6 * 3_600_000L }
+            } catch (_: Exception) { return null }
+        }
+        return null
+    }
+
+    private fun clean(value: String): String {
+        var out = value.replace(emoji, " ")
+        out = out.replace(trailer, "")
+        out = out.trim(' ', ':', '-', '+', '.', ',', '"', '\'', '«', '»', '(', ')', '|')
+        return out.replace(Regex("\\s{2,}"), " ").take(60)
+    }
+
+    private fun merchant(bank: Bank, text: String, first: Hit): String {
+        label.find(text)?.groupValues?.getOrNull(1)?.let(::clean)?.takeIf { it.length >= 2 }?.let { return it }
+        val badStart = Regex("^(?:карт|card|рахунок|счет|account|[0-9]|[＊*•])", RegexOption.IGNORE_CASE)
+        val after = text.substring(minOf(text.length, first.range.last + 1))
+        preposition.findAll(after).map { clean(it.groupValues[1]) }
+            .firstOrNull { it.length >= 2 && !badStart.containsMatchIn(it) && !genericTitle.matches(it) }?.let { return it }
+        preposition.findAll(text).map { clean(it.groupValues[1]) }
+            .firstOrNull { it.length >= 2 && !badStart.containsMatchIn(it) && !genericTitle.matches(it) }?.let { return it }
+        // Many apps put the shop into the notification title (first line) and the amount into the body.
+        val noAmounts = suffixAmount.replace(prefixAmount.replace(text, ""), "")
+        val keywords = Regex("\\p{L}*(?:${expense.pattern}|${income.pattern}|${transfer.pattern})\\p{L}*", RegexOption.IGNORE_CASE)
+        return noAmounts.lines().asSequence()
+            .map { line -> clean(line.replace(card, " ").replace(keywords, " ")) }
+            .firstOrNull { line ->
+                line.length in 2..60 && !line.equals(bank.name, ignoreCase = true) && !genericTitle.matches(line) &&
+                    !nonTransactionAmount.containsMatchIn(line) && !line.all { it.isDigit() || it.isWhitespace() || it in ".,:*-" } &&
+                    !Regex("^(?:баланс|залишок|остаток|balance|bal)", RegexOption.IGNORE_CASE).containsMatchIn(line)
+            }.orEmpty()
+    }
+
     fun categorize(merchant: String): Category {
         val value = merchant.lowercase(Locale.ROOT)
         return when {
-            listOf("атб", "atb", "сільпо", "silpo", "ашан", "auchan", "novus", "metro").any(value::contains) -> Category.FOOD
-            listOf("wog", "okko", "ugo", "uber", "bolt", "uklon").any(value::contains) -> Category.TRANSPORT
-            listOf("steam", "megogo", "netflix", "spotify", "cinema").any(value::contains) -> Category.LEISURE
-            listOf("аптек", "pharmacy", "clinic").any(value::contains) -> Category.HEALTH
-            listOf("restaurant", "кафе", "cafe", "mcdonald", "kfc").any(value::contains) -> Category.DINING
+            listOf("атб", "atb", "сільпо", "silpo", "ашан", "auchan", "novus", "метро", "metro", "varus", "варус", "фора", "fora", "lidl", "biedronka", "продукт", "супермаркет", "grocery", "market", "маркет", "ева ", "eva ").any(value::contains) -> Category.FOOD
+            listOf("wog", "okko", "ugo", "uber", "bolt", "uklon", "укрзалізниц", "ukrzaliznytsia", "азс", "shell", "socar", "паливо", "taxi", "таксі").any(value::contains) -> Category.TRANSPORT
+            listOf("steam", "megogo", "netflix", "spotify", "cinema", "кіно", "youtube", "playstation", "xbox", "multiplex").any(value::contains) -> Category.LEISURE
+            listOf("аптек", "pharmacy", "clinic", "клінік", "подорожник", "анц", "лікарн").any(value::contains) -> Category.HEALTH
+            listOf("restaurant", "ресторан", "кафе", "cafe", "mcdonald", "kfc", "pizza", "піц", "sushi", "суші", "coffee", "кав", "starbucks", "burger", "бургер").any(value::contains) -> Category.DINING
+            listOf("епіцентр", "epicentr", "jysk", "ikea", "комунал", "жкг", "kyivstar", "київстар", "vodafone", "lifecell", "інтернет").any(value::contains) -> Category.HOME
             else -> Category.OTHER
         }
     }
@@ -9535,6 +9854,76 @@ class BankParserTest {
     @Test fun receiptTimeIsNotInventedBankTime() {
         val value = BankParser.parse(bank, "Оплата 100 грн у АТБ", at)!!
         assertEquals(at, value.happenedAtMillis); assertFalse(value.timeFromMessage)
+    }
+
+    private fun parse(text: String, bankId: String = "mono") = BankParser.parse(Banks.all.first { it.id == bankId }, text, at, ZoneId.of("Europe/Kyiv"))
+
+    // ---- Realistic push formats: title on the first line, body below (as the listener builds them) ----
+    @Test fun monoUnicodeMinusWithMerchantInTitle() {
+        val p = parse("Сільпо\n−1 234,56 ₴ · Залишок 10 000,00 ₴")!!
+        assertEquals(123456L, p.amountMinor); assertEquals(EntryType.EXPENSE, p.type)
+        assertEquals("Сільпо", p.merchant); assertEquals(Category.FOOD, p.category); assertTrue(p.confident)
+    }
+    @Test fun monoIncomePlusSign() {
+        val p = parse("Іван П.\n+500,00 ₴ Баланс 1 500,00 ₴")!!
+        assertEquals(50000L, p.amountMinor); assertEquals(EntryType.INCOME, p.type); assertTrue(p.confident)
+    }
+    @Test fun privatPurchaseWithGluedCurrencyAndBalance() {
+        val p = parse("Оплата 150.50UAH Картка *4455 WOG Баланс 2000.00UAH", "privat")!!
+        assertEquals(15050L, p.amountMinor); assertEquals("4455", p.cardLast4); assertEquals(EntryType.EXPENSE, p.type)
+        assertEquals(Category.TRANSPORT, p.category); assertTrue(p.confident)
+    }
+    @Test fun transliteratedPrivatSms() {
+        val p = parse("Spysannya 99.00UAH. Karta *1111 Netflix. Bal. 500.00UAH", "privat")!!
+        assertEquals(9900L, p.amountMinor); assertEquals(EntryType.EXPENSE, p.type)
+    }
+    @Test fun incomeKeywordTransliterated() {
+        assertEquals(EntryType.INCOME, parse("Zarakhuvannya 2000.00UAH na kartku *1234", "privat")!!.type)
+    }
+    @Test fun titleIsGenericSoMerchantComesFromBody() {
+        val p = parse("Оплата\n320 грн, магазин: Аптека Доброго Дня")!!
+        assertEquals(32000L, p.amountMinor); assertEquals(Category.HEALTH, p.category)
+    }
+    @Test fun merchantMissingStillImportsWithBlankMerchant() {
+        val p = parse("Списано 77,00 грн")!!
+        assertEquals(7700L, p.amountMinor); assertTrue(p.confident); assertEquals("", p.merchant)
+    }
+    @Test fun conversionAmountIsNotSecondPurchase() {
+        val p = parse("Оплата 10.00 USD (412,50 грн) у Steam")!!
+        assertEquals(1000L, p.amountMinor); assertEquals(LedgerCurrency.USD, p.currency); assertTrue(p.confident)
+    }
+    @Test fun twoDifferentAmountsAreNotConfident() {
+        assertFalse(parse("Оплата 100 грн та 250 грн у АТБ")!!.confident)
+    }
+    @Test fun refundIsIncome() { assertEquals(EntryType.INCOME, parse("Повернення оплати 250 грн АТБ")!!.type) }
+    @Test fun transferDirections() {
+        assertEquals(EntryType.INCOME, parse("Переказ від Олена К. 300 грн")!!.type)
+        assertEquals(EntryType.EXPENSE, parse("Переказ на картку 300 грн")!!.type)
+        assertTrue(parse("Переказ на картку 300 грн")!!.transfer)
+    }
+    @Test fun adsAndCashbackOnlyAreIgnored() {
+        assertNull(parse("Кредит до 50 000 грн за акцією!"))
+        assertNull(parse("Кешбек 15 грн нараховано"))
+        assertNull(parse("Ваш ліміт 20 000 грн"))
+        assertNull(parse("Hello! Your card is ready"))
+    }
+    @Test fun thousandSeparators() {
+        assertEquals(120050L, parse("Оплата 1,200.50 грн")!!.amountMinor)
+        assertEquals(120050L, parse("Оплата 1.200,50 грн")!!.amountMinor)
+        assertEquals(1200000L, parse("Оплата 12 000 грн")!!.amountMinor)
+    }
+    @Test fun clockOnlyUsesTodayNotFuture() {
+        val p = parse("Оплата 10 грн Кава 22:50")!!
+        assertTrue(p.timeFromMessage)
+        assertTrue(p.happenedAtMillis <= at + 300_000L)
+    }
+    @Test fun walletAndBankPackagesAreRecognised() {
+        assertEquals("privat", Banks.byPackage("ua.privatbank.ap24")?.id)
+        assertEquals("mono", Banks.byPackage("com.ftband.mono")?.id)
+        assertEquals("wallet", Banks.byPackage("com.google.android.apps.walletnfcrel")?.id)
+        assertEquals("sense", Banks.byPackage("ua.alfabank.mobile.android.beta")?.id)
+        assertNull(Banks.byPackage("org.telegram.messenger"))
+        assertNull(Banks.byPackage("com.whatsapp"))
     }
 }
 ```

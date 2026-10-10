@@ -1,19 +1,15 @@
-TGLedger-3.3.0/
+TGLedger-3.3.1/
 ├── .github/
 │   └── workflows/
 │       └── android.yml
 ├── app/
 │   ├── src/
 │   │   ├── androidTest/
-│   │   │   ├── java/
-│   │   │   │   └── com/
-│   │   │   │       └── example/
-│   │   │   │           └── myapplication/
-│   │   │   │               └── ExampleInstrumentedTest.kt
 │   │   │   └── kotlin/
 │   │   │       └── com/
 │   │   │           └── semmyx/
 │   │   │               └── ledger/
+│   │   │                   ├── BankBackgroundImportTest.kt
 │   │   │                   └── ComposeScreensTest.kt
 │   │   ├── legacyV7/
 │   │   │   └── AndroidManifest.xml
@@ -67,6 +63,7 @@ TGLedger-3.3.0/
 │   │   │   │               ├── platform/
 │   │   │   │               │   ├── BiometricUnlocker.kt
 │   │   │   │               │   ├── HighRefreshRate.kt
+│   │   │   │               │   ├── OwnershipSeal.kt
 │   │   │   │               │   └── RateRefreshWorker.kt
 │   │   │   │               ├── settings/
 │   │   │   │               │   ├── ColorSettings.kt
@@ -237,6 +234,7 @@ TGLedger-3.3.0/
 │   ├── DEVELOPER_ACTIVATION_CODES.md
 │   ├── OLED_2_2.md
 │   ├── OPTIONAL_VOICE_ASSISTANT.md
+│   ├── OWNERSHIP.md
 │   ├── PROJECT_STRUCTURE.md
 │   ├── RELEASE_CHECKLIST.md
 │   ├── RESPONSIVE_2_4_1.md
@@ -306,6 +304,7 @@ TGLedger-3.3.0/
 ├── gradle.properties
 ├── gradlew
 ├── gradlew.bat
+├── LICENSE
 ├── MANIFEST.sha256
 ├── NOTICE.md
 ├── PROJECT_TREE.txt
