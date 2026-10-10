@@ -127,7 +127,7 @@ class OptionalVoiceAssistant(activity: Activity) {
         private val BALANCE_UK = listOf("баланс", "скільки в мене грошей", "скільки грошей")
         private val SPENT_EN = listOf("spent today", "spend today", "what did i spend")
         private val SPENT_UK = listOf("витратив сьогодні", "витратили сьогодні", "скільки витратив")
-        private val ADD_EN = listOf("add entry", "new entry", "add expense", "add income")
+        private val ADD_EN = listOf("add entry", "new entry", "add expense", "add income", "new expense", "new income")
         private val ADD_UK = listOf("додати запис", "новий запис", "додати витрату", "додати доход")
     }
 }

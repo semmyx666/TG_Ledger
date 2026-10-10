@@ -15,5 +15,5 @@ internal fun BillingClient.queryVersionedProducts(params: QueryProductDetailsPar
 internal fun versionedPrice(details: ProductDetails): String? = details.oneTimePurchaseOfferDetailsList?.firstOrNull()?.formattedPrice
 internal fun versionedProductParams(details: ProductDetails): BillingFlowParams.ProductDetailsParams {
     val offer = requireNotNull(details.oneTimePurchaseOfferDetailsList?.firstOrNull())
-    return BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(details).setOfferToken(offer.offerToken).build()
+    return BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(details).setOfferToken(requireNotNull(offer.offerToken)).build()
 }
