@@ -14,6 +14,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
@@ -23,6 +25,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: app/build/outputs/apk/*/debug/*.apk
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -44,6 +50,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Enable emulator acceleration
         run: |
