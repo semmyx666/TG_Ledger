@@ -2,6 +2,8 @@ package com.semmyx.ledger.support
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -10,12 +12,13 @@ import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
 import com.semmyx.ledger.common.ContentCard
-import com.semmyx.ledger.common.LedgerBottomBar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }) }, bottomBar = { LedgerBottomBar(2, onNavigate) }) { padding ->
+fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }, navigationIcon = {
+        IconButton(onClick = onClose) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { ContentCard {
                 Text(stringResource(R.string.help_heading), style = MaterialTheme.typography.headlineMedium)

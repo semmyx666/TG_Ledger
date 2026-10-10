@@ -47,9 +47,11 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
         EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.back), { onNavigate(0) })
         return
     }
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, actions = {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, navigationIcon = {
+        IconButton(onClick = { onNavigate(0) }) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }, actions = {
         IconButton(onClick = onLock) { Icon(Icons.Default.Lock, stringResource(R.string.lock_now)) }
-    }) }, bottomBar = { LedgerBottomBar(1, onNavigate) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
+    }) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item(key = "profile") { ContentCard {
                 Text(stringResource(R.string.profile), style = MaterialTheme.typography.titleLarge)

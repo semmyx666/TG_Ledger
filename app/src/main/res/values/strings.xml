@@ -5,6 +5,7 @@
     <string name="settings">Settings</string>
     <string name="help">Help</string>
     <string name="back">Back</string>
+    <string name="close">Close</string>
     <string name="retry">Try again</string>
     <string name="next">Continue</string>
     <string name="skip">Skip</string>
@@ -294,7 +295,7 @@
     <string name="color_error">Errors and alerts</string>
     <string name="bank_dashboard">Banks</string>
     <string name="bank_import_title">Offline bank import</string>
-    <string name="bank_consent">Optional. Only enabled bank apps and bank SMS senders are examined. Turn import on, then grant access. Review mode is the default.</string>
+    <string name="bank_consent">Only enabled bank apps and bank SMS senders are examined. Import runs in the background, even when the app is closed: it records new payments, and picks up ones that arrived while the app was off. Just grant access once.</string>
     <string name="bank_enabled">Enable bank import</string>
     <string name="bank_auto">Auto-import confident operations</string>
     <string name="bank_access_yes">Notification access granted</string>
@@ -328,6 +329,7 @@
     <string name="bank_clear_history">Clear recognition history</string>
     <string name="bank_clear_warning">Pending reviews and duplicate fingerprints will be deleted. Saved transactions are kept. Old notifications could be recognized again after clearing.</string>
     <string name="bank_app_permissions">Android app permissions</string>
+    <string name="bank_battery">Allow background work (battery)</string>
     <string name="bank_budget_disable">Disable monthly limit</string>
     <string name="history_search">Search operations</string>
     <string name="import_diagnostics">Import diagnostics</string>

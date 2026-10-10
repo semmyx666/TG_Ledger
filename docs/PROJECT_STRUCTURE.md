@@ -7,7 +7,7 @@
 
 | Модуль | Папка | Что внутри |
 |---|---|---|
-| app | `app/src/main/kotlin/com/semmyx/ledger/bank/` | `BankNotificationListener` (чтение уведомлений банков), `BankSmsReceiver` (SMS), `BankScreen` (экран), `BankViewModel` |
+| app | `app/src/main/kotlin/com/semmyx/ledger/bank/` | `BankNotificationListener` (чтение уведомлений банков в фоне), `BankSmsReceiver` (новые SMS), `BankSmsCatchUp` (SMS, пришедшие пока приложение было закрыто), `BankImportWorker` (раз в 15 минут держит импорт живым), `BankScreen` (экран), `BankViewModel` |
 | domain | `domain/src/main/kotlin/com/semmyx/ledger/domain/bank/` | `BankParser` (разбор текста уведомлений), `BankRepository` (контракты) |
 | data | `data/src/main/kotlin/com/semmyx/ledger/data/bank/` | `BankEntities` (таблицы и DAO), `BankImportRepository` (импорт, дедупликация) |
 
@@ -62,3 +62,11 @@
 
 `bank/` (банк), `local/` (база Room: `LedgerDatabase`, `LedgerEntities`, `LedgerDao`), `repository/` (записи, настройки, курсы), `security/` (PIN, ключи), `billing/` (подписка), `remote/` (курсы НБУ).
 Не переименовывайте `LedgerDatabase` и не переносите её в другой пакет: от этого зависит имя папки со схемами Room в `data/schemas/`.
+
+## Навигация
+
+Нижняя панель есть только на главном экране (`dashboard/`). Каждая вкладка (настройки, помощь, аналитика, банки) открывается отдельным экраном с кнопкой ✕; она, как и системная «Назад», возвращает на главный экран. Логика в `navigation/AppRoot.kt`.
+
+## Фоновый импорт банка
+
+Работает без открытого приложения: сервис уведомлений пишет операции сразу в базу, при каждом (пере)подключении подхватывает уведомления, которые ещё висят в шторке, а `BankImportWorker` переподключает сервис и (в sideload-варианте с разрешением READ_SMS) читает SMS за период, пока приложение было закрыто. Импорт и автозапись теперь включены по умолчанию.

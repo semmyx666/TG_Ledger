@@ -70,7 +70,7 @@ class EntryViewModel(
     fun bank(id: String) { mutableState.update { it.copy(bankId = id, sourceType = "CARD") } }
     fun date(value: LocalDate) { mutableState.update { it.copy(date = value, eventAtMillis = value.atStartOfDay(clock.zone).toInstant().toEpochMilli(), validation = null) } }
     fun note(value: String) { mutableState.update { it.copy(note = value.take(240), validation = null) } }
-    fun save() {
+    fun save(fallbackTitle: String = "") {
         if (state.value.busy || state.value.loading || state.value.loadFailed) return
         val form = state.value
         val minor = Money.parseMinor(form.amount)
@@ -78,7 +78,7 @@ class EntryViewModel(
         mutableState.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
-                saveEntry(LedgerEntry(id, form.title, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
+                saveEntry(LedgerEntry(id, form.title.ifBlank { fallbackTitle.take(60) }, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
                     form.eventAtMillis ?: if (form.date == LocalDate.now(clock)) clock.millis() else form.date.atStartOfDay(clock.zone).toInstant().toEpochMilli(),
                     form.customCategoryId, form.origin))
                 savedChannel.send(Unit)

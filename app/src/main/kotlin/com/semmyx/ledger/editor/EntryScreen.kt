@@ -11,6 +11,8 @@ import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
@@ -44,62 +46,50 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
         if (state.loading) LoadingState(Modifier.padding(padding))
         else if (state.loadFailed) EmptyState(stringResource(R.string.load_error_title), stringResource(state.error?.label() ?: R.string.storage_error),
             stringResource(R.string.back), onBack, Modifier.padding(padding))
-        else Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(stringResource(R.string.entry_currency_notice, state.currency.name), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.expense)) })
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.income)) })
-            }
-            OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
-                suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryAmount"),
-                supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
-            OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
-                isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"),
-                supportingText = { Text(stringResource(if (state.validation == ValidationIssue.TITLE) R.string.title_invalid else R.string.title_hint)) })
-            Text(stringResource(R.string.bank_source), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, label = { Text(stringResource(R.string.bank_cash)) })
-                FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, label = { Text(stringResource(R.string.bank_card)) })
-            }
-            if (state.sourceType == "CARD") {
+        else {
+            val fallbackTitle = customCategories.firstOrNull { it.id == state.customCategoryId }?.name ?: stringResource(state.category.label())
+            val amountFocus = remember { FocusRequester() }
+            LaunchedEffect(state.loading) { if (!state.editing) runCatching { amountFocus.requestFocus() } }
+            Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // Minimal form: type, amount, category, (date), save. Title falls back to the category name.
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.expense)) })
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.income)) })
+                }
+                OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
+                    suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
+                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
+                    supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
+                if (state.editing) {
+                    OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
+                        isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    com.semmyx.ledger.domain.bank.Banks.all.forEach { bank ->
-                        FilterChip(selected = state.bankId == bank.id, onClick = { model.bank(bank.id) }, label = { Text(bank.name) })
+                    Category.entries.forEach { category ->
+                        FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
+                            label = { Text(stringResource(category.label())) })
+                    }
+                    customCategories.forEach { category ->
+                        FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
+                            label = { Text(category.name) })
                     }
                 }
-            }
-            Text(stringResource(R.string.category), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Category.entries.forEach { category ->
-                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
-                        label = { Text(stringResource(category.label())) })
+                TextButton(onClick = { dateDialog = true }, enabled = !state.busy) {
+                    Icon(Icons.Default.CalendarMonth, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(formatDate(state.date, language))
+                }
+                if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
+                state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
+                Button(onClick = { model.save(fallbackTitle) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("saveEntry")) {
+                    if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Text(stringResource(R.string.save_entry))
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                customCategories.forEach { category ->
-                    FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
-                        label = { Text(category.name) })
-                }
-            }
-            OutlinedButton(onClick = { dateDialog = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                Icon(Icons.Default.CalendarMonth, null)
-                Spacer(Modifier.width(12.dp))
-                Text(formatDate(state.date, language))
-            }
-            if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
-            OutlinedTextField(value = state.note, onValueChange = model::note, label = { Text(stringResource(R.string.note_optional)) },
-                modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 5, enabled = !state.busy,
-                supportingText = { Text(stringResource(R.string.character_count, state.note.length, 240)) })
-            state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
-            Button(onClick = model::save, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("saveEntry")) {
-                if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                else Text(stringResource(R.string.save_entry))
-            }
-            Spacer(Modifier.height(16.dp))
         }
     }
     if (discardDialog) AlertDialog(onDismissRequest = { discardDialog = false }, title = { Text(stringResource(R.string.discard_title)) },

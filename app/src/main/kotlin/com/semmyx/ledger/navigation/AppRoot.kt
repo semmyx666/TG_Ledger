@@ -134,10 +134,12 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
     val nav = rememberNavController()
     val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
     val onNavigate: (Int) -> Unit = { index ->
-        nav.navigate(routes[index]) {
-            popUpTo("dashboard") { saveState = true }
+        // Home is the only screen with the bottom bar. Every other tab opens as its own full screen
+        // with a close (X) button; closing, or pressing Back, always returns to Home.
+        if (index == 0) nav.popBackStack("dashboard", inclusive = false)
+        else nav.navigate(routes[index]) {
+            popUpTo("dashboard")
             launchSingleTop = true
-            restoreState = true
         }
     }
     NavHost(navController = nav, startDestination = "dashboard") {
@@ -155,7 +157,7 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
             })
             SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
         }
-        composable("help") { HelpScreen(onNavigate, onSupport) }
+        composable("help") { HelpScreen(onClose = { onNavigate(0) }, onSupport = onSupport) }
         composable("analytics") {
             val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
                 AnalyticsViewModel(container.entries, container.preferences, container.clock)

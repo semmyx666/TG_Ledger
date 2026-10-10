@@ -3,6 +3,7 @@ package com.semmyx.ledger
 import android.app.Application
 import android.os.Process
 import android.util.Log
+import com.semmyx.ledger.bank.BankImportWorker
 import com.semmyx.ledger.diagnostics.CrashLogger
 import com.semmyx.ledger.platform.RateRefreshWorker
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -34,5 +35,7 @@ class LedgerApplication : Application() {
             }
         }
         RateRefreshWorker.schedule(this)
+        // Bank import must keep running when the app is closed.
+        BankImportWorker.schedule(this)
     }
 }

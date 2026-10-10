@@ -69,7 +69,10 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { exportFailed = true }
     }
-    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { smsAccess = it }
+    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        smsAccess = result[Manifest.permission.RECEIVE_SMS] == true
+        if (smsAccess) BankImportWorker.schedule(context)
+    }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri: Uri? ->
         if (uri != null) scope.launch {
             try { withContext(Dispatchers.IO) {
@@ -98,7 +101,7 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val budget = remember(currency, revision) { model.budget(currency) }
     var budgetText by remember(currency, budget) { mutableStateOf(if (budget > 0) Money.editable(budget) else "") }
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.bank_dashboard)) }, navigationIcon = {
-        IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
+        IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
     }, actions = { IconButton(onClick = onAdd) { Icon(Icons.Default.Add, stringResource(R.string.add_entry)) } }) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { ContentCard {
@@ -110,9 +113,11 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
                 if (BuildConfig.FLAVOR == "legacyV7") {
                     Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
-                    OutlinedButton(onClick = { smsPermission.launch(Manifest.permission.RECEIVE_SMS) }) { Text(stringResource(R.string.bank_sms_permission)) }
+                    OutlinedButton(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
                 } else Text(stringResource(R.string.bank_play_sms), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
+
+                TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {

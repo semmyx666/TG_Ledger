@@ -5,6 +5,7 @@
     <string name="settings">Налаштування</string>
     <string name="help">Довідка</string>
     <string name="back">Назад</string>
+    <string name="close">Закрити</string>
     <string name="retry">Спробувати ще</string>
     <string name="next">Продовжити</string>
     <string name="skip">Пропустити</string>
@@ -294,7 +295,7 @@
     <string name="color_error">Помилки й попередження</string>
     <string name="bank_dashboard">Банки</string>
     <string name="bank_import_title">Локальний імпорт банківських операцій</string>
-    <string name="bank_consent">Добровільно. Обробляються лише банківські застосунки та банківські SMS-відправники. Увімкніть імпорт і надайте доступ. Типово всі операції потребують підтвердження.</string>
+    <string name="bank_consent">Обробляються лише банківські застосунки та банківські SMS-відправники. Імпорт працює у фоні, навіть коли застосунок закрито: записує нові платежі та підхоплює ті, що надійшли, поки застосунок був вимкнений. Достатньо один раз надати доступ.</string>
     <string name="bank_enabled">Увімкнути банківський імпорт</string>
     <string name="bank_auto">Автоімпорт однозначних операцій</string>
     <string name="bank_access_yes">Доступ до сповіщень надано</string>
@@ -328,6 +329,7 @@
     <string name="bank_clear_history">Очистити історію розпізнавання</string>
     <string name="bank_clear_warning">Чергу підтвердження та відбитки дублікатів буде видалено. Збережені операції залишаться. Після очищення старі сповіщення можуть бути розпізнані знову.</string>
     <string name="bank_app_permissions">Дозволи застосунку Android</string>
+    <string name="bank_battery">Дозволити роботу у фоні (батарея)</string>
     <string name="bank_budget_disable">Вимкнути місячний ліміт</string>
     <string name="history_search">Пошук операцій</string>
     <string name="import_diagnostics">Діагностика імпорту</string>

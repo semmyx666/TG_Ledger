@@ -1,6 +1,6 @@
 # TG Ledger 3.2.0 — cat appearance fix — complete file-by-file source
 
-130 implementation, configuration and test files, included without truncation.
+132 implementation, configuration and test files, included without truncation.
 
 The same files are editable at the paths below. Build instructions, architectural notes, visual references and verification limitations are in README.md and docs/.
 
@@ -291,6 +291,7 @@ class ComposeScreensTest {
 ```xml
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
     <application>
         <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
             <intent-filter><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
@@ -423,6 +424,7 @@ package com.semmyx.ledger
 import android.app.Application
 import android.os.Process
 import android.util.Log
+import com.semmyx.ledger.bank.BankImportWorker
 import com.semmyx.ledger.diagnostics.CrashLogger
 import com.semmyx.ledger.platform.RateRefreshWorker
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -454,6 +456,8 @@ class LedgerApplication : Application() {
             }
         }
         RateRefreshWorker.schedule(this)
+        // Bank import must keep running when the app is closed.
+        BankImportWorker.schedule(this)
     }
 }
 ```
@@ -1318,78 +1322,123 @@ private fun PinKey(value: Int, enabled: Boolean, onClick: () -> Unit, modifier: 
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.content.ComponentName
+import android.content.Context
+import android.service.notification.NotificationListenerService
+import androidx.core.app.NotificationManagerCompat
+import androidx.work.*
+import com.semmyx.ledger.LedgerApplication
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+
+/**
+ * Keeps bank import alive without the app being open:
+ *  - re-binds the notification listener if the system dropped it (its start-up replays pending notifications),
+ *  - imports bank SMS received while the app was closed (sideload variant with READ_SMS).
+ * Runs every 15 minutes, after reboot, and once whenever the app process starts.
+ */
+class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        return try {
+            val repository = (applicationContext as LedgerApplication).container.bankImport
+            if (!repository.enabled) return Result.success()
+            if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
+                runCatching {
+                    NotificationListenerService.requestRebind(ComponentName(applicationContext, BankNotificationListener::class.java))
+                }
+            }
+            BankSmsCatchUp.run(applicationContext, repository)
+            Result.success()
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            Result.retry()
+        }
+    }
+
+    companion object {
+        fun schedule(context: Context) {
+            val work = WorkManager.getInstance(context)
+            work.enqueueUniquePeriodicWork("bank-import-keepalive", ExistingPeriodicWorkPolicy.UPDATE,
+                PeriodicWorkRequestBuilder<BankImportWorker>(15, TimeUnit.MINUTES).build())
+            work.enqueueUniqueWork("bank-import-now", ExistingWorkPolicy.KEEP, OneTimeWorkRequestBuilder<BankImportWorker>().build())
+        }
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
 
 ```kotlin
 package com.semmyx.ledger.bank
 
 import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.content.Context
-import android.os.Build
+import android.content.ComponentName
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.domain.bank.Banks
 import kotlinx.coroutines.*
 
 /**
- * Listens to posted notifications from registered bank/wallet apps and routes them
- * to [com.semmyx.ledger.data.bank.BankImportRepository].
+ * Reads bank / wallet notifications in the background, with no Activity needed.
  *
- * Works entirely in the background: the service is bound by the OS (no Activity
- * needed) and uses the application's long-lived [LedgerApplication.applicationScope].
- * Cross-source deduplication happens inside the repository transaction, so even if
- * Google Pay fires first and PrivatBank fires 60 s later for the same tap, only one
- * entry appears in the ledger.
+ * Imports are written straight to the database by [com.semmyx.ledger.data.bank.BankImportRepository];
+ * the same notification delivered twice (live + replay) is ignored by its event key, and one card tap
+ * reported by two apps (e.g. Google Pay + PrivatBank) is collapsed by cross-source deduplication.
+ *
+ * Catch-up: every time the system (re)binds this service we replay the notifications that are still
+ * in the shade, so anything that arrived while the service was dead, the phone rebooted or the app
+ * was force-closed is still recorded.
  */
 class BankNotificationListener : NotificationListenerService() {
 
-    /**
-     * Own supervisor scope for fire-and-forget import coroutines.
-     * Cancelled in onDestroy so pending work is cleaned up if the OS kills the service.
-     */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    override fun onCreate() {
-        super.onCreate()
-        ensureImportChannel()
-    }
+    private fun repository() = (application as LedgerApplication).container.bankImport
 
     override fun onListenerConnected() {
-        (application as LedgerApplication).container.bankImport.connected(true)
+        try {
+            repository().connected(true)
+            val pending = try { activeNotifications } catch (_: Exception) { null }
+            pending?.forEach { handle(it) }
+        } catch (e: Exception) {
+            android.util.Log.w("BankImport", "Catch-up failed: ${e.javaClass.simpleName}")
+        }
     }
 
     override fun onListenerDisconnected() {
-        (application as LedgerApplication).container.bankImport.connected(false)
-        // Request an immediate rebind rather than waiting for the OS back-off timer.
-        requestRebind(android.content.ComponentName(this, BankNotificationListener::class.java))
+        runCatching { repository().connected(false) }
+        // Ask for an immediate rebind instead of waiting for the OS back-off timer.
+        runCatching { requestRebind(ComponentName(this, BankNotificationListener::class.java)) }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
-        val repository = (application as LedgerApplication).container.bankImport
-        val bank = repository.bankForPackage(sbn.packageName)
+        try { handle(sbn) } catch (e: Exception) {
+            // A failure here must never crash the process: that would stop all background import.
+            android.util.Log.w("BankImport", "Notification handling failed: ${e.javaClass.simpleName}")
+        }
+    }
 
+    private fun handle(sbn: StatusBarNotification) {
+        val repository = repository()
+        val bank = repository.bankForPackage(sbn.packageName)
         repository.note(
             if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED",
-            sbn.packageName,
-            notification = true,
-            bankMessage = bank != null,
+            sbn.packageName, notification = true, bankMessage = bank != null,
         )
         bank ?: return
 
         val notification = sbn.notification
-        // Group summary notifications carry no useful transaction data; skip them.
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) {
-            repository.note("GROUP_SUMMARY")
-            return
-        }
+        // Group summaries carry no transaction data.
+        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
 
         val extras = notification.extras
-        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT)
-            ?: extras.getCharSequence(Notification.EXTRA_TEXT))
+        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
             ?.toString().orEmpty()
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
         val text = "$title\n$body".take(8001)
@@ -1415,33 +1464,9 @@ class BankNotificationListener : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        (application as LedgerApplication).container.bankImport.connected(false)
+        runCatching { repository().connected(false) }
         scope.cancel()
         super.onDestroy()
-    }
-
-    // -----------------------------------------------------------------------
-    // Notification channel for background import confirmations
-    // -----------------------------------------------------------------------
-
-    private fun ensureImportChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val channelId = IMPORT_CHANNEL_ID
-        if (nm.getNotificationChannel(channelId) == null) {
-            nm.createNotificationChannel(
-                NotificationChannel(channelId, "Ledger Import", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "Silent confirmation when a transaction is auto-imported in the background"
-                    setShowBadge(false)
-                    enableLights(false)
-                    enableVibration(false)
-                },
-            )
-        }
-    }
-
-    companion object {
-        const val IMPORT_CHANNEL_ID = "ledger_import"
     }
 }
 ```
@@ -1520,7 +1545,10 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { exportFailed = true }
     }
-    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { smsAccess = it }
+    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        smsAccess = result[Manifest.permission.RECEIVE_SMS] == true
+        if (smsAccess) BankImportWorker.schedule(context)
+    }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri: Uri? ->
         if (uri != null) scope.launch {
             try { withContext(Dispatchers.IO) {
@@ -1549,7 +1577,7 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val budget = remember(currency, revision) { model.budget(currency) }
     var budgetText by remember(currency, budget) { mutableStateOf(if (budget > 0) Money.editable(budget) else "") }
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.bank_dashboard)) }, navigationIcon = {
-        IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
+        IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
     }, actions = { IconButton(onClick = onAdd) { Icon(Icons.Default.Add, stringResource(R.string.add_entry)) } }) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { ContentCard {
@@ -1561,9 +1589,11 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
                 if (BuildConfig.FLAVOR == "legacyV7") {
                     Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
-                    OutlinedButton(onClick = { smsPermission.launch(Manifest.permission.RECEIVE_SMS) }) { Text(stringResource(R.string.bank_sms_permission)) }
+                    OutlinedButton(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
                 } else Text(stringResource(R.string.bank_play_sms), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
+
+                TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
@@ -1759,6 +1789,52 @@ private fun importReason(code: String): Int = when (code) {
     "REDELIVERED" -> R.string.import_repeated
     "ERROR" -> R.string.storage_error
     else -> R.string.import_waiting
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.provider.Telephony
+import androidx.core.content.ContextCompat
+import com.semmyx.ledger.data.bank.BankImportRepository
+import com.semmyx.ledger.domain.bank.Banks
+import java.util.concurrent.TimeUnit
+
+/**
+ * Reads bank SMS that arrived while the app was closed (needs READ_SMS, sideload variant only).
+ * Without the permission it does nothing. Messages already recorded are skipped by event key.
+ */
+object BankSmsCatchUp {
+    private const val FIRST_RUN_DAYS = 30L
+    private const val OVERLAP_MINUTES = 10L
+
+    suspend fun run(context: Context, repository: BankImportRepository) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return
+        val prefs = context.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val since = prefs.getLong("sms_scan_at", now - TimeUnit.DAYS.toMillis(FIRST_RUN_DAYS)) - TimeUnit.MINUTES.toMillis(OVERLAP_MINUTES)
+        val projection = arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.DATE_SENT)
+        context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, projection, "${Telephony.Sms.DATE} > ?",
+            arrayOf(since.toString()), "${Telephony.Sms.DATE} ASC")?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val sender = cursor.getString(0).orEmpty()
+                val bank = Banks.bySender(sender) ?: continue
+                val text = cursor.getString(1).orEmpty().take(8001)
+                if (text.isBlank()) continue
+                val sent = cursor.getLong(3)
+                val at = if (sent > 0) sent else cursor.getLong(2)
+                // Same event key as BankSmsReceiver so a live message and its catch-up copy are one record.
+                repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS")
+            }
+        }
+        prefs.edit().putLong("sms_scan_at", now).apply()
+    }
 }
 ```
 
@@ -3357,6 +3433,8 @@ import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
@@ -3390,62 +3468,50 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
         if (state.loading) LoadingState(Modifier.padding(padding))
         else if (state.loadFailed) EmptyState(stringResource(R.string.load_error_title), stringResource(state.error?.label() ?: R.string.storage_error),
             stringResource(R.string.back), onBack, Modifier.padding(padding))
-        else Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(stringResource(R.string.entry_currency_notice, state.currency.name), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.expense)) })
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.income)) })
-            }
-            OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
-                suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryAmount"),
-                supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
-            OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
-                isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"),
-                supportingText = { Text(stringResource(if (state.validation == ValidationIssue.TITLE) R.string.title_invalid else R.string.title_hint)) })
-            Text(stringResource(R.string.bank_source), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, label = { Text(stringResource(R.string.bank_cash)) })
-                FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, label = { Text(stringResource(R.string.bank_card)) })
-            }
-            if (state.sourceType == "CARD") {
+        else {
+            val fallbackTitle = customCategories.firstOrNull { it.id == state.customCategoryId }?.name ?: stringResource(state.category.label())
+            val amountFocus = remember { FocusRequester() }
+            LaunchedEffect(state.loading) { if (!state.editing) runCatching { amountFocus.requestFocus() } }
+            Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // Minimal form: type, amount, category, (date), save. Title falls back to the category name.
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.expense)) })
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.income)) })
+                }
+                OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
+                    suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
+                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
+                    supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
+                if (state.editing) {
+                    OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
+                        isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    com.semmyx.ledger.domain.bank.Banks.all.forEach { bank ->
-                        FilterChip(selected = state.bankId == bank.id, onClick = { model.bank(bank.id) }, label = { Text(bank.name) })
+                    Category.entries.forEach { category ->
+                        FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
+                            label = { Text(stringResource(category.label())) })
+                    }
+                    customCategories.forEach { category ->
+                        FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
+                            label = { Text(category.name) })
                     }
                 }
-            }
-            Text(stringResource(R.string.category), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Category.entries.forEach { category ->
-                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
-                        label = { Text(stringResource(category.label())) })
+                TextButton(onClick = { dateDialog = true }, enabled = !state.busy) {
+                    Icon(Icons.Default.CalendarMonth, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(formatDate(state.date, language))
+                }
+                if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
+                state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
+                Button(onClick = { model.save(fallbackTitle) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("saveEntry")) {
+                    if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Text(stringResource(R.string.save_entry))
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                customCategories.forEach { category ->
-                    FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
-                        label = { Text(category.name) })
-                }
-            }
-            OutlinedButton(onClick = { dateDialog = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                Icon(Icons.Default.CalendarMonth, null)
-                Spacer(Modifier.width(12.dp))
-                Text(formatDate(state.date, language))
-            }
-            if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
-            OutlinedTextField(value = state.note, onValueChange = model::note, label = { Text(stringResource(R.string.note_optional)) },
-                modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 5, enabled = !state.busy,
-                supportingText = { Text(stringResource(R.string.character_count, state.note.length, 240)) })
-            state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
-            Button(onClick = model::save, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("saveEntry")) {
-                if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                else Text(stringResource(R.string.save_entry))
-            }
-            Spacer(Modifier.height(16.dp))
         }
     }
     if (discardDialog) AlertDialog(onDismissRequest = { discardDialog = false }, title = { Text(stringResource(R.string.discard_title)) },
@@ -3549,7 +3615,7 @@ class EntryViewModel(
     fun bank(id: String) { mutableState.update { it.copy(bankId = id, sourceType = "CARD") } }
     fun date(value: LocalDate) { mutableState.update { it.copy(date = value, eventAtMillis = value.atStartOfDay(clock.zone).toInstant().toEpochMilli(), validation = null) } }
     fun note(value: String) { mutableState.update { it.copy(note = value.take(240), validation = null) } }
-    fun save() {
+    fun save(fallbackTitle: String = "") {
         if (state.value.busy || state.value.loading || state.value.loadFailed) return
         val form = state.value
         val minor = Money.parseMinor(form.amount)
@@ -3557,7 +3623,7 @@ class EntryViewModel(
         mutableState.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
-                saveEntry(LedgerEntry(id, form.title, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
+                saveEntry(LedgerEntry(id, form.title.ifBlank { fallbackTitle.take(60) }, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
                     form.eventAtMillis ?: if (form.date == LocalDate.now(clock)) clock.millis() else form.date.atStartOfDay(clock.zone).toInstant().toEpochMilli(),
                     form.customCategoryId, form.origin))
                 savedChannel.send(Unit)
@@ -3802,10 +3868,12 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
     val nav = rememberNavController()
     val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
     val onNavigate: (Int) -> Unit = { index ->
-        nav.navigate(routes[index]) {
-            popUpTo("dashboard") { saveState = true }
+        // Home is the only screen with the bottom bar. Every other tab opens as its own full screen
+        // with a close (X) button; closing, or pressing Back, always returns to Home.
+        if (index == 0) nav.popBackStack("dashboard", inclusive = false)
+        else nav.navigate(routes[index]) {
+            popUpTo("dashboard")
             launchSingleTop = true
-            restoreState = true
         }
     }
     NavHost(navController = nav, startDestination = "dashboard") {
@@ -3823,7 +3891,7 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
             })
             SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
         }
-        composable("help") { HelpScreen(onNavigate, onSupport) }
+        composable("help") { HelpScreen(onClose = { onNavigate(0) }, onSupport = onSupport) }
         composable("analytics") {
             val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
                 AnalyticsViewModel(container.entries, container.preferences, container.clock)
@@ -4302,9 +4370,11 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
         EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.back), { onNavigate(0) })
         return
     }
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, actions = {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, navigationIcon = {
+        IconButton(onClick = { onNavigate(0) }) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }, actions = {
         IconButton(onClick = onLock) { Icon(Icons.Default.Lock, stringResource(R.string.lock_now)) }
-    }) }, bottomBar = { LedgerBottomBar(1, onNavigate) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
+    }) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item(key = "profile") { ContentCard {
                 Text(stringResource(R.string.profile), style = MaterialTheme.typography.titleLarge)
@@ -4613,6 +4683,8 @@ package com.semmyx.ledger.support
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -4621,12 +4693,13 @@ import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
 import com.semmyx.ledger.common.ContentCard
-import com.semmyx.ledger.common.LedgerBottomBar
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }) }, bottomBar = { LedgerBottomBar(2, onNavigate) }) { padding ->
+fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }, navigationIcon = {
+        IconButton(onClick = onClose) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { ContentCard {
                 Text(stringResource(R.string.help_heading), style = MaterialTheme.typography.headlineMedium)
@@ -5680,6 +5753,7 @@ object VoiceSmallTalk {
     <string name="settings">Налаштування</string>
     <string name="help">Довідка</string>
     <string name="back">Назад</string>
+    <string name="close">Закрити</string>
     <string name="retry">Спробувати ще</string>
     <string name="next">Продовжити</string>
     <string name="skip">Пропустити</string>
@@ -5969,7 +6043,7 @@ object VoiceSmallTalk {
     <string name="color_error">Помилки й попередження</string>
     <string name="bank_dashboard">Банки</string>
     <string name="bank_import_title">Локальний імпорт банківських операцій</string>
-    <string name="bank_consent">Добровільно. Обробляються лише банківські застосунки та банківські SMS-відправники. Увімкніть імпорт і надайте доступ. Типово всі операції потребують підтвердження.</string>
+    <string name="bank_consent">Обробляються лише банківські застосунки та банківські SMS-відправники. Імпорт працює у фоні, навіть коли застосунок закрито: записує нові платежі та підхоплює ті, що надійшли, поки застосунок був вимкнений. Достатньо один раз надати доступ.</string>
     <string name="bank_enabled">Увімкнути банківський імпорт</string>
     <string name="bank_auto">Автоімпорт однозначних операцій</string>
     <string name="bank_access_yes">Доступ до сповіщень надано</string>
@@ -6003,6 +6077,7 @@ object VoiceSmallTalk {
     <string name="bank_clear_history">Очистити історію розпізнавання</string>
     <string name="bank_clear_warning">Чергу підтвердження та відбитки дублікатів буде видалено. Збережені операції залишаться. Після очищення старі сповіщення можуть бути розпізнані знову.</string>
     <string name="bank_app_permissions">Дозволи застосунку Android</string>
+    <string name="bank_battery">Дозволити роботу у фоні (батарея)</string>
     <string name="bank_budget_disable">Вимкнути місячний ліміт</string>
     <string name="history_search">Пошук операцій</string>
     <string name="import_diagnostics">Діагностика імпорту</string>
@@ -6050,6 +6125,7 @@ object VoiceSmallTalk {
     <string name="settings">Settings</string>
     <string name="help">Help</string>
     <string name="back">Back</string>
+    <string name="close">Close</string>
     <string name="retry">Try again</string>
     <string name="next">Continue</string>
     <string name="skip">Skip</string>
@@ -6339,7 +6415,7 @@ object VoiceSmallTalk {
     <string name="color_error">Errors and alerts</string>
     <string name="bank_dashboard">Banks</string>
     <string name="bank_import_title">Offline bank import</string>
-    <string name="bank_consent">Optional. Only enabled bank apps and bank SMS senders are examined. Turn import on, then grant access. Review mode is the default.</string>
+    <string name="bank_consent">Only enabled bank apps and bank SMS senders are examined. Import runs in the background, even when the app is closed: it records new payments, and picks up ones that arrived while the app was off. Just grant access once.</string>
     <string name="bank_enabled">Enable bank import</string>
     <string name="bank_auto">Auto-import confident operations</string>
     <string name="bank_access_yes">Notification access granted</string>
@@ -6373,6 +6449,7 @@ object VoiceSmallTalk {
     <string name="bank_clear_history">Clear recognition history</string>
     <string name="bank_clear_warning">Pending reviews and duplicate fingerprints will be deleted. Saved transactions are kept. Old notifications could be recognized again after clearing.</string>
     <string name="bank_app_permissions">Android app permissions</string>
+    <string name="bank_battery">Allow background work (battery)</string>
     <string name="bank_budget_disable">Disable monthly limit</string>
     <string name="history_search">Search operations</string>
     <string name="import_diagnostics">Import diagnostics</string>
@@ -7181,11 +7258,11 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
     override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_${currency.name}", minor).apply() }
 
     override var enabled: Boolean
-        get() = config.getBoolean("enabled", false)
+        get() = config.getBoolean("enabled", true)
         set(value) { config.edit().putBoolean("enabled", value).apply() }
 
     override var autoImport: Boolean
-        get() = config.getBoolean("auto", false)
+        get() = config.getBoolean("auto", true)
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
     // -------------------------------------------------------------------------

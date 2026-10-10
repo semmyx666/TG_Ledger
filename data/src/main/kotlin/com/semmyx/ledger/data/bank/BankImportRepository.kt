@@ -115,11 +115,11 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
     override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_${currency.name}", minor).apply() }
 
     override var enabled: Boolean
-        get() = config.getBoolean("enabled", false)
+        get() = config.getBoolean("enabled", true)
         set(value) { config.edit().putBoolean("enabled", value).apply() }
 
     override var autoImport: Boolean
-        get() = config.getBoolean("auto", false)
+        get() = config.getBoolean("auto", true)
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
     // -------------------------------------------------------------------------

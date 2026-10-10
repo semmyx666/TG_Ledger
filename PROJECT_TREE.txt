@@ -32,8 +32,10 @@ TGLedger-3.2.0/
 │   │   │   │               │   ├── AuthenticationScreen.kt
 │   │   │   │               │   └── AuthViewModel.kt
 │   │   │   │               ├── bank/
+│   │   │   │               │   ├── BankImportWorker.kt
 │   │   │   │               │   ├── BankNotificationListener.kt
 │   │   │   │               │   ├── BankScreen.kt
+│   │   │   │               │   ├── BankSmsCatchUp.kt
 │   │   │   │               │   ├── BankSmsReceiver.kt
 │   │   │   │               │   └── BankViewModel.kt
 │   │   │   │               ├── cat/
@@ -235,6 +237,7 @@ TGLedger-3.2.0/
 │   ├── DEVELOPER_ACTIVATION_CODES.md
 │   ├── OLED_2_2.md
 │   ├── OPTIONAL_VOICE_ASSISTANT.md
+│   ├── PROJECT_STRUCTURE.md
 │   ├── RELEASE_CHECKLIST.md
 │   ├── RESPONSIVE_2_4_1.md
 │   ├── SECURITY.md
