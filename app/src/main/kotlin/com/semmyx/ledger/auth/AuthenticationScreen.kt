@@ -43,7 +43,7 @@ fun AuthenticationScreen(
         Text(stringResource(heading), style = MaterialTheme.typography.headlineMedium)
         Text(stringResource(if (state.setup) R.string.pin_setup_subtitle else R.string.pin_unlock_subtitle),
             color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-        Row(Modifier.padding(vertical = 8.dp).clearAndSetSemantics { contentDescription = description }.testTag("pinDots"),
+        Row(Modifier.padding(vertical = 8.dp).testTag("pinDots").clearAndSetSemantics { contentDescription = description },
             horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             repeat(6) { index ->
                 Box(Modifier.size(16.dp).clip(CircleShape).background(if (index < state.digits) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
