@@ -21,9 +21,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
             if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
-                runCatching {
-                    NotificationListenerService.requestRebind(ComponentName(applicationContext, BankNotificationListener::class.java))
-                }
+                ensureListenerBound(applicationContext, repository)
             }
             BankSmsCatchUp.run(applicationContext, repository)
             Result.success()
@@ -34,6 +32,23 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
     }
 
     companion object {
+        /**
+         * The system sometimes leaves a notification listener unbound after an app update, a crash or aggressive
+         * battery management. First ask politely; if it is still not connected, toggle the component, which makes
+         * Android bind it again (and it then replays the notifications still in the shade).
+         */
+        suspend fun ensureListenerBound(context: Context, repository: com.semmyx.ledger.data.bank.BankImportRepository) {
+            val component = ComponentName(context, BankNotificationListener::class.java)
+            runCatching { NotificationListenerService.requestRebind(component) }
+            kotlinx.coroutines.delay(3_000)
+            if (repository.diagnostics.value.connected) return
+            val pm = context.packageManager
+            runCatching {
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+            }
+        }
+
         fun schedule(context: Context) {
             val work = WorkManager.getInstance(context)
             work.enqueueUniquePeriodicWork("bank-import-keepalive", ExistingPeriodicWorkPolicy.UPDATE,

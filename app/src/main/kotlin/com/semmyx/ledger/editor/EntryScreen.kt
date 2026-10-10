@@ -52,7 +52,7 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
             LaunchedEffect(state.loading) { if (!state.editing) runCatching { amountFocus.requestFocus() } }
             Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                // Minimal form: type, amount, category, (date), save. Title falls back to the category name.
+                // Form: type, amount, optional title, category, date, save. Empty title falls back to the category name.
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
                         label = { Text(stringResource(R.string.expense)) })
@@ -64,10 +64,9 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
                     isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
                     modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
                     supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
-                if (state.editing) {
-                    OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
-                        isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
-                }
+                OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
+                    placeholder = { Text(fallbackTitle) }, supportingText = { Text(stringResource(R.string.title_optional_hint)) },
+                    isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Category.entries.forEach { category ->
                         FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,

@@ -49,6 +49,8 @@ class BankNotificationListener : NotificationListenerService() {
     }
 
     private fun handle(sbn: StatusBarNotification) {
+        // Our own "imported" confirmations must never be re-read as bank messages.
+        if (sbn.packageName == packageName) return
         val repository = repository()
         val bank = repository.bankForPackage(sbn.packageName)
         repository.note(
@@ -61,16 +63,12 @@ class BankNotificationListener : NotificationListenerService() {
         // Group summaries carry no transaction data.
         if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
 
-        val extras = notification.extras
-        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
-            ?.toString().orEmpty()
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = "$title\n$body".take(8001)
-
-        if (body.isBlank()) { repository.note("EMPTY_TEXT"); return }
+        val text = readText(notification)
+        if (text.isBlank()) { repository.note("EMPTY_TEXT"); return }
         if (!repository.enabled) { repository.note("DISABLED"); return }
 
-        scope.launch {
+        // NonCancellable: a started import must finish even if the service is being torn down.
+        scope.launch(NonCancellable) {
             try {
                 repository.receive(
                     bank, text,
@@ -85,6 +83,27 @@ class BankNotificationListener : NotificationListenerService() {
                 android.util.Log.w("BankImport", "Background import failed; no message contents logged")
             }
         }
+    }
+
+    /**
+     * Banks put the shop into the title and the amount into the text, or use big/inbox styles.
+     * Everything readable is joined, first line = title, duplicates removed.
+     */
+    private fun readText(notification: Notification): String {
+        val extras = notification.extras ?: return ""
+        val parts = LinkedHashSet<String>()
+        fun add(value: CharSequence?) { value?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(parts::add) }
+        add(extras.getCharSequence(Notification.EXTRA_TITLE_BIG) ?: extras.getCharSequence(Notification.EXTRA_TITLE))
+        add(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_TEXT))
+        extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach(::add)
+        add(extras.getCharSequence(Notification.EXTRA_SUB_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT))
+        if (parts.size < 2) add(notification.tickerText)
+        // Remove parts that are entirely contained in a longer part (BIG_TEXT repeats TEXT).
+        val list = parts.toList()
+        return list.filter { part -> list.none { other -> other !== part && other.length > part.length && other.contains(part) } }
+            .joinToString("\n").take(8001)
     }
 
     override fun onDestroy() {

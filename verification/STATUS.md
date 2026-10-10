@@ -43,3 +43,9 @@ files were unchanged. Two problems that existed in the original code were fixed 
 Gradle build (`:app:assemblePlayDebug`, `:app:assembleLegacyV7Debug`, `:app:compilePlayDebugAndroidTestKotlin`, `:domain:test`, `:data:testPlayDebugUnitTest`, `:app:testPlayDebugUnitTest` — all unit tests pass) was run after the
 background-import, form, navigation and single 14-day trial changes. Not run: instrumented tests, any on-device behaviour (notification listener,
 SMS catch-up, battery restrictions).
+
+## 3.3.1 check
+- Bank import rewritten (parser, listener, duplicate handling, keep-alive); 44+ domain tests incl. real push formats.
+- `BankBackgroundImportTest` (emulator): foreign-app notification -> imported with no UI; repeat ignored.
+- Manual entry has an optional Title field again.
+- Ownership: LICENSE, OwnershipSeal, docs/OWNERSHIP.md, proof/ (OpenTimestamps).

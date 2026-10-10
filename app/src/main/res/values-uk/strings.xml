@@ -86,6 +86,7 @@
     <string name="entry_currency_notice">Валюта: %1$s. Наявні записи зберігають початкову валюту. Змініть типову валюту в налаштуваннях перед додаванням нового запису.</string>
     <string name="amount">Сума</string>
     <string name="amount_invalid">Введіть від 0,01 до 99 999 999,99 з не більш ніж двома десятковими знаками, без роздільників тисяч.</string>
+    <string name="title_optional_hint">Необов’язково — якщо порожньо, буде назва категорії</string>
     <string name="entry_title">Назва</string>
     <string name="title_invalid">Введіть назву від 1 до 60 символів.</string>
     <string name="title_hint">Наприклад: продукти або зарплата</string>

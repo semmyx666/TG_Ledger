@@ -24,6 +24,7 @@ class LedgerApplication : Application() {
         // Installed first so it wraps (and runs before) the fatal handler below, saving the
         // stack trace to app-internal storage. Settings -> Support can then show it, since we
         // otherwise have no way to see what actually crashed without adb/logcat access.
+        com.semmyx.ledger.platform.OwnershipSeal.register()
         CrashLogger.install(this)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->

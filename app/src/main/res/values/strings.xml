@@ -86,6 +86,7 @@
     <string name="entry_currency_notice">Currency: %1$s. Existing entries keep their original currency. Change the default in Settings before adding a new entry.</string>
     <string name="amount">Amount</string>
     <string name="amount_invalid">Enter 0.01–99,999,999.99 with at most two decimal places; do not use thousands separators.</string>
+    <string name="title_optional_hint">Optional — the category name is used if empty</string>
     <string name="entry_title">Title</string>
     <string name="title_invalid">Enter a title of 1–60 characters.</string>
     <string name="title_hint">For example: groceries or salary</string>

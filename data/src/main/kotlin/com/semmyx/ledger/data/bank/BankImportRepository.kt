@@ -147,7 +147,13 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
             ) > 0
 
+            // With auto-import on, repeats are dropped silently: a bank re-posting the same push, or a wallet
+            // app and the issuing bank announcing the same tap. Otherwise they wait in the review queue.
+            val walletInvolved = Banks.WALLET_ID == parsed.bankId || crossSourceDup && dao.walletTwin(
+                parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis) > 0
+            val silentDrop = !manual && autoImport && (sameBankDup || (crossSourceDup && walletInvolved))
             val status = when {
+                silentDrop -> "DUPLICATE_IGNORED"
                 sameBankDup   -> "DUPLICATE_REVIEW"
                 crossSourceDup -> "CROSS_DUPLICATE_REVIEW"
                 else          -> "REVIEW"
@@ -181,7 +187,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
 
             // Auto-import: only for confident single-source entries.
             // Cross-source duplicates are NEVER auto-imported — the user must review.
-            if (!manual && autoImport && parsed.confident && !sameBankDup && !crossSourceDup) {
+            if (!manual && autoImport && parsed.confident && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
                 postImportNotification(parsed)
@@ -209,7 +215,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
         val entity = EntryEntity(
             id, title, item.amountMinor, item.currency, type.name, item.category,
             date.toEpochDay(),
-            if (item.transfer) "Confirmed external transfer" else "",
+            "",
             title.lowercase(Locale.ROOT),
             item.receivedAtMillis,
             sourceType = "CARD",
@@ -258,7 +264,7 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
             )
         }
         val amountText = Money.editable(parsed.amountMinor)
-        val title = "${parsed.bankId.replaceFirstChar { it.uppercase() }}: ${parsed.merchant.ifBlank { parsed.bankId }}"
+        val title = "${Banks.name(parsed.bankId)}: ${parsed.merchant.ifBlank { Banks.name(parsed.bankId) }}"
         val body = "${if (parsed.type == EntryType.EXPENSE) "−" else "+"} $amountText ${parsed.currency.name}"
         val notification = NotificationCompat.Builder(ctx, channelId)
             .setSmallIcon(android.R.drawable.ic_menu_save)

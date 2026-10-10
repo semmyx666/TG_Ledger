@@ -104,6 +104,14 @@ interface BankDao {
     )
     suspend fun similarCrossSource(amount: Long, currency: String, type: String, time: Long): Int
 
+    /** A wallet-app row for the same amount/time exists (wallet + issuing bank announce one tap). */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE bankId='wallet' AND amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=180000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')""",
+    )
+    suspend fun walletTwin(amount: Long, currency: String, type: String, time: Long): Int
+
     @Query(
         """SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
         WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
