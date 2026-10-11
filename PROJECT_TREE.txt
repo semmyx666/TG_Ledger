@@ -285,7 +285,9 @@ TGLedger-3.3.2/
 │   └── libs.versions.toml
 ├── proof/
 │   ├── MANIFEST-3.3.1.sha256
-│   └── MANIFEST-3.3.1.sha256.ots
+│   ├── MANIFEST-3.3.1.sha256.ots
+│   ├── MANIFEST-3.3.2.sha256
+│   └── MANIFEST-3.3.2.sha256.ots
 ├── tools/
 │   ├── audit_project.py
 │   ├── issue_activation_code.py
