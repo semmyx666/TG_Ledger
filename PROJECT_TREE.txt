@@ -1,4 +1,4 @@
-TGLedger-3.3.1/
+TGLedger-3.3.2/
 ├── .github/
 │   └── workflows/
 │       └── android.yml
@@ -11,8 +11,6 @@ TGLedger-3.3.1/
 │   │   │               └── ledger/
 │   │   │                   ├── BankBackgroundImportTest.kt
 │   │   │                   └── ComposeScreensTest.kt
-│   │   ├── legacyV7/
-│   │   │   └── AndroidManifest.xml
 │   │   ├── main/
 │   │   │   ├── keepRules/
 │   │   │   │   └── rules.keep
@@ -146,7 +144,8 @@ TGLedger-3.3.1/
 │   │                       │   └── CatFaceMeshTest.kt
 │   │                       ├── voice/
 │   │                       │   ├── FinanceUpgradeTest.kt
-│   │                       │   └── OptionalVoiceAssistantParserTest.kt
+│   │                       │   ├── OptionalVoiceAssistantParserTest.kt
+│   │                       │   └── VoiceSourceTest.kt
 │   │                       ├── MainDispatcherRule.kt
 │   │                       └── ViewModelTest.kt
 │   ├── .gitignore
@@ -183,7 +182,8 @@ TGLedger-3.3.1/
 │   │   │   │               └── data/
 │   │   │   │                   ├── bank/
 │   │   │   │                   │   ├── BankEntities.kt
-│   │   │   │                   │   └── BankImportRepository.kt
+│   │   │   │                   │   ├── BankImportRepository.kt
+│   │   │   │                   │   └── MonobankClient.kt
 │   │   │   │                   ├── billing/
 │   │   │   │                   │   ├── DeveloperSubscriptionVerifier.kt
 │   │   │   │                   │   ├── PlayPremiumRepository.kt
@@ -217,6 +217,8 @@ TGLedger-3.3.1/
 │   │               └── semmyx/
 │   │                   └── ledger/
 │   │                       └── data/
+│   │                           ├── bank/
+│   │                           │   └── MonobankClientTest.kt
 │   │                           ├── billing/
 │   │                           │   └── DeveloperSubscriptionVerifierTest.kt
 │   │                           ├── PurchaseSignatureVerifierTest.kt
@@ -251,7 +253,8 @@ TGLedger-3.3.1/
 │   │   │                   └── domain/
 │   │   │                       ├── bank/
 │   │   │                       │   ├── BankParser.kt
-│   │   │                       │   └── BankRepository.kt
+│   │   │                       │   ├── BankRepository.kt
+│   │   │                       │   └── MonobankMapper.kt
 │   │   │                       ├── Analytics.kt
 │   │   │                       ├── CinematicAnalytics.kt
 │   │   │                       ├── ColorPreferences.kt
@@ -265,7 +268,8 @@ TGLedger-3.3.1/
 │   │                   └── ledger/
 │   │                       └── domain/
 │   │                           ├── bank/
-│   │                           │   └── BankParserTest.kt
+│   │                           │   ├── BankParserTest.kt
+│   │                           │   └── MonobankMapperTest.kt
 │   │                           ├── CinematicAnalyticsTest.kt
 │   │                           ├── ColorPreferencesTest.kt
 │   │                           ├── LedgerUseCasesTest.kt
@@ -279,6 +283,9 @@ TGLedger-3.3.1/
 │   ├── bootstrap.ps1
 │   ├── gradle-daemon-jvm.properties
 │   └── libs.versions.toml
+├── proof/
+│   ├── MANIFEST-3.3.1.sha256
+│   └── MANIFEST-3.3.1.sha256.ots
 ├── tools/
 │   ├── audit_project.py
 │   ├── issue_activation_code.py

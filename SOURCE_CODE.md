@@ -1,6 +1,6 @@
-# TG Ledger 3.3.1 — complete file-by-file source
+# TG Ledger 3.3.2 — complete file-by-file source
 
-134 implementation, configuration and test files, included without truncation.
+138 implementation, configuration and test files, included without truncation.
 
 The same files are editable at the paths below. Build instructions, architectural notes, visual references and verification limitations are in README.md and docs/.
 
@@ -128,8 +128,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
-        versionName = "3.3.1"
+        versionCode = 16
+        versionName = "3.3.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -266,6 +266,7 @@ class BankBackgroundImportTest {
     @Before fun setUp() {
         repo.enabled = true
         repo.autoImport = true
+        repo.importMode = "NOTIFY"
         repo.setPackage("mono", "com.android.shell")
         shell("cmd notification allow_listener $listener")
         val current = shell("settings get secure enabled_notification_listeners").trim()
@@ -275,7 +276,7 @@ class BankBackgroundImportTest {
         assertTrue("Notification listener did not bind", waitFor(30_000) { repo.diagnostics.value.connected })
     }
 
-    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono") }
+    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono"); repo.importMode = "SMS" }
 
     @Test fun bankPushIsImportedInBackgroundAndRepeatIsIgnored() {
         // No spaces: UiAutomation tokenises the command line without quote handling.
@@ -372,20 +373,6 @@ class ComposeScreensTest {
 }
 ```
 
-## app/src/legacyV7/AndroidManifest.xml
-
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.RECEIVE_SMS" />
-    <uses-permission android:name="android.permission.READ_SMS" />
-    <application>
-        <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
-            <intent-filter><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
-        </receiver>
-    </application>
-</manifest>
-```
-
 ## app/src/main/AndroidManifest.xml
 
 ```xml
@@ -399,6 +386,9 @@ class ComposeScreensTest {
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Required on Android 13+ (API 33+) to post background import notifications. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Bank SMS import mode (user-selected on the Banks screen). -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
 
     <queries>
         <package android:name="org.telegram.messenger" />
@@ -436,6 +426,9 @@ class ComposeScreensTest {
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999"><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
+        </receiver>
         <service android:name=".bank.BankNotificationListener" android:label="@string/bank_import_title"
             android:exported="true" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
@@ -472,7 +465,7 @@ class AppContainer(context: Context, scope: CoroutineScope) {
     val clock: Clock = Clock.systemDefaultZone()
     private val database = LedgerDatabase.create(app)
     private val vault = KeystoreVault(app)
-    val bankImport = com.semmyx.ledger.data.bank.BankImportRepository(database, app)
+    val bankImport = com.semmyx.ledger.data.bank.BankImportRepository(database, app, vault)
     val entries: EntryRepository = RoomEntryRepository(database.ledgerDao(), clock)
     val preferences: PreferencesRepository = DataStorePreferences(app, scope)
     val security: SecurityRepository = KeystoreSecurityRepository(app, vault, clock)
@@ -1426,7 +1419,7 @@ import kotlinx.coroutines.CancellationException
 /**
  * Keeps bank import alive without the app being open:
  *  - re-binds the notification listener if the system dropped it (its start-up replays pending notifications),
- *  - imports bank SMS received while the app was closed (sideload variant with READ_SMS).
+ *  - API mode: pulls new operations from monobank; SMS mode: imports bank SMS received while the app was closed.
  * Runs every 15 minutes, after reboot, and once whenever the app process starts.
  */
 class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -1434,10 +1427,13 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
         return try {
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
-            if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
-                ensureListenerBound(applicationContext, repository)
+            when (repository.importMode) {
+                "API" -> repository.syncMonobank()
+                "SMS" -> BankSmsCatchUp.run(applicationContext, repository)
+                else -> if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
+                    ensureListenerBound(applicationContext, repository)
+                }
             }
-            BankSmsCatchUp.run(applicationContext, repository)
             Result.success()
         } catch (error: Exception) {
             if (error is CancellationException) throw error
@@ -1461,6 +1457,12 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
                 pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
                 pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
             }
+        }
+
+        /** Runs one import pass right now (after switching mode, connecting, or pressing "Sync now"). */
+        fun runNow(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork("bank-import-now", ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<BankImportWorker>().build())
         }
 
         fun schedule(context: Context) {
@@ -1530,6 +1532,7 @@ class BankNotificationListener : NotificationListenerService() {
         // Our own "imported" confirmations must never be re-read as bank messages.
         if (sbn.packageName == packageName) return
         val repository = repository()
+        if (repository.importMode != "NOTIFY") return
         val bank = repository.bankForPackage(sbn.packageName)
         repository.note(
             if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED",
@@ -1641,7 +1644,7 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val reviews by model.reviews.collectAsStateWithLifecycle()
@@ -1650,6 +1653,8 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val automatic by model.auto.collectAsStateWithLifecycle()
     val failed by model.error.collectAsStateWithLifecycle()
     val revision by model.revision.collectAsStateWithLifecycle()
+    val mode by model.mode.collectAsStateWithLifecycle()
+    val mono by model.mono.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val palette = LocalAppearance.current
@@ -1661,6 +1666,10 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     var categoryDialog by remember { mutableStateOf(false) }
     var privacy by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
+    var token by remember { mutableStateOf("") }
+    var connecting by remember { mutableStateOf(false) }
+    var smsScan by remember { mutableStateOf<BankSmsCatchUp.Result?>(null) }
+    var scanning by remember { mutableStateOf(false) }
     
     fun openSettings(action: String, data: Uri? = null) {
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
@@ -1706,19 +1715,72 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 Text(stringResource(R.string.bank_consent), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_enabled), Modifier.weight(1f)); Switch(enabled, model::enabled) }
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_auto), Modifier.weight(1f)); Switch(automatic, model::auto, enabled = enabled) }
-                Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
-                OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
-                if (BuildConfig.FLAVOR == "legacyV7") {
-                    Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
-                    OutlinedButton(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
-                } else Text(stringResource(R.string.bank_play_sms), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(stringResource(R.string.import_mode_title), style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms, "NOTIFY" to R.string.import_mode_notify).forEach { (value, title) ->
+                        FilterChip(selected = mode == value, onClick = { model.mode(value); BankImportWorker.runNow(context) }, label = { Text(stringResource(title)) })
+                    }
+                }
+                when (mode) {
+                    "API" -> {
+                        Text(stringResource(R.string.api_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://api.monobank.ua/")) }) { Text(stringResource(R.string.api_open_site)) }
+                        if (!mono.connected) {
+                            OutlinedTextField(token, { token = it.trim().take(200) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.api_token_label)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                isError = mono.error == "BAD_TOKEN")
+                            Button(enabled = token.length >= 20 && !connecting, onClick = {
+                                connecting = true
+                                scope.launch {
+                                    if (repository.connectMonobank(token)) { token = ""; BankImportWorker.runNow(context) }
+                                    connecting = false
+                                }
+                            }) { Text(stringResource(if (connecting) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.api_connected, mono.accounts.coerceAtLeast(1)), color = MaterialTheme.colorScheme.secondary)
+                            if (mono.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(mono.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))) + " · " +
+                                stringResource(R.string.api_imported_last, mono.lastImported), style = MaterialTheme.typography.bodySmall)
+                            if (mono.syncing) Text(stringResource(R.string.api_syncing), style = MaterialTheme.typography.bodySmall)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(enabled = !mono.syncing, onClick = { BankImportWorker.runNow(context) }) { Text(stringResource(R.string.api_sync_now)) }
+                                TextButton(onClick = { scope.launch { repository.disconnectMonobank() } }) { Text(stringResource(R.string.api_disconnect)) }
+                            }
+                        }
+                        mono.error?.let { code ->
+                            Text(stringResource(when (code) {
+                                "BAD_TOKEN" -> R.string.api_error_bad_token; "RATE_LIMIT" -> R.string.api_error_rate
+                                "NO_ACCOUNTS" -> R.string.api_error_no_accounts; else -> R.string.api_error_network
+                            }), color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    "SMS" -> {
+                        Text(stringResource(R.string.sms_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
+                        if (!smsAccess) Button(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
+                        OutlinedButton(enabled = smsAccess && !scanning, onClick = {
+                            scanning = true
+                            scope.launch { smsScan = withContext(Dispatchers.IO) { BankSmsCatchUp.run(context, repository, 30) }; scanning = false }
+                        }) { Text(stringResource(if (scanning) R.string.sms_scanning else R.string.sms_scan)) }
+                        smsScan?.let { r ->
+                            Text(if (!r.permission) stringResource(R.string.bank_sms_no)
+                                else stringResource(R.string.sms_scan_result, r.bankMessages, r.imported, r.queued), style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(stringResource(R.string.sms_restricted_tip), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> {
+                        Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
+                        OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
+                    }
+                }
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
-
                 TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
                 Text(stringResource(R.string.import_diagnostics), style = MaterialTheme.typography.titleMedium)
+                if (mode == "NOTIFY") {
                 Text(stringResource(if (diagnostics.connected) R.string.import_connected else R.string.import_disconnected))
                 Text(stringResource(R.string.import_counts, diagnostics.notificationCount, diagnostics.bankMessageCount))
                 Text(stringResource(importReason(diagnostics.lastCode)), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1729,6 +1791,7 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                     catch (_: Exception) { exportFailed = true }
                 }) { Text(stringResource(R.string.import_reconnect)) }
                 TextButton(onClick = { packageDialog = true }) { Text(stringResource(R.string.import_package_settings)) }
+                }
                 Button(onClick = { pasteDialog = true }) { Text(stringResource(R.string.import_paste)) }
                 Text(stringResource(R.string.import_queue_note), color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
@@ -1928,18 +1991,23 @@ import com.semmyx.ledger.domain.bank.Banks
 import java.util.concurrent.TimeUnit
 
 /**
- * Reads bank SMS that arrived while the app was closed (needs READ_SMS, sideload variant only).
+ * Reads bank SMS that arrived while the app was closed (needs READ_SMS).
  * Without the permission it does nothing. Messages already recorded are skipped by event key.
  */
 object BankSmsCatchUp {
     private const val FIRST_RUN_DAYS = 30L
     private const val OVERLAP_MINUTES = 10L
 
-    suspend fun run(context: Context, repository: BankImportRepository) {
-        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return
+    data class Result(val permission: Boolean, val bankMessages: Int = 0, val imported: Int = 0, val queued: Int = 0)
+
+    /** [days] != null rescans that many days of the inbox regardless of the last scan (manual "Scan now"). */
+    suspend fun run(context: Context, repository: BankImportRepository, days: Long? = null): Result {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return Result(false)
+        var bankMessages = 0; var imported = 0; var queued = 0
         val prefs = context.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
-        val since = prefs.getLong("sms_scan_at", now - TimeUnit.DAYS.toMillis(FIRST_RUN_DAYS)) - TimeUnit.MINUTES.toMillis(OVERLAP_MINUTES)
+        val since = if (days != null) now - TimeUnit.DAYS.toMillis(days)
+            else prefs.getLong("sms_scan_at", now - TimeUnit.DAYS.toMillis(FIRST_RUN_DAYS)) - TimeUnit.MINUTES.toMillis(OVERLAP_MINUTES)
         val projection = arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.DATE_SENT)
         context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, projection, "${Telephony.Sms.DATE} > ?",
             arrayOf(since.toString()), "${Telephony.Sms.DATE} ASC")?.use { cursor ->
@@ -1951,10 +2019,15 @@ object BankSmsCatchUp {
                 val sent = cursor.getLong(3)
                 val at = if (sent > 0) sent else cursor.getLong(2)
                 // Same event key as BankSmsReceiver so a live message and its catch-up copy are one record.
-                repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS")
+                bankMessages++
+                when (repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS")) {
+                    "AUTO_IMPORTED" -> imported++
+                    "REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW" -> queued++
+                }
             }
         }
-        prefs.edit().putLong("sms_scan_at", now).apply()
+        if (days == null) prefs.edit().putLong("sms_scan_at", now).apply()
+        return Result(true, bankMessages, imported, queued)
     }
 }
 ```
@@ -1972,7 +2045,7 @@ import com.semmyx.ledger.LedgerApplication
 import com.semmyx.ledger.domain.bank.Banks
 import kotlinx.coroutines.*
 
-/** Included in the legacyV7 sideload manifest only. Reads new messages, never the historical SMS inbox. */
+/** SMS import mode: reads each new bank SMS as it arrives (historical inbox is read by [BankSmsCatchUp]). */
 class BankSmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
@@ -1981,7 +2054,7 @@ class BankSmsReceiver : BroadcastReceiver() {
         val sender = messages.first().originatingAddress.orEmpty()
         val bank = Banks.bySender(sender) ?: return
         val repository = (context.applicationContext as LedgerApplication).container.bankImport
-        if (!repository.enabled) return
+        if (!repository.enabled || repository.importMode != "SMS") return
         val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
         val at = messages.minOf { it.timestampMillis }
         val pending = goAsync()
@@ -2028,6 +2101,9 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
     val customCategories = repo.categories().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val reviews = repo.reviews().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val enabled = MutableStateFlow(repo.enabled)
+    val mode = MutableStateFlow(repo.importMode)
+    val mono = repo.monobankStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
+    fun mode(value: String) { repo.importMode = value; mode.value = value }
     val auto = MutableStateFlow(repo.autoImport)
     val error = MutableStateFlow(false)
     val revision = MutableStateFlow(0)
@@ -2201,7 +2277,7 @@ import com.semmyx.ledger.domain.AppLanguage
 @Composable
 fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
     modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
-    onText: (String) -> Unit = {}, balanceMinor: Long = 0) {
+    onText: (String) -> Unit = {}, balanceMinor: Long = 0, locked: Boolean = false) {
     var text by remember { mutableStateOf("") }
     var typing by remember { mutableStateOf(false) }
     val label = stringResource(R.string.voice_assistant_button)
@@ -2212,10 +2288,10 @@ fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: Strin
             LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
                 .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
                 .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
-            Text(if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
+            Text(if (locked) stringResource(R.string.cat_locked_hint) else if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
-            AnimatedVisibility(typing, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+            if (!locked) TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
+            AnimatedVisibility(typing && !locked, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                 Column {
                     OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
                         label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)
@@ -2977,7 +3053,7 @@ fun DashboardRoute(model: DashboardViewModel, host: FragmentActivity, onNavigate
 fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: FragmentActivity, onNavigate: (Int) -> Unit,
     onAdd: () -> Unit, onEdit: (String) -> Unit, onDelete: (String) -> Unit, onSearch: (String) -> Unit,
     onFilter: (EntryType?) -> Unit, onDays: (Int) -> Unit, onLoadMore: () -> Unit, onRetry: () -> Unit,
-    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft) -> Unit,
+    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit,
     speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
     setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit,
     onCategory: (Category?) -> Unit, onMoreCategory: () -> Unit,
@@ -3035,6 +3111,26 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
         // Speech results are handled in one place: first try to read the phrase as a whole ledger
         // entry ("I bought 1 kg of tomatoes for 100 UAH"), and only fall back to the small set of
         // fixed commands (balance / spent today / open add-entry) when no amount could be found.
+        var pendingVoice by remember { mutableStateOf<com.semmyx.ledger.voice.VoiceEntryDraft?>(null) }
+        val finishVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit = { ready, source ->
+            pendingVoice = null
+            onVoiceEntry(ready, source)
+            val language = state.preferences.language
+            val typeLabel = voiceContext.getString(if (ready.type == EntryType.INCOME) R.string.income else R.string.expense)
+            val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
+                formatMoney(ready.amountMinor, state.preferences.currency, language), ready.title, voiceContext.getString(ready.category.label()))
+            lastReply = reply
+            ensureAssistant().speak(reply, language)
+        }
+        pendingVoice?.let { ready ->
+            AlertDialog(onDismissRequest = { pendingVoice = null }, title = { Text(stringResource(R.string.voice_ask_source)) },
+                text = { Text(ready.title + " · " + formatMoney(ready.amountMinor, state.preferences.currency, state.preferences.language)) },
+                confirmButton = { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { finishVoiceEntry(ready, "CARD") }, modifier = Modifier.testTag("voiceSourceCard")) { Text(stringResource(R.string.bank_card)) }
+                    Button(onClick = { finishVoiceEntry(ready, "CASH") }, modifier = Modifier.testTag("voiceSourceCash")) { Text(stringResource(R.string.bank_cash)) }
+                } },
+                dismissButton = { TextButton(onClick = { pendingVoice = null }) { Text(stringResource(R.string.cancel)) } })
+        }
         val processInput: (String?) -> Unit = { heard ->
                 listening = false
                 val assistant = ensureAssistant()
@@ -3063,12 +3159,16 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                     }
                     draft != null -> {
                         val title = draft.title.ifBlank { voiceContext.getString(draft.category.label()) }
-                        onVoiceEntry(draft.copy(title = title))
-                        val typeLabel = voiceContext.getString(if (draft.type == EntryType.INCOME) R.string.income else R.string.expense)
-                        val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
-                            formatMoney(draft.amountMinor, state.preferences.currency, language), title, voiceContext.getString(draft.category.label()))
-                        lastReply = reply
-                        assistant.speak(reply, language)
+                        val ready = draft.copy(title = title)
+                        val said = heard?.let { VoiceEntryParser.detectSource(it) }
+                        if (said != null) finishVoiceEntry(ready, said)
+                        else {
+                            // The cat always needs to know how it was paid before it writes the entry.
+                            pendingVoice = ready
+                            val ask = voiceContext.getString(R.string.voice_ask_source)
+                            lastReply = ask
+                            assistant.speak(ask, language)
+                        }
                     }
                     heard != null -> when (OptionalVoiceAssistant.classify(heard)) {
                         VoiceCommand.ShowBalance -> {
@@ -3146,11 +3246,13 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                         Text(stringResource(R.string.dashboard_subtitle), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                if (state.premium && state.preferences.premiumAssistantEnabled) {
+                // The cat is always on the home screen; without Premium it is shown locked and opens the Premium card.
+                if (!state.premium || state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
-                        CatAssistantCard(state.preferences.language, listening, lastReply, onTalk = onVoice,
+                        CatAssistantCard(state.preferences.language, listening, lastReply,
+                            onTalk = if (state.premium) onVoice else ({ onNavigate(1) }),
                             skin = state.preferences.mascotSkin, animations = state.preferences.mascotAnimations,
-                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor)
+                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor, locked = !state.premium)
                     }
                 }
                 item(key = "balance", contentType = "summary") { BalanceCard(state) }
@@ -3458,7 +3560,7 @@ class DashboardViewModel(
     // Saves an entry parsed from a free-form spoken sentence (see VoiceEntryParser). The current
     // display currency is attached here rather than in the parser, since the parser has no access
     // to user preferences and money spoken aloud is always assumed to be in the user's own currency.
-    fun addVoiceEntry(draft: VoiceEntryDraft) {
+    fun addVoiceEntry(draft: VoiceEntryDraft, sourceType: String = "UNKNOWN") {
         guarded(onError = { eventChannel.trySend(DashboardEvent.Message(UiMessage.STORAGE)) }) {
             saveEntry(LedgerEntry(
                 id = UUID.randomUUID().toString(),
@@ -3469,6 +3571,7 @@ class DashboardViewModel(
                 category = draft.category,
                 date = LocalDate.now(clock),
                 note = draft.note,
+                sourceType = sourceType,
             ))
         }
     }
@@ -3607,6 +3710,14 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
                     isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
                     modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
                     supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
+                Text(stringResource(R.string.pay_source_title), style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_card)) }, modifier = Modifier.testTag("sourceCard"))
+                    FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_cash)) }, modifier = Modifier.testTag("sourceCash"))
+                }
+                if (state.sourceMissing) Text(stringResource(R.string.pay_source_required), color = MaterialTheme.colorScheme.error)
                 OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
                     placeholder = { Text(fallbackTitle) }, supportingText = { Text(stringResource(R.string.title_optional_hint)) },
                     isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
@@ -3692,7 +3803,9 @@ data class EditorState(
     val validation: ValidationIssue? = null,
     val error: UiMessage? = null,
     val loadFailed: Boolean = false,
-    val sourceType: String = "CASH",
+    /** "CASH" or "CARD" once chosen; new entries cannot be saved until the user picks one. */
+    val sourceType: String = "UNKNOWN",
+    val sourceMissing: Boolean = false,
     val bankId: String? = null,
     val cardLast4: String? = null,
     val customCategoryId: String? = null,
@@ -3731,7 +3844,10 @@ class EntryViewModel(
     fun type(value: EntryType) { mutableState.update { it.copy(type = value) } }
     fun category(value: Category) { mutableState.update { it.copy(category = value, customCategoryId = null) } }
     fun customCategory(id: String) { mutableState.update { it.copy(category = Category.OTHER, customCategoryId = id) } }
-    fun source(value: String) { require(value in listOf("UNKNOWN", "CASH", "CARD")); mutableState.update { it.copy(sourceType = value, bankId = if (value == "CARD") it.bankId ?: "privat" else null, cardLast4 = if (value == "CARD") it.cardLast4 else null) } }
+    fun source(value: String) {
+        require(value in listOf("UNKNOWN", "CASH", "CARD"))
+        mutableState.update { it.copy(sourceType = value, sourceMissing = false, cardLast4 = if (value == "CARD") it.cardLast4 else null, bankId = if (value == "CARD") it.bankId else null) }
+    }
     fun bank(id: String) { mutableState.update { it.copy(bankId = id, sourceType = "CARD") } }
     fun date(value: LocalDate) { mutableState.update { it.copy(date = value, eventAtMillis = value.atStartOfDay(clock.zone).toInstant().toEpochMilli(), validation = null) } }
     fun note(value: String) { mutableState.update { it.copy(note = value.take(240), validation = null) } }
@@ -3740,6 +3856,7 @@ class EntryViewModel(
         val form = state.value
         val minor = Money.parseMinor(form.amount)
         if (minor == null) { mutableState.update { it.copy(validation = ValidationIssue.AMOUNT) }; return }
+        if (!form.editing && form.sourceType != "CASH" && form.sourceType != "CARD") { mutableState.update { it.copy(sourceMissing = true) }; return }
         mutableState.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
@@ -5524,6 +5641,16 @@ data class VoiceEntryDraft(
 
 object VoiceEntryParser {
 
+    private val CARD_WORDS = Regex("карт|card|безнал|безготівк", RegexOption.IGNORE_CASE)
+    private val CASH_WORDS = Regex("готівк|наличн|налом|cash", RegexOption.IGNORE_CASE)
+
+    /** "CARD" / "CASH" when the sentence already says how it was paid; null when the cat must ask. */
+    fun detectSource(heard: String): String? {
+        val card = CARD_WORDS.containsMatchIn(heard)
+        val cash = CASH_WORDS.containsMatchIn(heard)
+        return when { card && !cash -> "CARD"; cash && !card -> "CASH"; else -> null }
+    }
+
     fun parse(heard: String): VoiceEntryDraft? {
         val text = heard.trim()
         if (text.isBlank()) return null
@@ -6239,6 +6366,34 @@ object VoiceSmallTalk {
     <string name="import_queued">Операція очікує підтвердження нижче.</string>
     <string name="import_repeated">Повторну доставку проігноровано; дублікат не збережено.</string>
     <string name="import_waiting">Очікування нового банківського сповіщення. Минулі сповіщення не скануються.</string>
+    <string name="import_mode_title">Спосіб імпорту</string>
+    <string name="import_mode_api">API-ключ (monobank)</string>
+    <string name="import_mode_sms">SMS</string>
+    <string name="import_mode_notify">Сповіщення</string>
+    <string name="api_howto">1) Відкрийте api.monobank.ua і увійдіть через застосунок monobank. 2) Скопіюйте особистий токен. 3) Вставте його сюди. Застосунок лише читає виписку (read-only) і перевіряє нові платежі приблизно кожні 15 хвилин, навіть коли закритий. Токен зберігається на телефоні в зашифованому вигляді.</string>
+    <string name="api_open_site">Відкрити api.monobank.ua</string>
+    <string name="api_token_label">API-токен monobank</string>
+    <string name="api_connect">Підключити</string>
+    <string name="api_connecting">Підключення…</string>
+    <string name="api_connected">Підключено · рахунків: %1$d</string>
+    <string name="api_last_sync">Остання синхронізація: %1$s</string>
+    <string name="api_imported_last">нових: %1$d</string>
+    <string name="api_syncing">Синхронізація…</string>
+    <string name="api_sync_now">Синхронізувати зараз</string>
+    <string name="api_disconnect">Відключити</string>
+    <string name="api_error_bad_token">monobank не прийняв токен. Скопіюйте його ще раз з api.monobank.ua.</string>
+    <string name="api_error_rate">monobank дозволяє один запит на хвилину. Зачекайте хвилину й спробуйте знову.</string>
+    <string name="api_error_network">Не вдалося зʼєднатися з monobank. Перевірте інтернет.</string>
+    <string name="api_error_no_accounts">За цим токеном рахунків не знайдено.</string>
+    <string name="sms_howto">Застосунок читає SMS від банків (PRIVATBANK, monobank, SENSE, Ощад, ПУМБ…) одразу після надходження й сам додає платежі. Інші SMS ігноруються й не зберігаються.</string>
+    <string name="sms_scan">Сканувати SMS за 30 днів</string>
+    <string name="sms_scanning">Сканування…</string>
+    <string name="sms_scan_result">Банківських SMS знайдено: %1$d · додано: %2$d · потребують підтвердження: %3$d</string>
+    <string name="sms_restricted_tip">Якщо Android блокує доступ до SMS: Налаштування → Застосунки → TG Ledger → ⋮ → Дозволити обмежені налаштування, потім знову дозвольте SMS.</string>
+    <string name="pay_source_title">Чим оплачено</string>
+    <string name="pay_source_required">Оберіть: картка чи готівка</string>
+    <string name="voice_ask_source">Картка чи готівка?</string>
+    <string name="cat_locked_hint">Кіт-помічник входить у Premium. Торкніться, щоб розблокувати (14 днів безкоштовно).</string>
 </resources>
 ```
 
@@ -6611,6 +6766,34 @@ object VoiceSmallTalk {
     <string name="import_queued">Operation awaits confirmation below.</string>
     <string name="import_repeated">Repeated delivery ignored; no duplicate was saved.</string>
     <string name="import_waiting">Waiting for a new bank notification. Past notification history is not scanned.</string>
+    <string name="import_mode_title">Import method</string>
+    <string name="import_mode_api">API key (monobank)</string>
+    <string name="import_mode_sms">SMS</string>
+    <string name="import_mode_notify">Notifications</string>
+    <string name="api_howto">1) Open api.monobank.ua and sign in with the monobank app. 2) Copy your personal token. 3) Paste it here. The app only reads your statement (read-only) and checks for new payments every ~15 minutes, even when closed. The token is stored encrypted on this phone.</string>
+    <string name="api_open_site">Open api.monobank.ua</string>
+    <string name="api_token_label">monobank API token</string>
+    <string name="api_connect">Connect</string>
+    <string name="api_connecting">Connecting…</string>
+    <string name="api_connected">Connected · accounts: %1$d</string>
+    <string name="api_last_sync">Last sync: %1$s</string>
+    <string name="api_imported_last">new: %1$d</string>
+    <string name="api_syncing">Syncing…</string>
+    <string name="api_sync_now">Sync now</string>
+    <string name="api_disconnect">Disconnect</string>
+    <string name="api_error_bad_token">monobank rejected the token. Copy it again from api.monobank.ua.</string>
+    <string name="api_error_rate">monobank allows one request per minute. Wait a minute and try again.</string>
+    <string name="api_error_network">Could not reach monobank. Check the internet connection.</string>
+    <string name="api_error_no_accounts">No accounts found for this token.</string>
+    <string name="sms_howto">The app reads SMS from banks (PRIVATBANK, monobank, SENSE, Oschad, PUMB…) as they arrive and imports payments automatically. Other SMS are ignored and never stored.</string>
+    <string name="sms_scan">Scan SMS from the last 30 days</string>
+    <string name="sms_scanning">Scanning…</string>
+    <string name="sms_scan_result">Bank SMS found: %1$d · added: %2$d · need confirmation: %3$d</string>
+    <string name="sms_restricted_tip">If Android blocks SMS access: Settings → Apps → TG Ledger → ⋮ → Allow restricted settings, then allow SMS again.</string>
+    <string name="pay_source_title">Paid with</string>
+    <string name="pay_source_required">Choose card or cash</string>
+    <string name="voice_ask_source">Card or cash?</string>
+    <string name="cat_locked_hint">The cat assistant is part of Premium. Tap to unlock (14-day trial is free).</string>
 </resources>
 ```
 
@@ -6903,6 +7086,25 @@ class OptionalVoiceAssistantParserTest {
     }
     @Test fun returnsNullForBlankInput() {
         assertNull(OptionalVoiceAssistant.classify("   "))
+    }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt
+
+```kotlin
+package com.semmyx.ledger.voice
+
+import org.junit.Assert.*
+import org.junit.Test
+
+class VoiceSourceTest {
+    @Test fun sourceIsDetectedOnlyWhenSpoken() {
+        assertEquals("CARD", VoiceEntryParser.detectSource("купив каву за 50 карткою"))
+        assertEquals("CASH", VoiceEntryParser.detectSource("bought coffee for 5 cash"))
+        assertEquals("CASH", VoiceEntryParser.detectSource("витратив 100 готівкою"))
+        assertNull(VoiceEntryParser.detectSource("купив каву за 50"))
+        assertNull(VoiceEntryParser.detectSource("карткою або готівкою 50"))
     }
 }
 ```
@@ -7303,6 +7505,9 @@ import java.security.MessageDigest
 import java.time.*
 import java.util.UUID
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -7329,7 +7534,11 @@ import kotlinx.coroutines.flow.update
  *     so the user can still inspect and accept/reject it.  If auto-import is on,
  *     cross-duplicates are silently ignored to avoid double-counting.
  */
-class BankImportRepository(private val db: LedgerDatabase, context: Context) : BankRepository {
+class BankImportRepository(
+    private val db: LedgerDatabase, context: Context,
+    private val vault: com.semmyx.ledger.data.security.KeystoreVault? = null,
+    private val monobank: MonobankClient = MonobankClient(),
+) : BankRepository {
 
     private val ctx = context.applicationContext
     private val config = ctx.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
@@ -7411,28 +7620,134 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
         get() = config.getBoolean("auto", true)
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
+    override var importMode: String
+        get() = config.getString("mode", "SMS") ?: "SMS"
+        set(value) { require(value in listOf("API", "SMS", "NOTIFY")); config.edit().putString("mode", value).apply() }
+
+    // -------------------------------------------------------------------------
+    // monobank personal API (token mode)
+    // -------------------------------------------------------------------------
+
+    private val monoState = MutableStateFlow(MonobankStatus(
+        connected = config.getString("mono_accounts", null) != null,
+        lastSyncMillis = config.getLong("mono_last_sync", 0L),
+    ))
+    override val monobankStatus = monoState.asStateFlow()
+    private val syncLock = kotlinx.coroutines.sync.Mutex()
+
+    private fun savedAccounts(): List<MonobankClient.Account> =
+        config.getString("mono_accounts", null)?.split(';')?.mapNotNull { row ->
+            val f = row.split('|')
+            if (f.size < 4) null else MonobankClient.Account(f[0], runCatching { LedgerCurrency.valueOf(f[1]) }.getOrNull() ?: return@mapNotNull null, f[2], f[3].ifBlank { null })
+        }.orEmpty()
+
+    private fun saveAccounts(accounts: List<MonobankClient.Account>) {
+        config.edit().putString("mono_accounts", accounts.joinToString(";") { "${it.id}|${it.currency.name}|${it.type}|${it.cardLast4.orEmpty()}" }).apply()
+    }
+
+    /** Validates the token with monobank, stores it encrypted (Android Keystore) and remembers the accounts. */
+    override suspend fun connectMonobank(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..200 || !clean.all { it.isLetterOrDigit() || it == '-' || it == '_' }) {
+            monoState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val accounts = monobank.accounts(clean)
+            if (accounts.isEmpty()) { monoState.update { it.copy(error = "NO_ACCOUNTS") }; return@withContext false }
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("monoToken", clean); Unit }
+            saveAccounts(accounts)
+            config.edit().remove("mono_last_sync").putString("mode", "API").apply()
+            monoState.value = MonobankStatus(connected = true, accounts = accounts.size)
+            true
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }; false
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(error = "NETWORK") }; false
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            monoState.update { it.copy(error = "NETWORK") }; false
+        }
+    }
+
+    override suspend fun disconnectMonobank() = withContext(Dispatchers.IO) {
+        runCatching { vault?.update { it.remove("monoToken"); Unit } }
+        config.edit().remove("mono_accounts").remove("mono_last_sync").apply()
+        monoState.value = MonobankStatus()
+    }
+
+    /**
+     * Pulls new operations for every saved account. monobank allows one statement request per account
+     * per 60 s, so accounts are fetched one minute apart. Safe to call repeatedly: operations are keyed by id.
+     */
+    override suspend fun syncMonobank(): Int = withContext(Dispatchers.IO) {
+        if (!syncLock.tryLock()) return@withContext 0
+        try {
+            val token = vault?.read { it.optString("monoToken", "") }.orEmpty()
+            val accounts = savedAccounts()
+            if (token.isBlank() || accounts.isEmpty()) { monoState.update { it.copy(connected = false) }; return@withContext 0 }
+            monoState.update { it.copy(syncing = true, error = null) }
+            val nowSec = System.currentTimeMillis() / 1000
+            val last = config.getLong("mono_last_sync", 0L) / 1000
+            val from = if (last > 0) maxOf(last - 3600, nowSec - 31L * 86400) else nowSec - 30L * 86400
+            var imported = 0
+            accounts.take(4).forEachIndexed { index, account ->
+                if (index > 0) kotlinx.coroutines.delay(61_000)
+                val rows = monobank.statement(token, account.id, from, nowSec)
+                rows.sortedBy { it.timeSeconds }.forEach { row ->
+                    val op = MonobankMapper.map(row, account.currency, account.cardLast4) ?: return@forEach
+                    val result = store(op, "MONO:${row.id}", row.timeSeconds * 1000, "API", authoritative = true)
+                    if (result == "AUTO_IMPORTED") imported++
+                }
+            }
+            val now = System.currentTimeMillis()
+            config.edit().putLong("mono_last_sync", now).apply()
+            monoState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null, accounts = accounts.size) }
+            imported
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(syncing = false, error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }
+            0
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } finally { syncLock.unlock() }
+    }
+
     // -------------------------------------------------------------------------
     // Core receive path
     // -------------------------------------------------------------------------
 
+    /** Parses a bank text (push/SMS/pasted) and stores it. Returns the outcome code. */
     suspend fun receive(
         bank: Bank, text: String, eventKey: String, at: Long,
         origin: String, manual: Boolean = false,
-    ) {
-        if (!enabled && !manual) { note("DISABLED"); return }
-        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return }
+    ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
+        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return "UNRECOGNIZED" }
+        return store(parsed, eventKey, at, origin, manual)
+    }
 
+    /**
+     * Stores an already parsed operation. [authoritative] sources (the bank's own API, unique id per
+     * operation) skip the heuristic duplicate checks: the event key alone guarantees "once".
+     */
+    suspend fun store(
+        parsed: ParsedBankOperation, eventKey: String, at: Long, origin: String,
+        manual: Boolean = false, authoritative: Boolean = false,
+    ): String {
         var result = "QUEUED"
         db.withTransaction {
             // --- Tier 1: same-bank re-delivery guard ---
-            val sameBankDup = dao.similar(
+            val sameBankDup = !authoritative && dao.similar(
                 parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
                 parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant,
             ) > 0
 
             // --- Tier 2: cross-source dedup (wallet + bank for the same tap) ---
             // Only applies when the same-bank check didn't already flag it.
-            val crossSourceDup = !sameBankDup && dao.similarCrossSource(
+            val crossSourceDup = !authoritative && !sameBankDup && dao.similarCrossSource(
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
             ) > 0
 
@@ -7479,10 +7794,11 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
             if (!manual && autoImport && parsed.confident && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
-                postImportNotification(parsed)
+                if (System.currentTimeMillis() - parsed.happenedAtMillis < 15 * 60_000L) postImportNotification(parsed)
             }
         }
         note(result)
+        return result
     }
 
     // -------------------------------------------------------------------------
@@ -7575,6 +7891,72 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
         fun digest(value: String): String =
             MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
                 .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.LedgerCurrency
+import com.semmyx.ledger.domain.bank.MonobankMapper
+import com.semmyx.ledger.domain.bank.MonobankStatementItem
+import java.io.IOException
+import okhttp3.OkHttpClient
+import okhttp3.Request
+
+/**
+ * Minimal client for monobank's personal API (https://api.monobank.ua/docs/). Read-only; the token is
+ * sent only to this host in the `X-Token` header. Blocking calls: run on a background dispatcher.
+ */
+class MonobankClient(
+    private val http: OkHttpClient = OkHttpClient(),
+    private val baseUrl: String = "https://api.monobank.ua",
+) {
+    data class Account(val id: String, val currency: LedgerCurrency, val type: String, val cardLast4: String?)
+
+    class ApiException(val httpCode: Int, message: String) : IOException(message) {
+        val invalidToken get() = httpCode == 403 || httpCode == 401
+        val rateLimited get() = httpCode == 429
+    }
+
+    private fun get(path: String, token: String): String {
+        val request = Request.Builder().url(baseUrl.trimEnd('/') + path).header("X-Token", token).get().build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw ApiException(response.code, "monobank HTTP ${response.code}")
+            return response.body?.string().orEmpty()
+        }
+    }
+
+    fun accounts(token: String): List<Account> {
+        val root = JsonParser.parseString(get("/personal/client-info", token)).asJsonObject
+        return root.getAsJsonArray("accounts")?.mapNotNull { element ->
+            val a = element.asJsonObject
+            val currency = MonobankMapper.currency(a.get("currencyCode")?.asInt ?: return@mapNotNull null) ?: return@mapNotNull null
+            val type = a.get("type")?.asString.orEmpty()
+            if (type == "eAid") return@mapNotNull null // state-aid wallets are not spending accounts
+            val mask = a.getAsJsonArray("maskedPan")?.firstOrNull()?.asString
+            Account(a.get("id").asString, currency, type, mask?.takeLast(4)?.takeIf { it.all(Char::isDigit) })
+        }.orEmpty()
+    }
+
+    fun statement(token: String, accountId: String, fromSeconds: Long, toSeconds: Long): List<MonobankStatementItem> {
+        val array = JsonParser.parseString(get("/personal/statement/$accountId/$fromSeconds/$toSeconds", token)).asJsonArray
+        return array.mapNotNull { element ->
+            val o = element.asJsonObject
+            val id = o.get("id")?.asString ?: return@mapNotNull null
+            MonobankStatementItem(
+                id = id,
+                timeSeconds = o.get("time")?.asLong ?: return@mapNotNull null,
+                description = o.get("description")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
+                mcc = o.get("mcc")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
+                amount = o.get("amount")?.asLong ?: return@mapNotNull null,
+                comment = o.get("comment")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
+            )
+        }
     }
 }
 ```
@@ -7717,7 +8099,11 @@ class PlayPremiumRepository(
     private val cacheTtlMillis = 7L * 24 * 60 * 60 * 1000
 
     init {
-        scope.launch { refreshLocalEntitlements() }
+        scope.launch {
+            refreshLocalEntitlements()
+            // The single 14-day free trial starts by itself on first launch: no button, no card, no renewal.
+            if (trial.value.available) startTrial(TrialPolicy.DAYS)
+        }
         scope.launch {
             // One timer at the actual next entitlement deadline, not one AES/RSA read per minute.
             combine(developerActivation, trial, playExpiry) { dev, test, play ->
@@ -8303,7 +8689,7 @@ class DataStorePreferences(context: Context, scope: CoroutineScope) : Preference
             language = enumOrDefault(p[Keys.language], defaultLanguage),
             onboardingComplete = p[Keys.onboarded] ?: false,
             biometricsEnabled = p[Keys.biometrics] ?: false,
-            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: false,
+            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: true,
             mascotSkin = p[Keys.skin] ?: "gray",
             mascotAnimations = p[Keys.animations] ?: true,
             refreshRateHz = p[Keys.refreshRate] ?: 0,
@@ -8778,6 +9164,60 @@ class SearchPatternTest {
 }
 ```
 
+## data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.semmyx.ledger.domain.LedgerCurrency
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+
+class MonobankClientTest {
+    private lateinit var server: MockWebServer
+    private lateinit var client: MonobankClient
+    @Before fun setUp() { server = MockWebServer().also { it.start() }; client = MonobankClient(baseUrl = server.url("/").toString()) }
+    @After fun tearDown() { server.shutdown() }
+
+    @Test fun accountsAreParsedAndTokenIsSentAsHeader() {
+        server.enqueue(MockResponse().setBody("""{"clientId":"c","name":"N","accounts":[
+            {"id":"acc1","currencyCode":980,"type":"black","maskedPan":["537541******1234"],"balance":1000},
+            {"id":"acc2","currencyCode":840,"type":"white","maskedPan":[],"balance":5},
+            {"id":"acc3","currencyCode":980,"type":"eAid","maskedPan":[]},
+            {"id":"acc4","currencyCode":392,"type":"black","maskedPan":[]}]}"""))
+        val accounts = client.accounts("secret-token")
+        assertEquals(listOf("acc1", "acc2"), accounts.map { it.id })
+        assertEquals("1234", accounts[0].cardLast4); assertNull(accounts[1].cardLast4)
+        assertEquals(LedgerCurrency.USD, accounts[1].currency)
+        val request = server.takeRequest()
+        assertEquals("/personal/client-info", request.path); assertEquals("secret-token", request.getHeader("X-Token"))
+    }
+
+    @Test fun statementRowsAreParsed() {
+        server.enqueue(MockResponse().setBody("""[{"id":"s1","time":1700000000,"description":"Сільпо","mcc":5411,"amount":-12550,"balance":1,"currencyCode":980},
+            {"id":"s2","time":1700000100,"description":null,"mcc":4829,"amount":50000}]"""))
+        val rows = client.statement("t", "acc1", 1699000000, 1700000200)
+        assertEquals(2, rows.size)
+        assertEquals(-12550L, rows[0].amount); assertEquals("Сільпо", rows[0].description); assertEquals(5411, rows[0].mcc)
+        assertEquals("", rows[1].description)
+        assertEquals("/personal/statement/acc1/1699000000/1700000200", server.takeRequest().path)
+    }
+
+    @Test fun errorsCarryTheHttpCode() {
+        server.enqueue(MockResponse().setResponseCode(403))
+        val bad = try { client.accounts("x"); null } catch (e: MonobankClient.ApiException) { e }
+        assertTrue(bad!!.invalidToken)
+        server.enqueue(MockResponse().setResponseCode(429))
+        val slow = try { client.statement("x", "a", 1, 2); null } catch (e: MonobankClient.ApiException) { e }
+        assertTrue(slow!!.rateLimited)
+    }
+}
+```
+
 ## data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
 
 ```kotlin
@@ -9018,7 +9458,7 @@ data class UserPreferences(
     val onboardingComplete: Boolean = false,
     val biometricsEnabled: Boolean = false,
     // Gated separately from entitlement: a premium user can still hide the mascot.
-    val premiumAssistantEnabled: Boolean = false,
+    val premiumAssistantEnabled: Boolean = true,
     val mascotSkin: String = "gray",
     val mascotAnimations: Boolean = true,
     val refreshRateHz: Int = 0,
@@ -9278,7 +9718,13 @@ object Banks {
     )
     fun byPackage(value: String): Bank? =
         all.firstOrNull { value in it.packages } ?: all.firstOrNull { bank -> bank.packageHints.any { value.contains(it, ignoreCase = true) } }
-    fun bySender(value: String) = all.firstOrNull { value.trim().lowercase(Locale.ROOT) in it.senders }
+    /** SMS sender ids vary ("PRIVATBANK", "Privat24", "monobank", "SENSE BANK"): exact match, else a name fragment (4+ chars). */
+    fun bySender(value: String): Bank? {
+        val sender = value.trim().lowercase(Locale.ROOT)
+        if (sender.isEmpty()) return null
+        return all.firstOrNull { sender in it.senders }
+            ?: all.firstOrNull { bank -> bank.senders.any { it.length >= 4 && sender.contains(it) } }
+    }
     fun name(id: String?) = all.firstOrNull { it.id == id }?.name ?: id.orEmpty()
 }
 
@@ -9305,7 +9751,7 @@ object BankParser {
         RegexOption.IGNORE_CASE)
     private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
     private val expense = Regex(
-        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|pokupk|kupivl|platizh)",
+        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
         RegexOption.IGNORE_CASE)
     private val income = Regex(
         "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",
@@ -9515,7 +9961,16 @@ data class ImportReview(val id: String, val bankId: String, val amountMinor: Lon
     val transfer: Boolean, val status: String)
 data class ImportDiagnostics(val connected: Boolean = false, val notificationCount: Int = 0, val bankMessageCount: Int = 0,
     val lastCode: String = "WAITING", val lastPackage: String = "", val lastAtMillis: Long = 0)
+/** [error] is a code: BAD_TOKEN, RATE_LIMIT, NETWORK, NO_ACCOUNTS (or null). */
+data class MonobankStatus(val connected: Boolean = false, val syncing: Boolean = false, val lastSyncMillis: Long = 0,
+    val lastImported: Int = 0, val accounts: Int = 0, val error: String? = null)
 interface BankRepository {
+    /** "API" (monobank token), "SMS" or "NOTIFY" (bank app notifications). */
+    var importMode: String
+    val monobankStatus: Flow<MonobankStatus>
+    suspend fun connectMonobank(token: String): Boolean
+    suspend fun disconnectMonobank()
+    suspend fun syncMonobank(): Int
     val diagnostics: Flow<ImportDiagnostics>
     fun configuredPackage(bankId: String): String
     fun setPackage(bankId: String, packageName: String)
@@ -9534,6 +9989,58 @@ interface BankRepository {
     suspend fun exportEntries(): List<LedgerEntry>
     fun budget(currency: LedgerCurrency): Long
     fun setBudget(currency: LedgerCurrency, minor: Long)
+}
+```
+
+## domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+import com.semmyx.ledger.domain.*
+
+/** One row of monobank's personal `statement` API ([amount] is signed minor units of the account currency). */
+data class MonobankStatementItem(
+    val id: String, val timeSeconds: Long, val description: String, val mcc: Int,
+    val amount: Long, val comment: String = "",
+)
+
+/** Pure mapping of monobank API rows to ledger operations. No network, no Android. */
+object MonobankMapper {
+    fun currency(code: Int): LedgerCurrency? = when (code) {
+        980 -> LedgerCurrency.UAH; 840 -> LedgerCurrency.USD; 978 -> LedgerCurrency.EUR
+        826 -> LedgerCurrency.GBP; 985 -> LedgerCurrency.PLN; else -> null
+    }
+
+    fun map(item: MonobankStatementItem, accountCurrency: LedgerCurrency, cardLast4: String?): ParsedBankOperation? {
+        if (item.id.isBlank() || item.amount == 0L) return null
+        val minor = Math.abs(item.amount)
+        if (minor > Money.MAX_ENTRY_MINOR) return null
+        val description = item.description.replace(Regex("\\s+"), " ").trim().take(60)
+        val transfer = item.mcc == 4829 || description.startsWith("Від:", true) || description.startsWith("До:", true) ||
+            description.startsWith("From:", true) || description.startsWith("To:", true)
+        val type = if (item.amount > 0) EntryType.INCOME else EntryType.EXPENSE
+        val category = when {
+            transfer -> Category.TRANSFER
+            else -> byMcc(item.mcc) ?: BankParser.categorize(description)
+        }
+        return ParsedBankOperation(
+            bankId = "mono", amountMinor = minor, currency = accountCurrency, type = type, merchant = description,
+            cardLast4 = cardLast4, happenedAtMillis = item.timeSeconds * 1000L, timeFromMessage = true,
+            transfer = transfer, confident = true, category = category,
+        )
+    }
+
+    /** Merchant category codes (ISO 18245) -> app categories; unknown codes fall back to name matching. */
+    fun byMcc(mcc: Int): Category? = when (mcc) {
+        5411, 5422, 5441, 5451, 5462, 5499, 5300, 5311 -> Category.FOOD
+        5811, 5812, 5813, 5814 -> Category.DINING
+        4111, 4112, 4121, 4131, 4784, 5541, 5542, 7523, 7512 -> Category.TRANSPORT
+        5912, 5122, 8011, 8021, 8031, 8041, 8042, 8043, 8049, 8050, 8062, 8071, 8099 -> Category.HEALTH
+        7832, 7841, 7922, 7929, 7932, 7933, 7941, 7991, 7992, 7993, 7994, 7995, 7996, 7997, 7998, 7999, 5815, 5816, 5817, 5818, 5735 -> Category.LEISURE
+        4900, 4814, 4899, 5200, 5211, 5251, 5712, 5713, 5719, 7349 -> Category.HOME
+        else -> null
+    }
 }
 ```
 
@@ -9924,6 +10431,49 @@ class BankParserTest {
         assertEquals("sense", Banks.byPackage("ua.alfabank.mobile.android.beta")?.id)
         assertNull(Banks.byPackage("org.telegram.messenger"))
         assertNull(Banks.byPackage("com.whatsapp"))
+    }
+
+    @Test fun senderMatchingIsLenient() {
+        assertEquals("privat", Banks.bySender("PRIVATBANK")?.id)
+        assertEquals("privat", Banks.bySender("Privat24")?.id)
+        assertEquals("mono", Banks.bySender("monobank")?.id)
+        assertEquals("sense", Banks.bySender("SENSE BANK")?.id)
+        assertNull(Banks.bySender("+380501234567"))
+        assertNull(Banks.bySender("Mom"))
+    }
+}
+```
+
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+import com.semmyx.ledger.domain.*
+import org.junit.Assert.*
+import org.junit.Test
+
+class MonobankMapperTest {
+    @Test fun expenseUsesMccAndSignedAmount() {
+        val op = MonobankMapper.map(MonobankStatementItem("a1", 1_700_000_000, "Сільпо", 5411, -12550), LedgerCurrency.UAH, "1234")!!
+        assertEquals(12550L, op.amountMinor); assertEquals(EntryType.EXPENSE, op.type)
+        assertEquals(Category.FOOD, op.category); assertEquals("1234", op.cardLast4)
+        assertEquals(1_700_000_000_000L, op.happenedAtMillis); assertTrue(op.confident)
+    }
+    @Test fun incomeAndTransfer() {
+        val op = MonobankMapper.map(MonobankStatementItem("a2", 1, "Від: Іван П.", 4829, 50000), LedgerCurrency.UAH, null)!!
+        assertEquals(EntryType.INCOME, op.type); assertTrue(op.transfer); assertEquals(Category.TRANSFER, op.category)
+    }
+    @Test fun unknownMccFallsBackToName() {
+        assertEquals(Category.TRANSPORT, MonobankMapper.map(MonobankStatementItem("a3", 1, "WOG", 0, -100), LedgerCurrency.UAH, null)!!.category)
+    }
+    @Test fun zeroAndBlankAreSkipped() {
+        assertNull(MonobankMapper.map(MonobankStatementItem("a4", 1, "x", 0, 0), LedgerCurrency.UAH, null))
+        assertNull(MonobankMapper.map(MonobankStatementItem("", 1, "x", 0, -5), LedgerCurrency.UAH, null))
+    }
+    @Test fun currencyCodes() {
+        assertEquals(LedgerCurrency.UAH, MonobankMapper.currency(980)); assertEquals(LedgerCurrency.USD, MonobankMapper.currency(840))
+        assertNull(MonobankMapper.currency(392))
     }
 }
 ```
