@@ -28,6 +28,9 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
     val customCategories = repo.categories().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val reviews = repo.reviews().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val enabled = MutableStateFlow(repo.enabled)
+    val mode = MutableStateFlow(repo.importMode)
+    val mono = repo.monobankStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
+    fun mode(value: String) { repo.importMode = value; mode.value = value }
     val auto = MutableStateFlow(repo.autoImport)
     val error = MutableStateFlow(false)
     val revision = MutableStateFlow(0)

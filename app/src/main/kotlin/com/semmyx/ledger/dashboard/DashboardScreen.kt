@@ -79,7 +79,7 @@ fun DashboardRoute(model: DashboardViewModel, host: FragmentActivity, onNavigate
 fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: FragmentActivity, onNavigate: (Int) -> Unit,
     onAdd: () -> Unit, onEdit: (String) -> Unit, onDelete: (String) -> Unit, onSearch: (String) -> Unit,
     onFilter: (EntryType?) -> Unit, onDays: (Int) -> Unit, onLoadMore: () -> Unit, onRetry: () -> Unit,
-    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft) -> Unit,
+    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit,
     speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
     setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit,
     onCategory: (Category?) -> Unit, onMoreCategory: () -> Unit,
@@ -137,6 +137,26 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
         // Speech results are handled in one place: first try to read the phrase as a whole ledger
         // entry ("I bought 1 kg of tomatoes for 100 UAH"), and only fall back to the small set of
         // fixed commands (balance / spent today / open add-entry) when no amount could be found.
+        var pendingVoice by remember { mutableStateOf<com.semmyx.ledger.voice.VoiceEntryDraft?>(null) }
+        val finishVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit = { ready, source ->
+            pendingVoice = null
+            onVoiceEntry(ready, source)
+            val language = state.preferences.language
+            val typeLabel = voiceContext.getString(if (ready.type == EntryType.INCOME) R.string.income else R.string.expense)
+            val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
+                formatMoney(ready.amountMinor, state.preferences.currency, language), ready.title, voiceContext.getString(ready.category.label()))
+            lastReply = reply
+            ensureAssistant().speak(reply, language)
+        }
+        pendingVoice?.let { ready ->
+            AlertDialog(onDismissRequest = { pendingVoice = null }, title = { Text(stringResource(R.string.voice_ask_source)) },
+                text = { Text(ready.title + " · " + formatMoney(ready.amountMinor, state.preferences.currency, state.preferences.language)) },
+                confirmButton = { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { finishVoiceEntry(ready, "CARD") }, modifier = Modifier.testTag("voiceSourceCard")) { Text(stringResource(R.string.bank_card)) }
+                    Button(onClick = { finishVoiceEntry(ready, "CASH") }, modifier = Modifier.testTag("voiceSourceCash")) { Text(stringResource(R.string.bank_cash)) }
+                } },
+                dismissButton = { TextButton(onClick = { pendingVoice = null }) { Text(stringResource(R.string.cancel)) } })
+        }
         val processInput: (String?) -> Unit = { heard ->
                 listening = false
                 val assistant = ensureAssistant()
@@ -165,12 +185,16 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                     }
                     draft != null -> {
                         val title = draft.title.ifBlank { voiceContext.getString(draft.category.label()) }
-                        onVoiceEntry(draft.copy(title = title))
-                        val typeLabel = voiceContext.getString(if (draft.type == EntryType.INCOME) R.string.income else R.string.expense)
-                        val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
-                            formatMoney(draft.amountMinor, state.preferences.currency, language), title, voiceContext.getString(draft.category.label()))
-                        lastReply = reply
-                        assistant.speak(reply, language)
+                        val ready = draft.copy(title = title)
+                        val said = heard?.let { VoiceEntryParser.detectSource(it) }
+                        if (said != null) finishVoiceEntry(ready, said)
+                        else {
+                            // The cat always needs to know how it was paid before it writes the entry.
+                            pendingVoice = ready
+                            val ask = voiceContext.getString(R.string.voice_ask_source)
+                            lastReply = ask
+                            assistant.speak(ask, language)
+                        }
                     }
                     heard != null -> when (OptionalVoiceAssistant.classify(heard)) {
                         VoiceCommand.ShowBalance -> {
@@ -248,11 +272,13 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                         Text(stringResource(R.string.dashboard_subtitle), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                if (state.premium && state.preferences.premiumAssistantEnabled) {
+                // The cat is always on the home screen; without Premium it is shown locked and opens the Premium card.
+                if (!state.premium || state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
-                        CatAssistantCard(state.preferences.language, listening, lastReply, onTalk = onVoice,
+                        CatAssistantCard(state.preferences.language, listening, lastReply,
+                            onTalk = if (state.premium) onVoice else ({ onNavigate(1) }),
                             skin = state.preferences.mascotSkin, animations = state.preferences.mascotAnimations,
-                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor)
+                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor, locked = !state.premium)
                     }
                 }
                 item(key = "balance", contentType = "summary") { BalanceCard(state) }

@@ -100,7 +100,7 @@ class DashboardViewModel(
     // Saves an entry parsed from a free-form spoken sentence (see VoiceEntryParser). The current
     // display currency is attached here rather than in the parser, since the parser has no access
     // to user preferences and money spoken aloud is always assumed to be in the user's own currency.
-    fun addVoiceEntry(draft: VoiceEntryDraft) {
+    fun addVoiceEntry(draft: VoiceEntryDraft, sourceType: String = "UNKNOWN") {
         guarded(onError = { eventChannel.trySend(DashboardEvent.Message(UiMessage.STORAGE)) }) {
             saveEntry(LedgerEntry(
                 id = UUID.randomUUID().toString(),
@@ -111,6 +111,7 @@ class DashboardViewModel(
                 category = draft.category,
                 date = LocalDate.now(clock),
                 note = draft.note,
+                sourceType = sourceType,
             ))
         }
     }

@@ -12,7 +12,7 @@ import kotlinx.coroutines.CancellationException
 /**
  * Keeps bank import alive without the app being open:
  *  - re-binds the notification listener if the system dropped it (its start-up replays pending notifications),
- *  - imports bank SMS received while the app was closed (sideload variant with READ_SMS).
+ *  - API mode: pulls new operations from monobank; SMS mode: imports bank SMS received while the app was closed.
  * Runs every 15 minutes, after reboot, and once whenever the app process starts.
  */
 class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -20,10 +20,13 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
         return try {
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
-            if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
-                ensureListenerBound(applicationContext, repository)
+            when (repository.importMode) {
+                "API" -> repository.syncMonobank()
+                "SMS" -> BankSmsCatchUp.run(applicationContext, repository)
+                else -> if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
+                    ensureListenerBound(applicationContext, repository)
+                }
             }
-            BankSmsCatchUp.run(applicationContext, repository)
             Result.success()
         } catch (error: Exception) {
             if (error is CancellationException) throw error
@@ -47,6 +50,12 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
                 pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
                 pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
             }
+        }
+
+        /** Runs one import pass right now (after switching mode, connecting, or pressing "Sync now"). */
+        fun runNow(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork("bank-import-now", ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<BankImportWorker>().build())
         }
 
         fun schedule(context: Context) {

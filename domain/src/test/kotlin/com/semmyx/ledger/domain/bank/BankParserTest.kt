@@ -109,4 +109,13 @@ class BankParserTest {
         assertNull(Banks.byPackage("org.telegram.messenger"))
         assertNull(Banks.byPackage("com.whatsapp"))
     }
+
+    @Test fun senderMatchingIsLenient() {
+        assertEquals("privat", Banks.bySender("PRIVATBANK")?.id)
+        assertEquals("privat", Banks.bySender("Privat24")?.id)
+        assertEquals("mono", Banks.bySender("monobank")?.id)
+        assertEquals("sense", Banks.bySender("SENSE BANK")?.id)
+        assertNull(Banks.bySender("+380501234567"))
+        assertNull(Banks.bySender("Mom"))
+    }
 }

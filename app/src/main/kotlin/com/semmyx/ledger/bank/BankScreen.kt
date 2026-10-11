@@ -44,7 +44,7 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val reviews by model.reviews.collectAsStateWithLifecycle()
@@ -53,6 +53,8 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val automatic by model.auto.collectAsStateWithLifecycle()
     val failed by model.error.collectAsStateWithLifecycle()
     val revision by model.revision.collectAsStateWithLifecycle()
+    val mode by model.mode.collectAsStateWithLifecycle()
+    val mono by model.mono.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val palette = LocalAppearance.current
@@ -64,6 +66,10 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     var categoryDialog by remember { mutableStateOf(false) }
     var privacy by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
+    var token by remember { mutableStateOf("") }
+    var connecting by remember { mutableStateOf(false) }
+    var smsScan by remember { mutableStateOf<BankSmsCatchUp.Result?>(null) }
+    var scanning by remember { mutableStateOf(false) }
     
     fun openSettings(action: String, data: Uri? = null) {
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
@@ -109,19 +115,72 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 Text(stringResource(R.string.bank_consent), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_enabled), Modifier.weight(1f)); Switch(enabled, model::enabled) }
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_auto), Modifier.weight(1f)); Switch(automatic, model::auto, enabled = enabled) }
-                Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
-                OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
-                if (BuildConfig.FLAVOR == "legacyV7") {
-                    Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
-                    OutlinedButton(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
-                } else Text(stringResource(R.string.bank_play_sms), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(stringResource(R.string.import_mode_title), style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms, "NOTIFY" to R.string.import_mode_notify).forEach { (value, title) ->
+                        FilterChip(selected = mode == value, onClick = { model.mode(value); BankImportWorker.runNow(context) }, label = { Text(stringResource(title)) })
+                    }
+                }
+                when (mode) {
+                    "API" -> {
+                        Text(stringResource(R.string.api_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://api.monobank.ua/")) }) { Text(stringResource(R.string.api_open_site)) }
+                        if (!mono.connected) {
+                            OutlinedTextField(token, { token = it.trim().take(200) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.api_token_label)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                isError = mono.error == "BAD_TOKEN")
+                            Button(enabled = token.length >= 20 && !connecting, onClick = {
+                                connecting = true
+                                scope.launch {
+                                    if (repository.connectMonobank(token)) { token = ""; BankImportWorker.runNow(context) }
+                                    connecting = false
+                                }
+                            }) { Text(stringResource(if (connecting) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.api_connected, mono.accounts.coerceAtLeast(1)), color = MaterialTheme.colorScheme.secondary)
+                            if (mono.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(mono.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))) + " · " +
+                                stringResource(R.string.api_imported_last, mono.lastImported), style = MaterialTheme.typography.bodySmall)
+                            if (mono.syncing) Text(stringResource(R.string.api_syncing), style = MaterialTheme.typography.bodySmall)
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(enabled = !mono.syncing, onClick = { BankImportWorker.runNow(context) }) { Text(stringResource(R.string.api_sync_now)) }
+                                TextButton(onClick = { scope.launch { repository.disconnectMonobank() } }) { Text(stringResource(R.string.api_disconnect)) }
+                            }
+                        }
+                        mono.error?.let { code ->
+                            Text(stringResource(when (code) {
+                                "BAD_TOKEN" -> R.string.api_error_bad_token; "RATE_LIMIT" -> R.string.api_error_rate
+                                "NO_ACCOUNTS" -> R.string.api_error_no_accounts; else -> R.string.api_error_network
+                            }), color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    "SMS" -> {
+                        Text(stringResource(R.string.sms_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
+                        if (!smsAccess) Button(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
+                        OutlinedButton(enabled = smsAccess && !scanning, onClick = {
+                            scanning = true
+                            scope.launch { smsScan = withContext(Dispatchers.IO) { BankSmsCatchUp.run(context, repository, 30) }; scanning = false }
+                        }) { Text(stringResource(if (scanning) R.string.sms_scanning else R.string.sms_scan)) }
+                        smsScan?.let { r ->
+                            Text(if (!r.permission) stringResource(R.string.bank_sms_no)
+                                else stringResource(R.string.sms_scan_result, r.bankMessages, r.imported, r.queued), style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(stringResource(R.string.sms_restricted_tip), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> {
+                        Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
+                        OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
+                    }
+                }
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
-
                 TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
                 Text(stringResource(R.string.import_diagnostics), style = MaterialTheme.typography.titleMedium)
+                if (mode == "NOTIFY") {
                 Text(stringResource(if (diagnostics.connected) R.string.import_connected else R.string.import_disconnected))
                 Text(stringResource(R.string.import_counts, diagnostics.notificationCount, diagnostics.bankMessageCount))
                 Text(stringResource(importReason(diagnostics.lastCode)), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -132,6 +191,7 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                     catch (_: Exception) { exportFailed = true }
                 }) { Text(stringResource(R.string.import_reconnect)) }
                 TextButton(onClick = { packageDialog = true }) { Text(stringResource(R.string.import_package_settings)) }
+                }
                 Button(onClick = { pasteDialog = true }) { Text(stringResource(R.string.import_paste)) }
                 Text(stringResource(R.string.import_queue_note), color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }

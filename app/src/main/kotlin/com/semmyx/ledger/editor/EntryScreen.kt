@@ -64,6 +64,14 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
                     isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
                     modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
                     supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
+                Text(stringResource(R.string.pay_source_title), style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_card)) }, modifier = Modifier.testTag("sourceCard"))
+                    FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_cash)) }, modifier = Modifier.testTag("sourceCash"))
+                }
+                if (state.sourceMissing) Text(stringResource(R.string.pay_source_required), color = MaterialTheme.colorScheme.error)
                 OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
                     placeholder = { Text(fallbackTitle) }, supportingText = { Text(stringResource(R.string.title_optional_hint)) },
                     isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))

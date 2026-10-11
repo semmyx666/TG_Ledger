@@ -27,7 +27,9 @@ data class EditorState(
     val validation: ValidationIssue? = null,
     val error: UiMessage? = null,
     val loadFailed: Boolean = false,
-    val sourceType: String = "CASH",
+    /** "CASH" or "CARD" once chosen; new entries cannot be saved until the user picks one. */
+    val sourceType: String = "UNKNOWN",
+    val sourceMissing: Boolean = false,
     val bankId: String? = null,
     val cardLast4: String? = null,
     val customCategoryId: String? = null,
@@ -66,7 +68,10 @@ class EntryViewModel(
     fun type(value: EntryType) { mutableState.update { it.copy(type = value) } }
     fun category(value: Category) { mutableState.update { it.copy(category = value, customCategoryId = null) } }
     fun customCategory(id: String) { mutableState.update { it.copy(category = Category.OTHER, customCategoryId = id) } }
-    fun source(value: String) { require(value in listOf("UNKNOWN", "CASH", "CARD")); mutableState.update { it.copy(sourceType = value, bankId = if (value == "CARD") it.bankId ?: "privat" else null, cardLast4 = if (value == "CARD") it.cardLast4 else null) } }
+    fun source(value: String) {
+        require(value in listOf("UNKNOWN", "CASH", "CARD"))
+        mutableState.update { it.copy(sourceType = value, sourceMissing = false, cardLast4 = if (value == "CARD") it.cardLast4 else null, bankId = if (value == "CARD") it.bankId else null) }
+    }
     fun bank(id: String) { mutableState.update { it.copy(bankId = id, sourceType = "CARD") } }
     fun date(value: LocalDate) { mutableState.update { it.copy(date = value, eventAtMillis = value.atStartOfDay(clock.zone).toInstant().toEpochMilli(), validation = null) } }
     fun note(value: String) { mutableState.update { it.copy(note = value.take(240), validation = null) } }
@@ -75,6 +80,7 @@ class EntryViewModel(
         val form = state.value
         val minor = Money.parseMinor(form.amount)
         if (minor == null) { mutableState.update { it.copy(validation = ValidationIssue.AMOUNT) }; return }
+        if (!form.editing && form.sourceType != "CASH" && form.sourceType != "CARD") { mutableState.update { it.copy(sourceMissing = true) }; return }
         mutableState.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {

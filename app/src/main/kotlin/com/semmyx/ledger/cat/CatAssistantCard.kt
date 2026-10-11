@@ -25,7 +25,7 @@ import com.semmyx.ledger.domain.AppLanguage
 @Composable
 fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
     modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
-    onText: (String) -> Unit = {}, balanceMinor: Long = 0) {
+    onText: (String) -> Unit = {}, balanceMinor: Long = 0, locked: Boolean = false) {
     var text by remember { mutableStateOf("") }
     var typing by remember { mutableStateOf(false) }
     val label = stringResource(R.string.voice_assistant_button)
@@ -36,10 +36,10 @@ fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: Strin
             LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
                 .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
                 .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
-            Text(if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
+            Text(if (locked) stringResource(R.string.cat_locked_hint) else if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
-            AnimatedVisibility(typing, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+            if (!locked) TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
+            AnimatedVisibility(typing && !locked, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                 Column {
                     OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
                         label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)

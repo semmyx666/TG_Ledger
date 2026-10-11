@@ -49,3 +49,8 @@ SMS catch-up, battery restrictions).
 - `BankBackgroundImportTest` (emulator): foreign-app notification -> imported with no UI; repeat ignored.
 - Manual entry has an optional Title field again.
 - Ownership: LICENSE, OwnershipSeal, docs/OWNERSHIP.md, proof/ (OpenTimestamps).
+
+## 3.3.2 check
+- Bank import modes: monobank API (token, MockWebServer-tested client + mapper) and SMS (permission in all flavors, scan button); notifications kept as fallback.
+- Trial auto-starts (14 days); cat always visible (locked without Premium); card/cash required in form and asked by the cat.
+- Unit tests: domain, data (MonobankClientTest), app (VoiceSourceTest) pass; androidTest compiles; CI emulator run pending.

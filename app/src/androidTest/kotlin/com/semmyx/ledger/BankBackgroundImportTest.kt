@@ -40,6 +40,7 @@ class BankBackgroundImportTest {
     @Before fun setUp() {
         repo.enabled = true
         repo.autoImport = true
+        repo.importMode = "NOTIFY"
         repo.setPackage("mono", "com.android.shell")
         shell("cmd notification allow_listener $listener")
         val current = shell("settings get secure enabled_notification_listeners").trim()
@@ -49,7 +50,7 @@ class BankBackgroundImportTest {
         assertTrue("Notification listener did not bind", waitFor(30_000) { repo.diagnostics.value.connected })
     }
 
-    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono") }
+    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono"); repo.importMode = "SMS" }
 
     @Test fun bankPushIsImportedInBackgroundAndRepeatIsIgnored() {
         // No spaces: UiAutomation tokenises the command line without quote handling.

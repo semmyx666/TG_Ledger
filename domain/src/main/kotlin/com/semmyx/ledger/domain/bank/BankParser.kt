@@ -36,7 +36,13 @@ object Banks {
     )
     fun byPackage(value: String): Bank? =
         all.firstOrNull { value in it.packages } ?: all.firstOrNull { bank -> bank.packageHints.any { value.contains(it, ignoreCase = true) } }
-    fun bySender(value: String) = all.firstOrNull { value.trim().lowercase(Locale.ROOT) in it.senders }
+    /** SMS sender ids vary ("PRIVATBANK", "Privat24", "monobank", "SENSE BANK"): exact match, else a name fragment (4+ chars). */
+    fun bySender(value: String): Bank? {
+        val sender = value.trim().lowercase(Locale.ROOT)
+        if (sender.isEmpty()) return null
+        return all.firstOrNull { sender in it.senders }
+            ?: all.firstOrNull { bank -> bank.senders.any { it.length >= 4 && sender.contains(it) } }
+    }
     fun name(id: String?) = all.firstOrNull { it.id == id }?.name ?: id.orEmpty()
 }
 
@@ -63,7 +69,7 @@ object BankParser {
         RegexOption.IGNORE_CASE)
     private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
     private val expense = Regex(
-        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|pokupk|kupivl|platizh)",
+        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
         RegexOption.IGNORE_CASE)
     private val income = Regex(
         "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",

@@ -8,7 +8,7 @@ import com.semmyx.ledger.LedgerApplication
 import com.semmyx.ledger.domain.bank.Banks
 import kotlinx.coroutines.*
 
-/** Included in the legacyV7 sideload manifest only. Reads new messages, never the historical SMS inbox. */
+/** SMS import mode: reads each new bank SMS as it arrives (historical inbox is read by [BankSmsCatchUp]). */
 class BankSmsReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
@@ -17,7 +17,7 @@ class BankSmsReceiver : BroadcastReceiver() {
         val sender = messages.first().originatingAddress.orEmpty()
         val bank = Banks.bySender(sender) ?: return
         val repository = (context.applicationContext as LedgerApplication).container.bankImport
-        if (!repository.enabled) return
+        if (!repository.enabled || repository.importMode != "SMS") return
         val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
         val at = messages.minOf { it.timestampMillis }
         val pending = goAsync()

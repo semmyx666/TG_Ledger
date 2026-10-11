@@ -52,6 +52,7 @@ class BankNotificationListener : NotificationListenerService() {
         // Our own "imported" confirmations must never be re-read as bank messages.
         if (sbn.packageName == packageName) return
         val repository = repository()
+        if (repository.importMode != "NOTIFY") return
         val bank = repository.bankForPackage(sbn.packageName)
         repository.note(
             if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED",

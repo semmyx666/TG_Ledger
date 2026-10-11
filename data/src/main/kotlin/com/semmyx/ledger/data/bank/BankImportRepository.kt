@@ -14,6 +14,9 @@ import java.security.MessageDigest
 import java.time.*
 import java.util.UUID
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -40,7 +43,11 @@ import kotlinx.coroutines.flow.update
  *     so the user can still inspect and accept/reject it.  If auto-import is on,
  *     cross-duplicates are silently ignored to avoid double-counting.
  */
-class BankImportRepository(private val db: LedgerDatabase, context: Context) : BankRepository {
+class BankImportRepository(
+    private val db: LedgerDatabase, context: Context,
+    private val vault: com.semmyx.ledger.data.security.KeystoreVault? = null,
+    private val monobank: MonobankClient = MonobankClient(),
+) : BankRepository {
 
     private val ctx = context.applicationContext
     private val config = ctx.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
@@ -122,28 +129,134 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
         get() = config.getBoolean("auto", true)
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
+    override var importMode: String
+        get() = config.getString("mode", "SMS") ?: "SMS"
+        set(value) { require(value in listOf("API", "SMS", "NOTIFY")); config.edit().putString("mode", value).apply() }
+
+    // -------------------------------------------------------------------------
+    // monobank personal API (token mode)
+    // -------------------------------------------------------------------------
+
+    private val monoState = MutableStateFlow(MonobankStatus(
+        connected = config.getString("mono_accounts", null) != null,
+        lastSyncMillis = config.getLong("mono_last_sync", 0L),
+    ))
+    override val monobankStatus = monoState.asStateFlow()
+    private val syncLock = kotlinx.coroutines.sync.Mutex()
+
+    private fun savedAccounts(): List<MonobankClient.Account> =
+        config.getString("mono_accounts", null)?.split(';')?.mapNotNull { row ->
+            val f = row.split('|')
+            if (f.size < 4) null else MonobankClient.Account(f[0], runCatching { LedgerCurrency.valueOf(f[1]) }.getOrNull() ?: return@mapNotNull null, f[2], f[3].ifBlank { null })
+        }.orEmpty()
+
+    private fun saveAccounts(accounts: List<MonobankClient.Account>) {
+        config.edit().putString("mono_accounts", accounts.joinToString(";") { "${it.id}|${it.currency.name}|${it.type}|${it.cardLast4.orEmpty()}" }).apply()
+    }
+
+    /** Validates the token with monobank, stores it encrypted (Android Keystore) and remembers the accounts. */
+    override suspend fun connectMonobank(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..200 || !clean.all { it.isLetterOrDigit() || it == '-' || it == '_' }) {
+            monoState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val accounts = monobank.accounts(clean)
+            if (accounts.isEmpty()) { monoState.update { it.copy(error = "NO_ACCOUNTS") }; return@withContext false }
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("monoToken", clean); Unit }
+            saveAccounts(accounts)
+            config.edit().remove("mono_last_sync").putString("mode", "API").apply()
+            monoState.value = MonobankStatus(connected = true, accounts = accounts.size)
+            true
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }; false
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(error = "NETWORK") }; false
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            monoState.update { it.copy(error = "NETWORK") }; false
+        }
+    }
+
+    override suspend fun disconnectMonobank() = withContext(Dispatchers.IO) {
+        runCatching { vault?.update { it.remove("monoToken"); Unit } }
+        config.edit().remove("mono_accounts").remove("mono_last_sync").apply()
+        monoState.value = MonobankStatus()
+    }
+
+    /**
+     * Pulls new operations for every saved account. monobank allows one statement request per account
+     * per 60 s, so accounts are fetched one minute apart. Safe to call repeatedly: operations are keyed by id.
+     */
+    override suspend fun syncMonobank(): Int = withContext(Dispatchers.IO) {
+        if (!syncLock.tryLock()) return@withContext 0
+        try {
+            val token = vault?.read { it.optString("monoToken", "") }.orEmpty()
+            val accounts = savedAccounts()
+            if (token.isBlank() || accounts.isEmpty()) { monoState.update { it.copy(connected = false) }; return@withContext 0 }
+            monoState.update { it.copy(syncing = true, error = null) }
+            val nowSec = System.currentTimeMillis() / 1000
+            val last = config.getLong("mono_last_sync", 0L) / 1000
+            val from = if (last > 0) maxOf(last - 3600, nowSec - 31L * 86400) else nowSec - 30L * 86400
+            var imported = 0
+            accounts.take(4).forEachIndexed { index, account ->
+                if (index > 0) kotlinx.coroutines.delay(61_000)
+                val rows = monobank.statement(token, account.id, from, nowSec)
+                rows.sortedBy { it.timeSeconds }.forEach { row ->
+                    val op = MonobankMapper.map(row, account.currency, account.cardLast4) ?: return@forEach
+                    val result = store(op, "MONO:${row.id}", row.timeSeconds * 1000, "API", authoritative = true)
+                    if (result == "AUTO_IMPORTED") imported++
+                }
+            }
+            val now = System.currentTimeMillis()
+            config.edit().putLong("mono_last_sync", now).apply()
+            monoState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null, accounts = accounts.size) }
+            imported
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(syncing = false, error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }
+            0
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } finally { syncLock.unlock() }
+    }
+
     // -------------------------------------------------------------------------
     // Core receive path
     // -------------------------------------------------------------------------
 
+    /** Parses a bank text (push/SMS/pasted) and stores it. Returns the outcome code. */
     suspend fun receive(
         bank: Bank, text: String, eventKey: String, at: Long,
         origin: String, manual: Boolean = false,
-    ) {
-        if (!enabled && !manual) { note("DISABLED"); return }
-        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return }
+    ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
+        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return "UNRECOGNIZED" }
+        return store(parsed, eventKey, at, origin, manual)
+    }
 
+    /**
+     * Stores an already parsed operation. [authoritative] sources (the bank's own API, unique id per
+     * operation) skip the heuristic duplicate checks: the event key alone guarantees "once".
+     */
+    suspend fun store(
+        parsed: ParsedBankOperation, eventKey: String, at: Long, origin: String,
+        manual: Boolean = false, authoritative: Boolean = false,
+    ): String {
         var result = "QUEUED"
         db.withTransaction {
             // --- Tier 1: same-bank re-delivery guard ---
-            val sameBankDup = dao.similar(
+            val sameBankDup = !authoritative && dao.similar(
                 parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
                 parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant,
             ) > 0
 
             // --- Tier 2: cross-source dedup (wallet + bank for the same tap) ---
             // Only applies when the same-bank check didn't already flag it.
-            val crossSourceDup = !sameBankDup && dao.similarCrossSource(
+            val crossSourceDup = !authoritative && !sameBankDup && dao.similarCrossSource(
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
             ) > 0
 
@@ -190,10 +303,11 @@ class BankImportRepository(private val db: LedgerDatabase, context: Context) : B
             if (!manual && autoImport && parsed.confident && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
-                postImportNotification(parsed)
+                if (System.currentTimeMillis() - parsed.happenedAtMillis < 15 * 60_000L) postImportNotification(parsed)
             }
         }
         note(result)
+        return result
     }
 
     // -------------------------------------------------------------------------
