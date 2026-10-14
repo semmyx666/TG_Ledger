@@ -1,0 +1,76 @@
+{
+  "version": "4.3.3",
+  "version_code": 18,
+  "tested_code_commit": "dee52eb4586e3a93fd6e84839515efd214a12aa7",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38592360999",
+  "jobs": [
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:56:22Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:53:48Z"
+    },
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:54:34Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 11907774913,
+      "name": "device-reports-api-26",
+      "size_in_bytes": 152972
+    },
+    {
+      "id": 11909080258,
+      "name": "device-reports-api-36",
+      "size_in_bytes": 156886
+    },
+    {
+      "id": 11908427625,
+      "name": "validation-reports",
+      "size_in_bytes": 222501
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 25,
+    "data_play": 18,
+    "data_legacy_v7": 18
+  },
+  "instrumented": {
+    "api26": {
+      "app": 15,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 15,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "packaging_changes_after_tests": "Documentation, generated source book, manifest and test artifacts only; application code unchanged."
+}

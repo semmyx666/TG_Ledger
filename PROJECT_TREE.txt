@@ -249,6 +249,7 @@ TG_Ledger-4.3.3/
   verification/history/3.3.3/RELEASE_3.3.3.md
   verification/history/3.3.3/release-3.3.3.json
   verification/navigation-recovery.json
+  verification/release-4.3.3.json
   verification/screenshots/README.md
   verification/screenshots/android-26/bank-320dp-font140-uk.png
   verification/screenshots/android-26/category-320dp-font140-uk.png
