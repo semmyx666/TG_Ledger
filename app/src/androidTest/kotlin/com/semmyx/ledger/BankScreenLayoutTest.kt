@@ -40,8 +40,8 @@ class BankScreenLayoutTest {
         owner.put("bank",model)
         var requests = 0
         compose.setContent {
-            val registryOwner = LocalActivityResultRegistryOwner.current
-            val backOwner = LocalOnBackPressedDispatcherOwner.current
+            val registryOwner = requireNotNull(LocalActivityResultRegistryOwner.current)
+            val backOwner = requireNotNull(LocalOnBackPressedDispatcherOwner.current)
             CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner, LocalOnBackPressedDispatcherOwner provides backOwner) {
             LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
             val density = LocalDensity.current
