@@ -371,7 +371,8 @@ fun CompactBalanceSummary(state: DashboardState) {
                 }
             @Composable fun Metric(label: Int, amount: Long, color: Color, tag: String, modifier: Modifier = Modifier) {
                 Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = if (compact) Modifier.heightIn(min = with(LocalDensity.current) { 32.sp.toDp() }) else Modifier)
                     BasicText(formatMoney(amount, state.preferences.currency, state.preferences.language),
                         style = MaterialTheme.typography.titleMedium.copy(color = color),
                         maxLines = 1, autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = 16.sp, stepSize = 1.sp),

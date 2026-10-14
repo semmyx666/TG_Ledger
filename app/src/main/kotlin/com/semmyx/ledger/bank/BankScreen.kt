@@ -254,9 +254,8 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 FilterChip(selected = state.filter.source == null, onClick = { model.source(null) }, label = { Text(stringResource(R.string.all)) })
                 state.sources.forEach { source ->
                     val name = when (source.sourceType) { "CASH" -> stringResource(R.string.bank_cash); "CARD" -> Banks.name(source.bankId); else -> stringResource(R.string.bank_unknown) }
-                    Row(Modifier.fillMaxWidth().clickable { model.source(source.sourceType, source.bankId) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(name, Modifier.weight(1f)); Text(formatMoney(source.totalMinor, currency, language))
-                    }
+                    BankAmountRow(name, formatMoney(source.totalMinor, currency, language),
+                        onClick = { model.source(source.sourceType, source.bankId) })
                 }
                 if (state.filter.period == "MONTH" && budget > 0) {
                     Text(stringResource(R.string.bank_budget_progress, formatMoney(state.sources.sumOf { it.totalMinor }, currency, language), formatMoney(budget, currency, language)))
@@ -267,11 +266,8 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Text(stringResource(R.string.bank_category_stats), style = MaterialTheme.typography.titleMedium)
                 state.categories.forEach { cat ->
                     val color = cat.colorHex?.let { Color(0xFF000000L or it.removePrefix("#").toLong(16)) } ?: palette.category(cat.category, false)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(Modifier.size(22.dp).background(color, CircleShape))
-                        Text(cat.customName ?: stringResource(cat.category.label()), Modifier.weight(1f))
-                        Text(formatMoney(cat.totalMinor, currency, language))
-                    }
+                    BankAmountRow(cat.customName ?: stringResource(cat.category.label()),
+                        formatMoney(cat.totalMinor, currency, language), color, labelTag = "bankCategoryLabel:${cat.category.name}")
                     LinearProgressIndicator(progress = { if (total == 0L) 0f else (cat.totalMinor.toDouble() / total).toFloat() }, modifier = Modifier.fillMaxWidth(), color = color)
                 }
                 TextButton(onClick = { categoryDialog = true }) { Text(stringResource(R.string.bank_new_category)) }

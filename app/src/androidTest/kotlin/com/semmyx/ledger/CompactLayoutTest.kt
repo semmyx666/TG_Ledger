@@ -64,6 +64,28 @@ class CompactLayoutTest {
         assertTrue(layouts.all { it.lineCount <= 2 })
         screenshot("compact-320dp-font170-uk")
     }
+    @Test fun longBankCategoryDoesNotBreakIntoLetterFragments() {
+        val label = "Супермаркети та продукти"
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Column(Modifier.width(320.dp).padding(16.dp)) {
+                    com.semmyx.ledger.bank.BankAmountRow(label,"778,89 ₴", androidx.compose.ui.graphics.Color.Magenta, labelTag="longCategory")
+                }
+            }
+        } } }
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag("longCategory").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertTrue(layouts.isNotEmpty())
+        layouts.forEach { layout ->
+            assertFalse(layout.hasVisualOverflow)
+            for (line in 0 until layout.lineCount-1) {
+                val boundary = layout.getLineEnd(line,visibleEnd=true)
+                assertTrue("Category word split into fragments at $boundary", boundary >= label.length || label[boundary].isWhitespace())
+            }
+        }
+        screenshot("category-320dp-font140-uk")
+    }
     @Test fun normalPhoneUsesThreeCompactMetrics() {
         content(360.dp, 1f)
         val positions = listOf("totalBalance","totalIncome","totalExpenses")
