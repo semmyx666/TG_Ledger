@@ -1,6 +1,7 @@
-TG_Ledger-3.3.3/
+TG_Ledger-4.3.3/
   .github/workflows/android.yml
   .gitignore
+  CHANGELOG.md
   LICENSE
   MANIFEST.sha256
   NOTICE.md
@@ -146,7 +147,7 @@ TG_Ledger-3.3.3/
   data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt
   data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
   docs/ARCHITECTURE.md
-  docs/BANKS_3.3.3_RU.md
+  docs/BANKS_4.3.3_RU.md
   docs/BANK_IMPORT_3_RU.md
   docs/CINEMATIC_REDESIGN_UK.md
   docs/COLORS_2_4.md
@@ -205,7 +206,7 @@ TG_Ledger-3.3.3/
   tools/verify_navigation_recovery.py
   tools/verify_upgrade_sql.py
   tools/verify_voice_regex.py
-  verification/RELEASE_3.3.3.md
+  verification/RELEASE_4.3.3.md
   verification/STATUS.md
   verification/android-build-3.1.log
   verification/android-build-attempt.log
@@ -245,8 +246,9 @@ TG_Ledger-3.3.3/
   verification/device-reports/android-36/data/index.html
   verification/device-reports/android-36/data/js/report.js
   verification/gradle-attempt.txt
+  verification/history/3.3.3/RELEASE_3.3.3.md
+  verification/history/3.3.3/release-3.3.3.json
   verification/navigation-recovery.json
-  verification/release-3.3.3.json
   verification/screenshots/README.md
   verification/screenshots/android-26/bank-320dp-font140-uk.png
   verification/screenshots/android-26/category-320dp-font140-uk.png

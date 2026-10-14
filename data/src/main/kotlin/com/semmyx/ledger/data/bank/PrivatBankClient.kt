@@ -36,7 +36,7 @@ class PrivatBankClient(
                 .addQueryParameter("limit", "100")
             cursor?.let { url.addQueryParameter("followId", it) }
             val request = Request.Builder().url(url.build()).get().header("token", token)
-                .header("User-Agent", "TG-Ledger/3.3.3")
+                .header("User-Agent", "TG-Ledger/4.3.3")
                 .header("Content-Type", "application/json;charset=utf8").header("Accept", "application/json").build()
             val root = http.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw ApiException(response.code)

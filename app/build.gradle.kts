@@ -18,8 +18,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
-        versionName = "3.3.3"
+        versionCode = 18
+        versionName = "4.3.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
