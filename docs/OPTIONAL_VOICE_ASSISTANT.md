@@ -70,7 +70,7 @@ input, entirely as plain JVM unit tests (no Android framework needed, since
 
 ## Relationship to the TG Plus mascot
 
-The premium mascot card (`presentation/premium/PremiumMascotAssistant.kt`) is
+The premium mascot card (`cat/CatAssistantCard.kt`) is
 a **separate, independent feature** that happens to also use Android's
 `TextToSpeech` engine to speak its own greeting. It does not depend on or
 reuse `OptionalVoiceAssistant` — each keeps its own engine instance, so you

@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
@@ -8,6 +9,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Required on Android 13+ (API 33+) to post background import notifications. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Bank SMS import mode (user-selected on the Banks screen). -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
 
     <queries>
         <package android:name="org.telegram.messenger" />
@@ -36,7 +40,7 @@
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.Ledger">
-        <activity android:name=".platform.SupportWebActivity" android:exported="false" />
+        <activity android:name=".support.SupportWebActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Ledger.Starting">
@@ -45,6 +49,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999"><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
+        </receiver>
         <service android:name=".bank.BankNotificationListener" android:label="@string/bank_import_title"
             android:exported="true" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>

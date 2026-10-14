@@ -57,7 +57,11 @@ class PlayPremiumRepository(
     private val cacheTtlMillis = 7L * 24 * 60 * 60 * 1000
 
     init {
-        scope.launch { refreshLocalEntitlements() }
+        scope.launch {
+            refreshLocalEntitlements()
+            // The single 14-day free trial starts by itself on first launch: no button, no card, no renewal.
+            if (trial.value.available) startTrial(TrialPolicy.DAYS)
+        }
         scope.launch {
             // One timer at the actual next entitlement deadline, not one AES/RSA read per minute.
             combine(developerActivation, trial, playExpiry) { dev, test, play ->

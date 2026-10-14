@@ -27,6 +27,16 @@ data class VoiceEntryDraft(
 
 object VoiceEntryParser {
 
+    private val CARD_WORDS = Regex("карт|card|безнал|безготівк", RegexOption.IGNORE_CASE)
+    private val CASH_WORDS = Regex("готівк|наличн|налом|cash", RegexOption.IGNORE_CASE)
+
+    /** "CARD" / "CASH" when the sentence already says how it was paid; null when the cat must ask. */
+    fun detectSource(heard: String): String? {
+        val card = CARD_WORDS.containsMatchIn(heard)
+        val cash = CASH_WORDS.containsMatchIn(heard)
+        return when { card && !cash -> "CARD"; cash && !card -> "CASH"; else -> null }
+    }
+
     fun parse(heard: String): VoiceEntryDraft? {
         val text = heard.trim()
         if (text.isBlank()) return null

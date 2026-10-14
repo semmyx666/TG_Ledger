@@ -12,7 +12,20 @@ data class ImportReview(val id: String, val bankId: String, val amountMinor: Lon
     val transfer: Boolean, val status: String)
 data class ImportDiagnostics(val connected: Boolean = false, val notificationCount: Int = 0, val bankMessageCount: Int = 0,
     val lastCode: String = "WAITING", val lastPackage: String = "", val lastAtMillis: Long = 0)
+/** [error] is a code: BAD_TOKEN, RATE_LIMIT, NETWORK, NO_ACCOUNTS (or null). */
+data class MonobankStatus(val connected: Boolean = false, val syncing: Boolean = false, val lastSyncMillis: Long = 0,
+    val lastImported: Int = 0, val accounts: Int = 0, val error: String? = null)
 interface BankRepository {
+    /** "API" (monobank token), "SMS" or "NOTIFY" (bank app notifications). */
+    var importMode: String
+    val privatStatus: Flow<MonobankStatus>
+    suspend fun connectPrivat(token: String): Boolean
+    suspend fun disconnectPrivat()
+    suspend fun syncPrivat(): Int
+    val monobankStatus: Flow<MonobankStatus>
+    suspend fun connectMonobank(token: String): Boolean
+    suspend fun disconnectMonobank()
+    suspend fun syncMonobank(): Int
     val diagnostics: Flow<ImportDiagnostics>
     fun configuredPackage(bankId: String): String
     fun setPackage(bankId: String, packageName: String)

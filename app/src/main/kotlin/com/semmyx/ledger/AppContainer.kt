@@ -23,7 +23,7 @@ class AppContainer(context: Context, scope: CoroutineScope) {
     val clock: Clock = Clock.systemDefaultZone()
     private val database = LedgerDatabase.create(app)
     private val vault = KeystoreVault(app)
-    val bankImport = com.semmyx.ledger.data.repository.BankImportRepository(database, app)
+    val bankImport = com.semmyx.ledger.data.bank.BankImportRepository(database, app, vault)
     val entries: EntryRepository = RoomEntryRepository(database.ledgerDao(), clock)
     val preferences: PreferencesRepository = DataStorePreferences(app, scope)
     val security: SecurityRepository = KeystoreSecurityRepository(app, vault, clock)

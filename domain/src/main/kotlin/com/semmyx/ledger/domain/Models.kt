@@ -17,7 +17,7 @@ data class UserPreferences(
     val onboardingComplete: Boolean = false,
     val biometricsEnabled: Boolean = false,
     // Gated separately from entitlement: a premium user can still hide the mascot.
-    val premiumAssistantEnabled: Boolean = false,
+    val premiumAssistantEnabled: Boolean = true,
     val mascotSkin: String = "gray",
     val mascotAnimations: Boolean = true,
     val refreshRateHz: Int = 0,

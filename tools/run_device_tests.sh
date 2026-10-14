@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Keep tests and status capture in ONE shell. emulator-runner executes script lines separately.
+set -eu
+collect_screenshots() {
+    mkdir -p verification/device-screenshots
+    adb pull /data/local/tmp/tg-ledger-screenshots/. verification/device-screenshots/ || true
+}
+trap collect_screenshots EXIT
+# A wider physical viewport lets the 360dp test really render at 360dp instead
+# of being silently coerced to the emulator default 320dp width.
+adb shell wm size 480x960
+adb shell wm density 160
+chmod +x gradlew
+./gradlew :bank-fixture:assembleDebug
+adb install -r bank-fixture/build/outputs/apk/debug/bank-fixture-debug.apk
+# API 26 has no runtime POST_NOTIFICATIONS permission.
+adb shell pm grant com.semmyx.ledger.bankfixture android.permission.POST_NOTIFICATIONS || true
+./gradlew :data:connectedPlayDebugAndroidTest :app:connectedPlayDebugAndroidTest --stacktrace

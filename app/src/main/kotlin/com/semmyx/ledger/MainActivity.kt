@@ -17,9 +17,9 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelProvider
 import com.semmyx.ledger.platform.HighRefreshRate
-import com.semmyx.ledger.presentation.AppRoot
-import com.semmyx.ledger.presentation.AppViewModel
-import com.semmyx.ledger.presentation.common.LedgerViewModelFactory
+import com.semmyx.ledger.navigation.AppRoot
+import com.semmyx.ledger.navigation.AppViewModel
+import com.semmyx.ledger.common.LedgerViewModelFactory
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {

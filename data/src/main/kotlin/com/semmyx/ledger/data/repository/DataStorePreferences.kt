@@ -64,7 +64,7 @@ class DataStorePreferences(context: Context, scope: CoroutineScope) : Preference
             language = enumOrDefault(p[Keys.language], defaultLanguage),
             onboardingComplete = p[Keys.onboarded] ?: false,
             biometricsEnabled = p[Keys.biometrics] ?: false,
-            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: false,
+            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: true,
             mascotSkin = p[Keys.skin] ?: "gray",
             mascotAnimations = p[Keys.animations] ?: true,
             refreshRateHz = p[Keys.refreshRate] ?: 0,

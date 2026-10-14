@@ -1,0 +1,59 @@
+{
+  "version": "3.3.3",
+  "version_code": 17,
+  "tested_code_commit": "56f60e981437e389e992d2901b3cf7adbd63cb36",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38578995362",
+  "jobs": [
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:24:14Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:23:49Z"
+    },
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:25:18Z"
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 25,
+    "data_play": 18,
+    "data_legacy_v7": 18
+  },
+  "instrumented": {
+    "api26": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "packaging_changes_after_tests": "Documentation, generated source book, manifest and test artifacts only; application code unchanged."
+}

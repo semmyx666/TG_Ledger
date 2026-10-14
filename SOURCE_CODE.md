@@ -1,9 +1,8 @@
-# TG Ledger 3.2.0 — cat appearance fix — complete file-by-file source
+# TG Ledger 4.3.3 — complete file-by-file source
 
-130 implementation, configuration and test files, included without truncation.
+167 implementation, configuration and test files, without truncation.
 
-The same files are editable at the paths below. Build instructions, architectural notes, visual references and verification limitations are in README.md and docs/.
-
+Generated from tracked files. Local keys and build outputs are excluded.
 
 ## .github/workflows/android.yml
 
@@ -11,6 +10,7 @@ The same files are editable at the paths below. Build instructions, architectura
 name: Android validation
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -24,6 +24,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
@@ -33,6 +35,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: app/build/outputs/apk/*/debug/*.apk
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -54,6 +60,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Enable emulator acceleration
         run: |
@@ -67,34 +75,14 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: chmod +x gradlew && ./gradlew :data:connectedPlayDebugAndroidTest :app:connectedPlayDebugAndroidTest --stacktrace
+          script: bash tools/run_device_tests.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: device-reports-api-${{ matrix.api }}
-          path: '**/build/reports/androidTests/'
-```
-
-## .gitignore
-
-```text
-.gradle/
-.kotlin/
-.idea/
-**/build/
-local.properties
-secrets.properties
-*.jks
-*.keystore
-*.pem
-tools/developer_private_key.pem
-tools/developer_public_key.der
-.DS_Store
-verification/local-*
-gradle/wrapper/gradle-wrapper.jar
-
-__pycache__/
-*.pyc
+          path: |
+            **/build/reports/androidTests/
+            verification/device-screenshots/
 ```
 
 ## app/build.gradle.kts
@@ -120,8 +108,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "3.1.1"
+        versionCode = 18
+        versionName = "4.3.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -165,7 +153,10 @@ tasks.configureEach {
 
 dependencies {
     implementation(project(":domain"))
-    implementation(project(":data")) // Used only by the composition root / platform adapters.
+    implementation(project(":data"))
+    implementation(libs.androidx.appcompat)
+    implementation(libs.material)
+    androidTestImplementation(libs.androidx.espresso.core) // Used only by the composition root / platform adapters.
     val composeBom = platform("androidx.compose:compose-bom:2025.06.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
@@ -195,18 +186,300 @@ dependencies {
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test:core:1.6.1")
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 ```
 
-## app/proguard-rules.pro
+## app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt
 
-```text
-# Retrofit / Gson consumer rules come from the data module and their libraries.
-# Room and Compose ship their own shrinker rules. Do not globally keep the app.
--keepattributes Signature,InnerClasses,EnclosingMethod
+```kotlin
+package com.semmyx.ledger
+
+import android.os.ParcelFileDescriptor
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.semmyx.ledger.bank.BankNotificationListener
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/** Real Android listener + another installed app + Room. No open ledger Activity. API 26 and 36. */
+@RunWith(AndroidJUnit4::class)
+class BankBackgroundImportTest {
+    private val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+    private val repo get() = app.container.bankImport
+    private val automation get() = InstrumentationRegistry.getInstrumentation().uiAutomation
+    private val listener get() = "${app.packageName}/com.semmyx.ledger.bank.BankNotificationListener"
+    private val fixture = "com.semmyx.ledger.bankfixture/.FixtureReceiver"
+    private fun shell(command: String): String = ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(command))
+        .use { it.readBytes().toString(Charsets.UTF_8) }
+    private fun waitFor(timeoutMs: Long = 30_000, check: () -> Boolean): Boolean {
+        val end = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < end) { if (check()) return true; Thread.sleep(250) }
+        return check()
+    }
+    private fun listenerAccess(enabled: Boolean) {
+        shell("cmd notification ${if (enabled) "allow_listener" else "disallow_listener"} $listener")
+        // Android 8 does not implement these cmd notification subcommands. Use the same
+        // secure setting that its notification-access Settings screen writes, via shell.
+        val existing = shell("settings get secure enabled_notification_listeners").trim()
+            .takeUnless { it == "null" }.orEmpty().split(':').filter { it.isNotBlank() }.toMutableSet()
+        if (enabled) existing.add(listener) else existing.remove(listener)
+        if (existing.isEmpty()) shell("settings delete secure enabled_notification_listeners")
+        else shell("settings put secure enabled_notification_listeners ${existing.joinToString(":")}")
+        if (enabled) android.service.notification.NotificationListenerService.requestRebind(android.content.ComponentName(app,BankNotificationListener::class.java))
+    }
+    private fun entries() = runBlocking { repo.exportEntries() }
+    private fun post(id: Int, cents: Int, at: Long, style: String = "big") {
+        val response = shell("am broadcast --receiver-foreground -n $fixture --ei id $id --ei cents $cents --el at $at --es style $style")
+        assertFalse("Fixture failed: $response", response.contains("Exception"))
+    }
+    @Before fun setUp() {
+        assertTrue("Install bank-fixture APK first", shell("pm path com.semmyx.ledger.bankfixture").contains("package:"))
+        repo.enabled = true; repo.autoImport = true; repo.importMode = "NOTIFY"
+        repo.setPackage("mono", "com.semmyx.ledger.bankfixture")
+        runBlocking {
+            repo.clearHistory()
+            entries().filter { it.origin == "PUSH" }.forEach { app.container.entries.delete(it.id) }
+        }
+        shell("am broadcast -n $fixture --ez cancel true")
+        listenerAccess(true)
+        assertTrue("Listener did not bind", waitFor { repo.diagnostics.value.connected })
+    }
+    @After fun tearDown() {
+        shell("am broadcast -n $fixture --ez cancel true")
+        repo.setPackage("mono", "com.ftband.mono"); repo.importMode = "NOTIFY"
+    }
+    @Test fun pushIsImportedWithoutAnActivityAndExactReplayIsIdempotent() {
+        val at = System.currentTimeMillis()
+        post(1, 12550, at)
+        assertTrue("No background import: ${repo.diagnostics.value.lastCode}", waitFor { entries().any { it.amountMinor == 12550L } })
+        val imported = entries().first { it.amountMinor == 12550L }
+        assertEquals(com.semmyx.ledger.domain.EntryType.EXPENSE, imported.type)
+        assertEquals(com.semmyx.ledger.domain.Category.FOOD, imported.category)
+        post(1, 12550, at)
+        Thread.sleep(1500)
+        BankNotificationListener.replayIfConnected()
+        Thread.sleep(1500)
+        assertEquals(1, entries().count { it.amountMinor == 12550L })
+    }
+    @Test fun twoMinuteOldPushIsRecoveredWhenListenerReconnects() {
+        listenerAccess(false)
+        assertTrue("Listener did not disconnect", waitFor { !repo.diagnostics.value.connected })
+        val at = System.currentTimeMillis() - 120_000
+        post(2, 33445, at)
+        Thread.sleep(800)
+        assertFalse(entries().any { it.amountMinor == 33445L })
+        listenerAccess(true)
+        assertTrue("Active notification not replayed: ${repo.diagnostics.value.lastCode}", waitFor { entries().any { it.amountMinor == 33445L } })
+        assertEquals(at, entries().first { it.amountMinor == 33445L }.eventAtMillis)
+    }
+    @Test fun equalAmountSeparatePaymentIsRetainedForReviewInsteadOfDropped() {
+        val at = System.currentTimeMillis()
+        post(10, 77889, at)
+        assertTrue(waitFor { entries().any { it.amountMinor == 77889L } })
+        post(11, 77889, at + 1000)
+        assertTrue(waitFor { runBlocking { repo.reviews().first().any { it.amountMinor == 77889L && it.status == "DUPLICATE_REVIEW" } } })
+        assertEquals(1, entries().count { it.amountMinor == 77889L })
+    }
+    @Test fun inboxStyleContainsTwoSeparatePayments() {
+        post(3, 44556, System.currentTimeMillis(), "inbox")
+        assertTrue(waitFor { entries().any { it.amountMinor == 44556L } && entries().any { it.amountMinor == 1122L } })
+    }
+    @Test fun messagesStyleWorksWithoutSmsOrApiToken() {
+        post(4, 55667, System.currentTimeMillis(), "messaging")
+        assertTrue(waitFor { entries().any { it.amountMinor == 55667L } })
+    }
+    @Test fun switchingBackToPushReplaysWhileListenerIsAlreadyConnected() {
+        repo.importMode = "API"
+        post(5, 66778, System.currentTimeMillis())
+        Thread.sleep(800)
+        assertFalse(entries().any { it.amountMinor == 66778L })
+        repo.importMode = "NOTIFY"
+        assertTrue(BankNotificationListener.replayIfConnected())
+        assertTrue(waitFor { entries().any { it.amountMinor == 66778L } })
+    }
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.compose.foundation.layout.*
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.lifecycle.ViewModelStore
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.bank.*
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.theme.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.File
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class BankScreenLayoutTest {
+    @get:Rule val compose = createComposeRule()
+    private val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+    private val owner = ViewModelStore()
+    @After fun cleanup() { compose.runOnUiThread { owner.clear() } }
+    @Test fun bankPeriodsOpenPremiumAndCompactScreenStaysReadable() {
+        val access = object : PremiumRepository {
+            override val state = MutableStateFlow(PremiumState())
+            override suspend fun refresh() {}
+            override suspend fun activateDeveloperToken(token: String) = false
+            override suspend fun developerInstallationId() = "test"
+            override fun clearIssue() {}
+        }
+        val model = BankViewModel(app.container.bankImport,app.container.preferences,access,app.container.clock)
+        owner.put("bank",model)
+        var requests = 0
+        compose.setContent {
+            val registryOwner = requireNotNull(LocalActivityResultRegistryOwner.current)
+            val backOwner = requireNotNull(LocalOnBackPressedDispatcherOwner.current)
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner, LocalOnBackPressedDispatcherOwner provides backOwner) {
+            LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Box(Modifier.width(320.dp).fillMaxHeight()) {
+                    BankScreen(model,app.container.bankImport, {}, {}, {}, { requests++ })
+                }
+            }
+        } } } }
+        compose.onNodeWithTag("bankPeriod:WEEK").performClick()
+        compose.runOnIdle { assertEquals(1,requests); assertEquals("DAY",model.state.value.filter.period) }
+        compose.onNodeWithTag("bankPeriod:MONTH").performClick()
+        compose.runOnIdle { assertEquals(2,requests) }
+        NativeScreenshots.save(compose.onRoot().captureToImage(),"bank-320dp-font140-uk")
+        compose.onNodeWithTag("bankSetup").performClick()
+        compose.onNodeWithTag("bankList").performScrollToNode(hasText("Push банку (рекомендовано)"))
+        compose.onNodeWithText("Push банку (рекомендовано)").performScrollTo().assertIsDisplayed()
+    }
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.dashboard.*
+import com.semmyx.ledger.settings.RestorePurchasesAction
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.theme.*
+import java.io.File
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class CompactLayoutTest {
+    @get:Rule val compose = createComposeRule()
+    private fun screenshot(name: String) { NativeScreenshots.save(compose.onRoot().captureToImage(),name) }
+    private fun content(width: Dp, fontScale: Float) {
+        compose.setContent {
+            LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density,fontScale)) {
+                    Column(Modifier.width(width).padding(8.dp)) {
+                        CompactBalanceSummary(DashboardState(snapshot = DashboardSnapshot(balance = Balance(250000,123450,2)), loading = false))
+                        RestorePurchasesAction(true) {}
+                    }
+                }
+            } }
+        }
+    }
+    private fun checkTextFits(tag: String) {
+        compose.onNodeWithTag(tag).assertIsDisplayed()
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag(tag, useUnmergedTree = true).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertTrue("Missing text layout: $tag", layouts.isNotEmpty())
+        assertFalse("Text overflow: $tag: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
+        if (tag == "restorePurchases") assertTrue("Restore label squeezed into letters", layouts.all { it.lineCount <= 2 })
+    }
+    @Test fun smallPhoneHasOneBalanceCardAndReadableRestore() {
+        content(288.dp, 1f)
+        compose.onAllNodesWithTag("balanceSummary").assertCountEquals(1)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        // Button merges its text semantics; use the descendant Text to inspect actual line breaks.
+        compose.onNodeWithText("Відновити покупки",useUnmergedTree=true).assertIsDisplayed()
+        screenshot("compact-288dp-uk")
+    }
+    @Test fun enlargedSystemFontRemainsWithinPhoneBounds() {
+        content(320.dp, 1.7f)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithText("Відновити покупки",useUnmergedTree=true)
+            .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertFalse("Restore overflow: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
+        assertTrue(layouts.all { it.lineCount <= 2 })
+        screenshot("compact-320dp-font170-uk")
+    }
+    @Test fun longBankCategoryDoesNotBreakIntoLetterFragments() {
+        val label = "Супермаркети та продукти"
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Column(Modifier.width(320.dp).padding(16.dp)) {
+                    com.semmyx.ledger.bank.BankAmountRow(label,"778,89 ₴", androidx.compose.ui.graphics.Color.Magenta, labelTag="longCategory")
+                }
+            }
+        } } }
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag("longCategory").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertTrue(layouts.isNotEmpty())
+        layouts.forEach { layout ->
+            assertFalse(layout.hasVisualOverflow)
+            for (line in 0 until layout.lineCount-1) {
+                val boundary = layout.getLineEnd(line,visibleEnd=true)
+                assertTrue("Category word split into fragments at $boundary", boundary >= label.length || label[boundary].isWhitespace())
+            }
+        }
+        screenshot("category-320dp-font140-uk")
+    }
+    @Test fun normalPhoneUsesThreeCompactMetrics() {
+        content(360.dp, 1f)
+        val positions = listOf("totalBalance","totalIncome","totalExpenses")
+            .map { compose.onNodeWithTag(it).fetchSemanticsNode().boundsInRoot.left }
+        assertTrue("Expected three horizontal metrics, viewport may be too narrow: $positions",
+            positions[0] < positions[1] && positions[1] < positions[2])
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        screenshot("compact-360dp-uk")
+    }
+}
 ```
 
 ## app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt
@@ -223,11 +496,11 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.semmyx.ledger.domain.AppLanguage
-import com.semmyx.ledger.presentation.auth.AuthState
-import com.semmyx.ledger.presentation.auth.AuthenticationScreen
-import com.semmyx.ledger.presentation.support.SupportSheet
-import com.semmyx.ledger.presentation.theme.LedgerTheme
-import com.semmyx.ledger.presentation.theme.LocalizedContent
+import com.semmyx.ledger.auth.AuthState
+import com.semmyx.ledger.auth.AuthenticationScreen
+import com.semmyx.ledger.support.SupportSheet
+import com.semmyx.ledger.theme.LedgerTheme
+import com.semmyx.ledger.theme.LocalizedContent
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
@@ -280,20 +553,42 @@ class ComposeScreensTest {
         compose.onNodeWithTag("contactTelegram").performClick()
         compose.runOnIdle { assertTrue(contacted) }
     }
+    @Test fun helpShowsMajorReleaseAndExplicitlyKeepsBankApi() {
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            com.semmyx.ledger.support.HelpScreen({}, {})
+        } } }
+        compose.onNodeWithTag("releaseHighlights").assertTextEquals("Що нового у " + BuildConfig.VERSION_NAME)
+        compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API monobank збережено",substring=true)
+        compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API ПриватБанку",substring=true)
+    }
+
 }
 ```
 
-## app/src/legacyV7/AndroidManifest.xml
+## app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt
 
-```xml
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.RECEIVE_SMS" />
-    <application>
-        <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
-            <intent-filter><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
-        </receiver>
-    </application>
-</manifest>
+```kotlin
+package com.semmyx.ledger
+
+import android.os.ParcelFileDescriptor
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
+
+/** Copy out before Gradle uninstalls the test app and deletes its external files. */
+object NativeScreenshots {
+    fun save(bitmap: ImageBitmap, name: String) {
+        val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+        val file = File(app.getExternalFilesDir(null),"screenshots/$name.png").also { it.parentFile!!.mkdirs() }
+        file.outputStream().use { bitmap.asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it) }
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        fun shell(command: String) = ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(command)).use { it.readBytes() }
+        shell("mkdir -p /data/local/tmp/tg-ledger-screenshots")
+        shell("cp ${file.absolutePath} /data/local/tmp/tg-ledger-screenshots/$name.png")
+    }
+}
 ```
 
 ## app/src/main/AndroidManifest.xml
@@ -301,12 +596,19 @@ class ComposeScreensTest {
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="com.android.vending.BILLING" />
     <!-- Only requested at runtime when a TG Plus subscriber taps the voice assistant button. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Required on Android 13+ (API 33+) to post background import notifications. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Bank SMS import mode (user-selected on the Banks screen). -->
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
     <queries>
         <package android:name="org.telegram.messenger" />
         <package android:name="org.telegram.messenger.web" />
@@ -334,7 +636,7 @@ class ComposeScreensTest {
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.Ledger">
-        <activity android:name=".platform.SupportWebActivity" android:exported="false" />
+        <activity android:name=".support.SupportWebActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize"
             android:theme="@style/Theme.Ledger.Starting">
@@ -343,6 +645,9 @@ class ComposeScreensTest {
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <receiver android:name=".bank.BankSmsReceiver" android:exported="true" android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter android:priority="999"><action android:name="android.provider.Telephony.SMS_RECEIVED" /></intent-filter>
+        </receiver>
         <service android:name=".bank.BankNotificationListener" android:label="@string/bank_import_title"
             android:exported="true" android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter><action android:name="android.service.notification.NotificationListenerService" /></intent-filter>
@@ -379,7 +684,7 @@ class AppContainer(context: Context, scope: CoroutineScope) {
     val clock: Clock = Clock.systemDefaultZone()
     private val database = LedgerDatabase.create(app)
     private val vault = KeystoreVault(app)
-    val bankImport = com.semmyx.ledger.data.repository.BankImportRepository(database, app)
+    val bankImport = com.semmyx.ledger.data.bank.BankImportRepository(database, app, vault)
     val entries: EntryRepository = RoomEntryRepository(database.ledgerDao(), clock)
     val preferences: PreferencesRepository = DataStorePreferences(app, scope)
     val security: SecurityRepository = KeystoreSecurityRepository(app, vault, clock)
@@ -417,6 +722,7 @@ package com.semmyx.ledger
 import android.app.Application
 import android.os.Process
 import android.util.Log
+import com.semmyx.ledger.bank.BankImportWorker
 import com.semmyx.ledger.diagnostics.CrashLogger
 import com.semmyx.ledger.platform.RateRefreshWorker
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -437,6 +743,7 @@ class LedgerApplication : Application() {
         // Installed first so it wraps (and runs before) the fatal handler below, saving the
         // stack trace to app-internal storage. Settings -> Support can then show it, since we
         // otherwise have no way to see what actually crashed without adb/logcat access.
+        com.semmyx.ledger.platform.OwnershipSeal.register()
         CrashLogger.install(this)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
@@ -448,6 +755,8 @@ class LedgerApplication : Application() {
             }
         }
         RateRefreshWorker.schedule(this)
+        // Bank import must keep running when the app is closed.
+        BankImportWorker.schedule(this)
     }
 }
 ```
@@ -474,9 +783,9 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.ViewModelProvider
 import com.semmyx.ledger.platform.HighRefreshRate
-import com.semmyx.ledger.presentation.AppRoot
-import com.semmyx.ledger.presentation.AppViewModel
-import com.semmyx.ledger.presentation.common.LedgerViewModelFactory
+import com.semmyx.ledger.navigation.AppRoot
+import com.semmyx.ledger.navigation.AppViewModel
+import com.semmyx.ledger.common.LedgerViewModelFactory
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
@@ -525,966 +834,10 @@ class MainActivity : FragmentActivity() {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt
 
 ```kotlin
-package com.semmyx.ledger.bank
-
-import android.app.Notification
-import android.service.notification.NotificationListenerService
-import android.service.notification.StatusBarNotification
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.domain.bank.Banks
-import kotlinx.coroutines.*
-
-class BankNotificationListener : NotificationListenerService() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    override fun onListenerConnected() { (application as LedgerApplication).container.bankImport.connected(true) }
-    override fun onListenerDisconnected() {
-        (application as LedgerApplication).container.bankImport.connected(false)
-        NotificationListenerService.requestRebind(android.content.ComponentName(this, BankNotificationListener::class.java))
-    }
-    override fun onNotificationPosted(sbn: StatusBarNotification?) {
-        sbn ?: return
-        val repository = (application as LedgerApplication).container.bankImport
-        val bank = repository.bankForPackage(sbn.packageName)
-        repository.note(if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED", sbn.packageName, notification = true, bankMessage = bank != null)
-        bank ?: return
-        val notification = sbn.notification
-        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
-        val extras = notification.extras
-        val body = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
-        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-        val text = "$title\n$body".take(8001)
-        if (body.isBlank()) { repository.note("EMPTY_TEXT"); return }
-        if (!repository.enabled) { repository.note("DISABLED"); return }
-        scope.launch {
-            try {
-                repository.receive(bank, text, "PUSH:${sbn.packageName}:${sbn.key}:${sbn.postTime}:$text", sbn.postTime, "PUSH")
-            } catch (error: CancellationException) { throw error }
-            catch (_: Exception) { repository.note("ERROR"); android.util.Log.w("BankImport", "Local import failed; no message contents logged") }
-        }
-    }
-    override fun onDestroy() { (application as LedgerApplication).container.bankImport.connected(false); scope.cancel(); super.onDestroy() }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt
-
-```kotlin
-package com.semmyx.ledger.bank
-
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.provider.Telephony
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.domain.bank.Banks
-import kotlinx.coroutines.*
-
-/** Included in the legacyV7 sideload manifest only. Reads new messages, never the historical SMS inbox. */
-class BankSmsReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
-        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
-        if (messages.isEmpty()) return
-        val sender = messages.first().originatingAddress.orEmpty()
-        val bank = Banks.bySender(sender) ?: return
-        val repository = (context.applicationContext as LedgerApplication).container.bankImport
-        if (!repository.enabled) return
-        val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
-        val at = messages.minOf { it.timestampMillis }
-        val pending = goAsync()
-        (context.applicationContext as LedgerApplication).applicationScope.launch(Dispatchers.IO) {
-            try { withTimeout(7000) { repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS") } }
-            catch (error: CancellationException) { throw error }
-            catch (_: Exception) { android.util.Log.w("BankImport", "Local SMS import failed; no message contents logged") }
-            finally { pending.finish() }
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt
-
-```kotlin
-package com.semmyx.ledger.diagnostics
-
-import android.content.Context
-import java.io.File
-import java.io.PrintWriter
-import java.io.StringWriter
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-
-/**
- * Persists the most recent uncaught crash to app-internal storage so it survives the process
- * dying, and can be viewed later from Settings -> Support without needing adb/logcat access.
- *
- * Only the exception class name, message, and stack trace (file/line/method names) are stored --
- * never entry titles, PINs, purchase tokens, or other user data, matching the existing logging
- * rule in LedgerApplication.
- */
-object CrashLogger {
-    private const val FILE_NAME = "last_crash.txt"
-
-    /** Wraps the app's existing uncaught-exception handler so every fatal crash is saved first. */
-    fun install(context: Context) {
-        val appContext = context.applicationContext
-        val previous = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            try {
-                writeCrash(appContext, error)
-            } catch (_: Throwable) {
-                // The logger itself must never cause a second crash while handling the first.
-            }
-            previous?.uncaughtException(thread, error)
-        }
-    }
-
-    private fun writeCrash(context: Context, error: Throwable) {
-        val writer = StringWriter()
-        error.printStackTrace(PrintWriter(writer))
-        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
-        val text = "TG Ledger crash - $timestamp\n\n$writer"
-        File(context.filesDir, FILE_NAME).writeText(text)
-    }
-
-    /** Returns the saved crash report, if any, or null when the app hasn't crashed since it was last cleared. */
-    fun readLastCrash(context: Context): String? {
-        val file = File(context.filesDir, FILE_NAME)
-        return if (file.exists()) file.readText() else null
-    }
-
-    fun clear(context: Context) {
-        File(context.filesDir, FILE_NAME).delete()
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import androidx.biometric.BiometricManager
-import androidx.biometric.BiometricPrompt
-import androidx.core.content.ContextCompat
-import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.Lifecycle
-import com.semmyx.ledger.data.security.BiometricKeys
-import java.security.SecureRandom
-
-/** A callback without the crypto object is never sufficient to unlock. */
-class BiometricUnlocker(
-    private val activity: FragmentActivity,
-    private val keys: BiometricKeys,
-) {
-    private var prompt: BiometricPrompt? = null
-    fun authenticate(title: String, subtitle: String, negative: String, success: () -> Unit, failure: () -> Unit) {
-        try {
-            val cipher = keys.authenticationCipher()
-            val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
-            val biometricPrompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity),
-                object : BiometricPrompt.AuthenticationCallback() {
-                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                        try {
-                            val authenticated = requireNotNull(result.cryptoObject?.cipher)
-                            require(authenticated === cipher)
-                            authenticated.doFinal(challenge) // Keystore enforces a fresh strong-biometric auth.
-                            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) success()
-                        } catch (_: Exception) { failure() }
-                        finally { challenge.fill(0) }
-                    }
-                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-                        challenge.fill(0)
-                        if (errorCode != BiometricPrompt.ERROR_USER_CANCELED && errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON && errorCode != BiometricPrompt.ERROR_CANCELED) failure()
-                    }
-                    override fun onAuthenticationFailed() { failure() }
-                })
-            prompt = biometricPrompt
-            val info = BiometricPrompt.PromptInfo.Builder().setTitle(title).setSubtitle(subtitle)
-                .setNegativeButtonText(negative).setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
-                .setConfirmationRequired(true).build()
-            biometricPrompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
-        } catch (_: Exception) {
-            // Invalidated enrollment keys are not recreated at the lock screen; use the PIN.
-            failure()
-        }
-    }
-    fun cancel() { prompt?.cancelAuthentication(); prompt = null }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.app.Activity
-import android.view.Display
-import kotlin.math.abs
-
-object HighRefreshRate {
-    fun supported(display: Display?): Set<Int> {
-        if (display == null) return setOf(60)
-        val current = display.mode
-        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
-        return listOf(60, 90, 120).filter { rate -> modes.any { abs(it.refreshRate - rate) <= 1.1f } }.toSet()
-    }
-    fun request(activity: Activity, requestedHz: Int = 0) {
-        val display = activity.window.decorView.display ?: return
-        val current = display.mode
-        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
-        val exact = modes.filter { requestedHz > 0 && abs(it.refreshRate - requestedHz) <= 1.1f }.firstOrNull()
-        val selected = if (requestedHz == 0) null else (exact
-            ?: modes.filter { it.refreshRate <= requestedHz + 1.1f }.maxByOrNull { it.refreshRate }
-            ?: modes.minByOrNull { it.refreshRate })
-        activity.window.attributes = activity.window.attributes.apply {
-            // Auto releases the override back to Android, rather than forcing the maximum forever.
-            preferredDisplayModeId = selected?.modeId ?: 0
-            preferredRefreshRate = selected?.refreshRate ?: 0f
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.content.Context
-import androidx.work.*
-import com.semmyx.ledger.LedgerApplication
-import java.util.concurrent.TimeUnit
-import kotlinx.coroutines.CancellationException
-
-/** Only public rates are refreshed in the background; personal entries never leave Room. */
-class RateRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
-    override suspend fun doWork(): Result {
-        val container = (applicationContext as LedgerApplication).container
-        return try {
-            container.entries.purgeDeletedBefore(container.clock.millis() - TimeUnit.DAYS.toMillis(1))
-            container.rates.refresh()
-            Result.success()
-        } catch (error: Exception) {
-            if (error is CancellationException) throw error
-            if (runAttemptCount >= 4) Result.failure() else Result.retry()
-        }
-    }
-    companion object {
-        fun schedule(context: Context) {
-            val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).setRequiresBatteryNotLow(true).build()
-            val periodic = PeriodicWorkRequestBuilder<RateRefreshWorker>(24, TimeUnit.HOURS)
-                .setConstraints(constraints).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build()
-            WorkManager.getInstance(context).enqueueUniquePeriodicWork("reference-rates", ExistingPeriodicWorkPolicy.UPDATE, periodic)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/SupportNavigator.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.app.Activity
-import android.content.ActivityNotFoundException
-import android.content.ComponentName
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-
-object SupportNavigator {
-    const val HANDLE = "@semmyxth"
-    const val WEB_URL = "https://t.me/semmyxth"
-    private val officialPackages = listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram")
-
-    fun open(activity: Activity) {
-        if (!openTelegram(activity)) activity.startActivity(Intent(activity, SupportWebActivity::class.java))
-    }
-    fun openTelegram(activity: Activity): Boolean {
-        for (packageName in officialPackages) {
-            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=semmyxth")).setPackage(packageName)
-            @Suppress("DEPRECATION")
-            val resolved = activity.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo
-            if (resolved == null || !resolved.exported || resolved.packageName != packageName) continue
-            intent.component = ComponentName(resolved.packageName, resolved.name) // Explicit, not a hijackable chooser.
-            try {
-                activity.startActivity(intent)
-                return true
-            } catch (_: ActivityNotFoundException) {
-                // App could have been removed between resolution and launch; try the next official client.
-                continue
-            } catch (_: SecurityException) { continue }
-        }
-        return false
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/platform/SupportWebActivity.kt
-
-```kotlin
-package com.semmyx.ledger.platform
-
-import android.annotation.SuppressLint
-import android.os.Bundle
-import android.view.ViewGroup
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.LedgerApplication
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.UserPreferences
-import com.semmyx.ledger.presentation.theme.LedgerTheme
-import com.semmyx.ledger.presentation.theme.LocalizedContent
-
-/** Non-exported HTTPS-only fallback. No JS bridge, file access, SSL bypass, or arbitrary URL input. */
-class SupportWebActivity : ComponentActivity() {
-    @OptIn(ExperimentalMaterial3Api::class)
-    @SuppressLint("SetJavaScriptEnabled")
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
-        setContent {
-            val prefs by (application as LedgerApplication).container.preferences.preferences
-                .collectAsStateWithLifecycle(initialValue = UserPreferences())
-            LocalizedContent(prefs.language) {
-                LedgerTheme(prefs.theme) {
-                    var error by remember { mutableStateOf(false) }
-                    var loading by remember { mutableStateOf(true) }
-                    var webView by remember { mutableStateOf<WebView?>(null) }
-                    BackHandler { if (webView?.canGoBack() == true) webView?.goBack() else finish() }
-                    DisposableEffect(Unit) {
-                        onDispose {
-                            webView?.let { view ->
-                                view.stopLoading()
-                                (view.parent as? ViewGroup)?.removeView(view)
-                                view.destroy()
-                            }
-                            webView = null
-                        }
-                    }
-                    Scaffold(topBar = {
-                        TopAppBar(title = { Text(stringResource(R.string.telegram_support)) }, navigationIcon = {
-                            IconButton(onClick = { finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
-                        })
-                    }) { padding ->
-                        Column(Modifier.fillMaxSize().padding(padding)) {
-                            if (loading && !error) LinearProgressIndicator(Modifier.fillMaxWidth())
-                            if (error) {
-                                Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                                    Text(stringResource(R.string.support_network_error))
-                                    Button(onClick = { error = false; loading = true; webView?.loadUrl(SupportNavigator.WEB_URL) }) {
-                                        Text(stringResource(R.string.retry))
-                                    }
-                                }
-                            }
-                            AndroidView(modifier = Modifier.fillMaxWidth().weight(1f), factory = { context ->
-                                WebView(context).apply {
-                                    settings.javaScriptEnabled = false
-                                    settings.allowFileAccess = false
-                                    settings.allowContentAccess = false
-                                    settings.domStorageEnabled = false
-                                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                                    settings.safeBrowsingEnabled = true
-                                    webViewClient = object : WebViewClient() {
-                                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                                            val uri = request.url
-                                            if (uri.scheme == "tg" && request.hasGesture()) {
-                                                SupportNavigator.openTelegram(this@SupportWebActivity)
-                                                return true
-                                            }
-                                            return uri.scheme != "https" || uri.host != "t.me"
-                                        }
-                                        override fun onPageFinished(view: WebView, url: String) { loading = false }
-                                        override fun onReceivedError(view: WebView, request: WebResourceRequest, failure: WebResourceError) {
-                                            if (request.isForMainFrame) { error = true; loading = false }
-                                        }
-                                    }
-                                    webView = this
-                                    loadUrl(SupportNavigator.WEB_URL)
-                                }
-                            })
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/AppRoot.kt
-
-```kotlin
-package com.semmyx.ledger.presentation
-
-import android.content.Intent
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.LocalActivityResultRegistryOwner
-import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
-import com.semmyx.ledger.presentation.history.*
-import java.time.YearMonth
-import androidx.activity.result.ActivityResultLauncher
-import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.core.view.WindowCompat
-import androidx.fragment.app.FragmentActivity
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.ViewModelStore
-import androidx.lifecycle.ViewModelStoreOwner
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.compose.LifecycleResumeEffect
-import com.semmyx.ledger.platform.HighRefreshRate
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.navigation.NavType
-import androidx.navigation.compose.*
-import androidx.navigation.navArgument
-import com.semmyx.ledger.AppContainer
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.ThemeMode
-import com.semmyx.ledger.platform.BiometricUnlocker
-import com.semmyx.ledger.platform.SupportNavigator
-import com.semmyx.ledger.presentation.auth.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.dashboard.*
-import com.semmyx.ledger.presentation.analytics.*
-import com.semmyx.ledger.presentation.bank.*
-import com.semmyx.ledger.presentation.editor.*
-import com.semmyx.ledger.presentation.onboarding.OnboardingScreen
-import com.semmyx.ledger.presentation.settings.*
-import com.semmyx.ledger.presentation.support.*
-import com.semmyx.ledger.presentation.theme.*
-
-@Composable
-fun AppRoot(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
-    CompositionLocalProvider(LocalActivityResultRegistryOwner provides host, LocalOnBackPressedDispatcherOwner provides host) {
-        AppRootContent(host, model, container)
-    }
-}
-
-@Composable
-private fun AppRootContent(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
-    val state by model.state.collectAsStateWithLifecycle()
-    LifecycleResumeEffect(state.preferences.refreshRateHz) {
-        HighRefreshRate.request(host, state.preferences.refreshRateHz)
-        onPauseOrDispose { }
-    }
-    var supportVisible by remember { mutableStateOf(false) }
-    // Registered unconditionally here, in AppRoot's very first composition (before the PIN
-    // screen even shows), never inside the Dashboard graph. An Activity Result launcher must be
-    // registered before the host Activity passes STARTED; the Dashboard route is only entered
-    // after the user unlocks with their PIN -- long after the Activity is already STARTED -- so
-    // registering it there always throws "LifecycleOwners must call register before they are
-    // STARTED", whether that registration sits inside a lazy list item or at the top of the
-    // screen. Only the *handling* of a result is Dashboard-specific, so that part is supplied
-    // later via a mutable callback the Dashboard route swaps in once it has real data.
-    var onSpeechResult by remember { mutableStateOf<(Intent?) -> Unit>({}) }
-    var onMicPermissionResult by remember { mutableStateOf<(Boolean) -> Unit>({}) }
-    val speechRecognizerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result -> onSpeechResult(result.data) }
-    val micPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> onMicPermissionResult(granted) }
-    LocalizedContent(state.preferences.language) {
-        LedgerTheme(state.preferences.theme, state.preferences.colorOverrides) {
-            val dark = when (state.preferences.theme) {
-                ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false
-            }
-            SideEffect {
-                WindowCompat.getInsetsController(host.window, host.window.decorView).apply {
-                    isAppearanceLightStatusBars = !dark
-                    isAppearanceLightNavigationBars = !dark
-                }
-            }
-            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                // Never cross-fade private content into a lock screen.
-                when {
-                    !state.ready -> LoadingState()
-                    state.failed -> Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                        EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.security_error), stringResource(R.string.retry), model::retry)
-                        TextButton(onClick = { supportVisible = true }) { Text(stringResource(R.string.need_help)) }
-                    }
-                    !state.preferences.onboardingComplete -> OnboardingScreen(model::completeOnboarding)
-                    !state.unlocked -> AuthenticationRoute(host, container, state, onUnlock = {
-                        if (host.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) model.unlock()
-                    }, onSupport = { supportVisible = true })
-                    else -> UnlockedGraph(host, container, state, model::lock, { container.billing.launchPurchase(host) }, { supportVisible = true },
-                        speechRecognizerLauncher, micPermissionLauncher, { onSpeechResult = it }, { onMicPermissionResult = it })
-                }
-                if (supportVisible) SupportSheet(onDismiss = { supportVisible = false }, onContact = {
-                    supportVisible = false
-                    SupportNavigator.open(host)
-                })
-            }
-        }
-    }
-}
-
-@Composable
-private fun AuthenticationRoute(host: FragmentActivity, container: AppContainer, appState: AppState, onUnlock: () -> Unit, onSupport: () -> Unit) {
-    // The auth-attempt owner is disposed on background lock; cancellation wipes PIN buffers.
-    val store = remember(appState.lockEpoch) { ViewModelStore() }
-    val owner = remember(store) { object : ViewModelStoreOwner { override val viewModelStore = store } }
-    DisposableEffect(store) { onDispose { store.clear() } }
-    val model: AuthViewModel = viewModel(viewModelStoreOwner = owner, factory = LedgerViewModelFactory(AuthViewModel::class.java) {
-        AuthViewModel(!appState.hasPin, container.security)
-    })
-    val auth by model.state.collectAsStateWithLifecycle()
-    val unlocker = remember(store, host) { BiometricUnlocker(host, container.biometricKeys) }
-    DisposableEffect(unlocker) { onDispose { unlocker.cancel() } }
-    LaunchedEffect(model) { model.unlocked.collect { onUnlock() } }
-    val title = stringResource(R.string.biometric_title)
-    val subtitle = stringResource(R.string.biometric_subtitle)
-    val negative = stringResource(R.string.use_pin)
-    AuthenticationScreen(auth, appState.preferences.biometricsEnabled && container.biometricAvailable(), model::digit, model::erase,
-        model::startOver, onBiometric = { unlocker.authenticate(title, subtitle, negative, onUnlock, model::biometricFailed) }, onSupport = onSupport)
-}
-
-@Composable
-private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appState: AppState, onLock: () -> Unit, onPurchase: () -> Unit, onSupport: () -> Unit,
-    speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
-    setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit) {
-    val nav = rememberNavController()
-    val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
-    val onNavigate: (Int) -> Unit = { index ->
-        nav.navigate(routes[index]) {
-            popUpTo("dashboard") { saveState = true }
-            launchSingleTop = true
-            restoreState = true
-        }
-    }
-    NavHost(navController = nav, startDestination = "dashboard") {
-        composable("dashboard") {
-            val model: DashboardViewModel = viewModel(factory = LedgerViewModelFactory(DashboardViewModel::class.java) {
-                DashboardViewModel(container.entries, container.preferences, container.premium, container.observeDashboard, container.clock, container.saveEntry)
-            })
-            DashboardRoute(model, host, onNavigate, onAdd = { nav.navigate("entry/new") }, onEdit = { nav.navigate("entry/$it") },
-                speechRecognizerLauncher = speechRecognizerLauncher, micPermissionLauncher = micPermissionLauncher,
-                setOnSpeechResult = setOnSpeechResult, setOnMicPermissionResult = setOnMicPermissionResult)
-        }
-        composable("settings") {
-            val model: SettingsViewModel = viewModel(factory = LedgerViewModelFactory(SettingsViewModel::class.java) {
-                SettingsViewModel(container.preferences, container.premium, container.rates, container::configureBiometrics)
-            })
-            SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
-        }
-        composable("help") { HelpScreen(onNavigate, onSupport) }
-        composable("analytics") {
-            val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
-                AnalyticsViewModel(container.entries, container.preferences, container.clock)
-            })
-            AnalyticsRoute(model, onBack = { onNavigate(0) }, onCurrency = { onNavigate(1) },
-                onEdit = { nav.navigate("entry/$it") },
-                onHistory = { month -> nav.navigate(if (month == null) "history" else "history?month=$month") })
-        }
-        composable("history?month={month}", arguments = listOf(navArgument("month") { type = NavType.StringType; nullable = true; defaultValue = null })) { backStack ->
-            val month = backStack.arguments?.getString("month")?.let { value -> runCatching { YearMonth.parse(value) }.getOrNull() }
-            val historyModel: HistoryViewModel = viewModel(factory = LedgerViewModelFactory(HistoryViewModel::class.java) {
-                HistoryViewModel(container.entries, container.preferences, container.clock, month)
-            })
-            HistoryScreen(historyModel, onBack = { nav.popBackStack() }, onEdit = { nav.navigate("entry/$it") })
-        }
-        composable("banks") {
-            val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
-                BankViewModel(container.bankImport, container.preferences, container.clock)
-            })
-            BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
-                onEdit = { nav.navigate("entry/$it") })
-        }
-        composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
-            val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }
-            val model: EntryViewModel = viewModel(factory = LedgerViewModelFactory(EntryViewModel::class.java) {
-                EntryViewModel(id, container.entries, container.preferences, container.saveEntry, container.clock)
-            })
-            val categories by container.bankImport.categories().collectAsStateWithLifecycle(initialValue = emptyList())
-            EntryRoute(model, appState.preferences.language, onBack = { nav.popBackStack() }, customCategories = categories)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/AppViewModel.kt
-
-```kotlin
-package com.semmyx.ledger.presentation
-
-import androidx.lifecycle.ViewModel
-import com.semmyx.ledger.domain.PreferencesRepository
-import com.semmyx.ledger.domain.SecurityRepository
-import com.semmyx.ledger.domain.UserPreferences
-import com.semmyx.ledger.presentation.common.guarded
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-
-data class AppState(
-    val ready: Boolean = false,
-    val preferences: UserPreferences = UserPreferences(),
-    val hasPin: Boolean = false,
-    val unlocked: Boolean = false,
-    val failed: Boolean = false,
-    val lockEpoch: Long = 0,
-)
-
-class AppViewModel(private val preferences: PreferencesRepository, private val security: SecurityRepository) : ViewModel() {
-    private val mutableState = MutableStateFlow(AppState())
-    val state = mutableState.asStateFlow()
-    private var bootstrap: Job? = null
-    init { retry() }
-
-    fun retry() {
-        bootstrap?.cancel()
-        mutableState.value = AppState()
-        bootstrap = guarded(onError = { mutableState.update { it.copy(ready = true, failed = true, unlocked = false) } }) {
-            val configured = security.hasPin()
-            mutableState.update { it.copy(hasPin = configured) }
-            preferences.preferences.collect { prefs ->
-                mutableState.update { it.copy(ready = true, preferences = prefs, failed = false) }
-            }
-        }
-    }
-    fun completeOnboarding() {
-        guarded(onError = { mutableState.update { it.copy(failed = true) } }) { preferences.completeOnboarding() }
-    }
-    /** Called only by the PIN verifier event or a successful crypto-bound biometric callback. */
-    fun unlock() { mutableState.update { it.copy(unlocked = true, hasPin = true) } }
-    fun lock() { mutableState.update { it.copy(unlocked = false, lockEpoch = it.lockEpoch + 1) } }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/AnalyticsScreen.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
-
-import androidx.activity.compose.BackHandler
-import androidx.compose.animation.*
-import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import java.time.YearMonth
-import java.time.format.DateTimeFormatter
-import java.util.Locale
-import kotlin.math.abs
-
-@Composable
-fun AnalyticsRoute(model: AnalyticsViewModel, onBack: () -> Unit, onCurrency: () -> Unit, onEdit: (String) -> Unit, onHistory: (YearMonth?) -> Unit) {
-    val state by model.state.collectAsStateWithLifecycle()
-    AnalyticsScreen(state, onBack, onCurrency, model::month, model::focus, model::more, model::retry, onEdit, onHistory = { onHistory(state.month) })
-}
-
-@OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
-@Composable
-fun AnalyticsScreen(state: AnalyticsState, onBack: () -> Unit, onCurrency: () -> Unit,
-    onMonth: (YearMonth?) -> Unit, onFocus: (AnalyticsFocus?) -> Unit, onMore: () -> Unit,
-    onRetry: () -> Unit, onEdit: (String) -> Unit, onHistory: () -> Unit) {
-    var monthPicker by remember { mutableStateOf(false) }
-    BackHandler(state.focus != null) { onFocus(null) }
-    val locale = Locale.forLanguageTag(state.preferences.language.tag)
-    val monthLabel = state.month?.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)) ?: stringResource(R.string.all_time)
-    if (monthPicker) {
-        var draft by remember(state.month) { mutableStateOf(state.month ?: YearMonth.now()) }
-        AlertDialog(onDismissRequest = { monthPicker = false }, title = { Text(stringResource(R.string.cinematic_period)) },
-            text = {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text(draft.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)))
-                    Row {
-                        TextButton(onClick = { if (draft > YearMonth.of(2000, 1)) draft = draft.minusMonths(1) }) { Text("‹") }
-                        TextButton(onClick = { if (draft < YearMonth.now()) draft = draft.plusMonths(1) }) { Text("›") }
-                    }
-                    TextButton(onClick = { onMonth(null); monthPicker = false }) { Text(stringResource(R.string.all_time)) }
-                }
-            }, confirmButton = { TextButton(onClick = { onMonth(draft); monthPicker = false }) { Text(stringResource(R.string.cinematic_apply)) } },
-            dismissButton = { TextButton(onClick = { monthPicker = false }) { Text(stringResource(R.string.back)) } })
-    }
-    Surface(color = CinematicTokens.Background, contentColor = MaterialTheme.colorScheme.onSurface, modifier = Modifier.fillMaxSize()) {
-        SharedTransitionLayout(Modifier.fillMaxSize()) {
-            AnimatedContent(targetState = state.focus, label = "categoryHero", transitionSpec = {
-                fadeIn(tween(380)) togetherWith fadeOut(tween(240))
-            }) { focus ->
-                val scope = this
-                if (focus == null) {
-                    LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
-                        verticalArrangement = Arrangement.spacedBy(22.dp)) {
-                        item {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.back)) }
-                                Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.weight(1f)) {
-                                    Row(Modifier.padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                                        TextButton(onClick = onHistory, modifier = Modifier.weight(1f)) { Icon(Icons.Default.History, null); Text(stringResource(R.string.cinematic_history)) }
-                                        Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .15f), modifier = Modifier.weight(1f)) {
-                                            Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.Center) {
-                                                Icon(Icons.Default.BarChart, null, tint = CinematicTokens.Accent)
-                                                Text(stringResource(R.string.analytics_title), color = CinematicTokens.Accent)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                                OutlinedButton(onClick = { monthPicker = true }) { Text(monthLabel); Icon(Icons.Default.CalendarMonth, null) }
-                                OutlinedButton(onClick = onCurrency) { Text(state.preferences.currency.name); Icon(Icons.Default.Payments, null) }
-                            }
-                        }
-                        if (state.loading) item { LoadingState(Modifier.height(200.dp)) }
-                        else if (state.failed) item { EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry) }
-                        else {
-                            item {
-                                CascadeCard(0) {
-                                    Text(stringResource(R.string.cinematic_expenses_period, monthLabel), color = CinematicTokens.Muted)
-                                    Odometer(-state.expenseMinor, state.preferences.currency, state.preferences.language, color = CinematicTokens.Expense)
-                                    state.previousExpenseMinor?.let { previous ->
-                                        val delta = state.expenseMinor - previous
-                                        Text(stringResource(R.string.cinematic_comparison, formatReferenceMoney(abs(delta), state.preferences.currency, state.preferences.language)),
-                                            color = if (delta > 0) CinematicTokens.Expense else CinematicTokens.Income)
-                                        Text(stringResource(if (delta > 0) R.string.cinematic_more_than_previous else R.string.cinematic_less_than_previous), color = CinematicTokens.Muted)
-                                    }
-                                    PremiumBars(state.buckets, state.preferences.currency, state.preferences.language)
-                                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text(stringResource(if (state.month == null) R.string.cinematic_month_average else R.string.cinematic_week_average),
-                                            modifier = Modifier.fillMaxWidth(), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodyMedium)
-                                        Text(formatReferenceMoney(if (state.buckets.isEmpty()) 0 else state.expenseMinor / state.buckets.size,
-                                            state.preferences.currency, state.preferences.language),
-                                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                                            maxLines = 1, softWrap = false, color = CinematicTokens.Expense,
-                                            style = MaterialTheme.typography.headlineSmall)
-                                    }
-                                }
-                            }
-                            listOf(EntryType.EXPENSE, EntryType.INCOME).forEachIndexed { index, type ->
-                                item(key = type) {
-                                    val hero = Modifier.sharedBounds(rememberSharedContentState("focus-$type-all"), scope)
-                                    CascadeCard(index + 1, hero) {
-                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                            Text(stringResource(if (type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(type))
-                                            TextButton(onClick = { onFocus(AnalyticsFocus(type)) }) { Text(stringResource(R.string.cinematic_more), color = CinematicTokens.Accent) }
-                                        }
-                                        val slices = AnalyticsMath.slices(state.totals, type)
-                                        if (slices.isEmpty()) Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted)
-                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                            slices.take(4).forEach { slice ->
-                                                val tint = CinematicTokens.category(slice.category, type == EntryType.INCOME)
-                                                Column(Modifier.weight(1f).sharedBounds(rememberSharedContentState("focus-$type-${slice.category}"), scope)
-                                                    .clickable { onFocus(AnalyticsFocus(type, slice.category)) }, horizontalAlignment = Alignment.CenterHorizontally) {
-                                                    Box(Modifier.size(48.dp).background(tint.copy(alpha = .14f), CircleShape), contentAlignment = Alignment.Center) {
-                                                        Icon(slice.category.icon(), stringResource(slice.category.label()), tint = tint)
-                                                    }
-                                                    Spacer(Modifier.height(6.dp))
-                                                    Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor,
-                                                        state.preferences.currency, state.preferences.language), style = MaterialTheme.typography.labelSmall,
-                                                        color = if (type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
-                                                    Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted,
-                                                        style = MaterialTheme.typography.labelSmall)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    val key = "focus-${focus.type}-${focus.category ?: "all"}"
-                    Surface(Modifier.fillMaxSize().sharedBounds(rememberSharedContentState(key), scope), color = CinematicTokens.Background) {
-                        val slices = AnalyticsMath.slices(state.totals, focus.type)
-                        val selected = slices.find { it.category == focus.category }
-                        val total = slices.sumOf { it.minor }
-                        LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
-                            verticalArrangement = Arrangement.spacedBy(20.dp)) {
-                            item {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    IconButton(onClick = { onFocus(null) }) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
-                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.expenses else R.string.income), style = MaterialTheme.typography.headlineSmall)
-                                }
-                                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Text(stringResource(R.string.reference_total_for, monthLabel), color = CinematicTokens.Muted)
-                                    Odometer(if (focus.type == EntryType.INCOME) total else -total,
-                                        state.preferences.currency, state.preferences.language,
-                                        if (focus.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense, positiveSign = focus.type == EntryType.INCOME)
-                                }
-                                PremiumDonut(slices, focus.type, focus.category, state.preferences.currency, state.preferences.language) { category ->
-                                    onFocus(AnalyticsFocus(focus.type, category))
-                                }
-                            }
-                            item {
-                                CascadeCard(0) {
-                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(focus.type))
-                                    slices.forEachIndexed { index, slice ->
-                                        CategoryRow(slice, focus.type, state) { onFocus(AnalyticsFocus(focus.type, slice.category)) }
-                                        if (index != slices.lastIndex) HorizontalDivider(Modifier.padding(start = 58.dp), color = MaterialTheme.colorScheme.outlineVariant)
-                                    }
-                                }
-                            }
-                            item {
-                                Text(focus.category?.let { stringResource(it.label()) } ?: stringResource(R.string.all_categories), style = MaterialTheme.typography.titleLarge)
-                                Text(stringResource(R.string.cinematic_transactions), color = CinematicTokens.Muted)
-                            }
-                            if (state.transactions.isEmpty()) item { Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted) }
-                            items(state.transactions, key = { it.id }) { entry ->
-                                Surface(shape = RoundedCornerShape(16.dp), color = CinematicTokens.Surface,
-                                    modifier = Modifier.fillMaxWidth().clickable { onEdit(entry.id) }) {
-                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                        Text(entry.title); Text(formatDate(entry.date, state.preferences.language), color = CinematicTokens.Muted)
-                                        Text(formatReferenceMoney(if (entry.type == EntryType.INCOME) entry.amountMinor else -entry.amountMinor,
-                                            entry.currency, state.preferences.language), color = if (entry.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
-                                        if (entry.note.isNotBlank()) Text(entry.note, color = CinematicTokens.Muted)
-                                    }
-                                }
-                            }
-                            if (state.canLoadMore) item { TextButton(onClick = onMore) { Text(stringResource(R.string.load_more)) } }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CategoryRow(slice: CategorySlice, type: EntryType, state: AnalyticsState,
-    modifier: Modifier = Modifier, onClick: () -> Unit) {
-    val color = CinematicTokens.category(slice.category, type == EntryType.INCOME)
-    Row(modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Box(Modifier.size(46.dp).background(color.copy(alpha = .12f), CircleShape), contentAlignment = Alignment.Center) {
-            Icon(slice.category.icon(), null, tint = color)
-        }
-        Column(Modifier.weight(1f)) {
-            Text(stringResource(slice.category.label()))
-            Text(stringResource(R.string.category_transaction_count, slice.count), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
-        }
-        Column(horizontalAlignment = Alignment.End) {
-            Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor, state.preferences.currency, state.preferences.language), color = LocalAppearance.current.type(type))
-            Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/AnalyticsViewModel.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
-
-import androidx.lifecycle.ViewModel
-import androidx.lifecycle.viewModelScope
-import com.semmyx.ledger.domain.*
-import java.time.Clock
-import java.time.LocalDate
-import java.time.YearMonth
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
-
-data class AnalyticsFocus(val type: EntryType, val category: Category? = null)
-data class AnalyticsState(
-    val preferences: UserPreferences = UserPreferences(),
-    val month: YearMonth? = null,
-    val totals: List<CategoryTotal> = emptyList(),
-    val buckets: List<CashBucket> = emptyList(),
-    val previousExpenseMinor: Long? = null,
-    val focus: AnalyticsFocus? = null,
-    val transactions: List<LedgerEntry> = emptyList(),
-    val canLoadMore: Boolean = false,
-    val loading: Boolean = true,
-    val failed: Boolean = false,
-) {
-    val expenseMinor: Long get() = totals.sumOf { it.expenseMinor }
-    val incomeMinor: Long get() = totals.sumOf { it.incomeMinor }
-}
-private data class AnalyticsSpec(val month: YearMonth?, val focus: AnalyticsFocus? = null, val limit: Int = 50, val retry: Int = 0)
-
-@OptIn(ExperimentalCoroutinesApi::class)
-class AnalyticsViewModel(private val repository: EntryRepository, preferences: PreferencesRepository,
-    private val clock: Clock) : ViewModel() {
-    private val spec = MutableStateFlow(AnalyticsSpec(YearMonth.now(clock)))
-    private val today = flow {
-        while (true) {
-            val day = LocalDate.now(clock); emit(day)
-            delay((day.plusDays(1).atStartOfDay(clock.zone).toInstant().toEpochMilli() - clock.millis()).coerceAtLeast(1000))
-        }
-    }
-    val state = combine(preferences.preferences, spec, today) { prefs, request, day -> Triple(prefs, request, day) }
-        .flatMapLatest { (prefs, request, day) ->
-            val from = request.month?.atDay(1) ?: FinanceWindow.EARLIEST
-            val through = minOf(request.month?.atEndOfMonth() ?: day, day)
-            val previous = request.month?.minusMonths(1)
-            // For the current month compare equal elapsed days, not partial month vs full past month.
-            val previousThrough = previous?.let { if (request.month == YearMonth.from(day))
-                it.atDay(day.dayOfMonth.coerceAtMost(it.lengthOfMonth())) else it.atEndOfMonth() }
-            val comparison = if (previous != null && previousThrough != null)
-                repository.observeCategoryTotals(prefs.currency, previous.atDay(1), previousThrough).map { rows -> rows.sumOf { it.expenseMinor } }
-                else flowOf<Long?>(null)
-            val detail = request.focus?.let { focus -> repository.observeEntries(EntryFilter(prefs.currency,
-                type = focus.type, limit = request.limit + 1, category = focus.category, from = from, through = through)) }
-                ?: flowOf(emptyList<LedgerEntry>())
-            combine(repository.observeCategoryTotals(prefs.currency, from, through),
-                repository.observeActivity(prefs.currency, from, through), comparison, detail) { totals, activity, prior, entries ->
-                AnalyticsState(prefs, request.month, totals, AnalyticsMath.buckets(activity, request.month, through), prior,
-                    request.focus, entries.take(request.limit), entries.size > request.limit, loading = false)
-            }.catch { e ->
-                if (e is CancellationException) throw e
-                emit(AnalyticsState(preferences = prefs, month = request.month, focus = request.focus, loading = false, failed = true))
-            }
-        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AnalyticsState(month = YearMonth.now(clock)))
-    fun month(value: YearMonth?) { if (value == null || value in YearMonth.of(2000, 1)..YearMonth.now(clock)) spec.update { it.copy(month = value, limit = 50) } }
-    fun focus(value: AnalyticsFocus?) { spec.update { it.copy(focus = value, limit = 50) } }
-    fun more() { spec.update { it.copy(limit = if (it.limit < Int.MAX_VALUE - 51) it.limit + 50 else Int.MAX_VALUE - 1) } }
-    fun retry() { spec.update { it.copy(retry = it.retry + 1) } }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/analytics/CinematicCharts.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.analytics
+package com.semmyx.ledger.analytics
 
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
@@ -1513,10 +866,10 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import kotlinx.coroutines.delay
 import java.math.BigDecimal
 import java.text.NumberFormat
@@ -1744,17 +1097,319 @@ fun formatReferenceMoney(minor: Long, currency: LedgerCurrency, language: AppLan
 fun percent(basisPoints: Int, language: AppLanguage): String = if (basisPoints == 10000) "100%" else String.format(Locale.forLanguageTag(language.tag), "%.2f%%", basisPoints / 100.0)
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/auth/AuthViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.auth
+package com.semmyx.ledger.analytics
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.*
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.semmyx.ledger.theme.LocalAppearance
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.common.*
+import java.time.YearMonth
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import kotlin.math.abs
+
+@Composable
+fun AnalyticsRoute(model: AnalyticsViewModel, onBack: () -> Unit, onCurrency: () -> Unit, onEdit: (String) -> Unit, onHistory: (YearMonth?) -> Unit) {
+    val state by model.state.collectAsStateWithLifecycle()
+    AnalyticsScreen(state, onBack, onCurrency, model::month, model::focus, model::more, model::retry, onEdit, onHistory = { onHistory(state.month) })
+}
+
+@OptIn(ExperimentalSharedTransitionApi::class, ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+fun AnalyticsScreen(state: AnalyticsState, onBack: () -> Unit, onCurrency: () -> Unit,
+    onMonth: (YearMonth?) -> Unit, onFocus: (AnalyticsFocus?) -> Unit, onMore: () -> Unit,
+    onRetry: () -> Unit, onEdit: (String) -> Unit, onHistory: () -> Unit) {
+    var monthPicker by remember { mutableStateOf(false) }
+    BackHandler(state.focus != null) { onFocus(null) }
+    val locale = Locale.forLanguageTag(state.preferences.language.tag)
+    val monthLabel = state.month?.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)) ?: stringResource(R.string.all_time)
+    if (monthPicker) {
+        var draft by remember(state.month) { mutableStateOf(state.month ?: YearMonth.now()) }
+        AlertDialog(onDismissRequest = { monthPicker = false }, title = { Text(stringResource(R.string.cinematic_period)) },
+            text = {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(draft.format(DateTimeFormatter.ofPattern("LLLL, yyyy", locale)))
+                    Row {
+                        TextButton(onClick = { if (draft > YearMonth.of(2000, 1)) draft = draft.minusMonths(1) }) { Text("‹") }
+                        TextButton(onClick = { if (draft < YearMonth.now()) draft = draft.plusMonths(1) }) { Text("›") }
+                    }
+                    TextButton(onClick = { onMonth(null); monthPicker = false }) { Text(stringResource(R.string.all_time)) }
+                }
+            }, confirmButton = { TextButton(onClick = { onMonth(draft); monthPicker = false }) { Text(stringResource(R.string.cinematic_apply)) } },
+            dismissButton = { TextButton(onClick = { monthPicker = false }) { Text(stringResource(R.string.back)) } })
+    }
+    Surface(color = CinematicTokens.Background, contentColor = MaterialTheme.colorScheme.onSurface, modifier = Modifier.fillMaxSize()) {
+        SharedTransitionLayout(Modifier.fillMaxSize()) {
+            AnimatedContent(targetState = state.focus, label = "categoryHero", transitionSpec = {
+                fadeIn(tween(380)) togetherWith fadeOut(tween(240))
+            }) { focus ->
+                val scope = this
+                if (focus == null) {
+                    LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
+                        verticalArrangement = Arrangement.spacedBy(22.dp)) {
+                        item {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.back)) }
+                                Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.weight(1f)) {
+                                    Row(Modifier.padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        TextButton(onClick = onHistory, modifier = Modifier.weight(1f)) { Icon(Icons.Default.History, null); Text(stringResource(R.string.cinematic_history)) }
+                                        Surface(shape = RoundedCornerShape(100.dp), color = MaterialTheme.colorScheme.primary.copy(alpha = .15f), modifier = Modifier.weight(1f)) {
+                                            Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.Center) {
+                                                Icon(Icons.Default.BarChart, null, tint = CinematicTokens.Accent)
+                                                Text(stringResource(R.string.analytics_title), color = CinematicTokens.Accent)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                OutlinedButton(onClick = { monthPicker = true }) { Text(monthLabel); Icon(Icons.Default.CalendarMonth, null) }
+                                OutlinedButton(onClick = onCurrency) { Text(state.preferences.currency.name); Icon(Icons.Default.Payments, null) }
+                            }
+                        }
+                        if (state.loading) item { LoadingState(Modifier.height(200.dp)) }
+                        else if (state.failed) item { EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry) }
+                        else {
+                            item {
+                                CascadeCard(0) {
+                                    Text(stringResource(R.string.cinematic_expenses_period, monthLabel), color = CinematicTokens.Muted)
+                                    Odometer(-state.expenseMinor, state.preferences.currency, state.preferences.language, color = CinematicTokens.Expense)
+                                    state.previousExpenseMinor?.let { previous ->
+                                        val delta = state.expenseMinor - previous
+                                        Text(stringResource(R.string.cinematic_comparison, formatReferenceMoney(abs(delta), state.preferences.currency, state.preferences.language)),
+                                            color = if (delta > 0) CinematicTokens.Expense else CinematicTokens.Income)
+                                        Text(stringResource(if (delta > 0) R.string.cinematic_more_than_previous else R.string.cinematic_less_than_previous), color = CinematicTokens.Muted)
+                                    }
+                                    PremiumBars(state.buckets, state.preferences.currency, state.preferences.language)
+                                    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(stringResource(if (state.month == null) R.string.cinematic_month_average else R.string.cinematic_week_average),
+                                            modifier = Modifier.fillMaxWidth(), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodyMedium)
+                                        Text(formatReferenceMoney(if (state.buckets.isEmpty()) 0 else state.expenseMinor / state.buckets.size,
+                                            state.preferences.currency, state.preferences.language),
+                                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                            maxLines = 1, softWrap = false, color = CinematicTokens.Expense,
+                                            style = MaterialTheme.typography.headlineSmall)
+                                    }
+                                }
+                            }
+                            listOf(EntryType.EXPENSE, EntryType.INCOME).forEachIndexed { index, type ->
+                                item(key = type) {
+                                    val hero = Modifier.sharedBounds(rememberSharedContentState("focus-$type-all"), scope)
+                                    CascadeCard(index + 1, hero) {
+                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                            Text(stringResource(if (type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(type))
+                                            TextButton(onClick = { onFocus(AnalyticsFocus(type)) }) { Text(stringResource(R.string.cinematic_more), color = CinematicTokens.Accent) }
+                                        }
+                                        val slices = AnalyticsMath.slices(state.totals, type)
+                                        if (slices.isEmpty()) Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted)
+                                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            slices.take(4).forEach { slice ->
+                                                val tint = CinematicTokens.category(slice.category, type == EntryType.INCOME)
+                                                Column(Modifier.weight(1f).sharedBounds(rememberSharedContentState("focus-$type-${slice.category}"), scope)
+                                                    .clickable { onFocus(AnalyticsFocus(type, slice.category)) }, horizontalAlignment = Alignment.CenterHorizontally) {
+                                                    Box(Modifier.size(48.dp).background(tint.copy(alpha = .14f), CircleShape), contentAlignment = Alignment.Center) {
+                                                        Icon(slice.category.icon(), stringResource(slice.category.label()), tint = tint)
+                                                    }
+                                                    Spacer(Modifier.height(6.dp))
+                                                    Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor,
+                                                        state.preferences.currency, state.preferences.language), style = MaterialTheme.typography.labelSmall,
+                                                        color = if (type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
+                                                    Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted,
+                                                        style = MaterialTheme.typography.labelSmall)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    val key = "focus-${focus.type}-${focus.category ?: "all"}"
+                    Surface(Modifier.fillMaxSize().sharedBounds(rememberSharedContentState(key), scope), color = CinematicTokens.Background) {
+                        val slices = AnalyticsMath.slices(state.totals, focus.type)
+                        val selected = slices.find { it.category == focus.category }
+                        val total = slices.sumOf { it.minor }
+                        LazyColumn(Modifier.fillMaxSize().safeDrawingPadding(), contentPadding = PaddingValues(18.dp),
+                            verticalArrangement = Arrangement.spacedBy(20.dp)) {
+                            item {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    IconButton(onClick = { onFocus(null) }) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
+                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.expenses else R.string.income), style = MaterialTheme.typography.headlineSmall)
+                                }
+                                Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(stringResource(R.string.reference_total_for, monthLabel), color = CinematicTokens.Muted)
+                                    Odometer(if (focus.type == EntryType.INCOME) total else -total,
+                                        state.preferences.currency, state.preferences.language,
+                                        if (focus.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense, positiveSign = focus.type == EntryType.INCOME)
+                                }
+                                PremiumDonut(slices, focus.type, focus.category, state.preferences.currency, state.preferences.language) { category ->
+                                    onFocus(AnalyticsFocus(focus.type, category))
+                                }
+                            }
+                            item {
+                                CascadeCard(0) {
+                                    Text(stringResource(if (focus.type == EntryType.EXPENSE) R.string.cinematic_expense_categories else R.string.cinematic_income_categories), color = LocalAppearance.current.type(focus.type))
+                                    slices.forEachIndexed { index, slice ->
+                                        CategoryRow(slice, focus.type, state) { onFocus(AnalyticsFocus(focus.type, slice.category)) }
+                                        if (index != slices.lastIndex) HorizontalDivider(Modifier.padding(start = 58.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                                    }
+                                }
+                            }
+                            item {
+                                Text(focus.category?.let { stringResource(it.label()) } ?: stringResource(R.string.all_categories), style = MaterialTheme.typography.titleLarge)
+                                Text(stringResource(R.string.cinematic_transactions), color = CinematicTokens.Muted)
+                            }
+                            if (state.transactions.isEmpty()) item { Text(stringResource(R.string.category_empty), color = CinematicTokens.Muted) }
+                            items(state.transactions, key = { it.id }) { entry ->
+                                Surface(shape = RoundedCornerShape(16.dp), color = CinematicTokens.Surface,
+                                    modifier = Modifier.fillMaxWidth().clickable { onEdit(entry.id) }) {
+                                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text(entry.title); Text(formatDate(entry.date, state.preferences.language), color = CinematicTokens.Muted)
+                                        Text(formatReferenceMoney(if (entry.type == EntryType.INCOME) entry.amountMinor else -entry.amountMinor,
+                                            entry.currency, state.preferences.language), color = if (entry.type == EntryType.INCOME) CinematicTokens.Income else CinematicTokens.Expense)
+                                        if (entry.note.isNotBlank()) Text(entry.note, color = CinematicTokens.Muted)
+                                    }
+                                }
+                            }
+                            if (state.canLoadMore) item { TextButton(onClick = onMore) { Text(stringResource(R.string.load_more)) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CategoryRow(slice: CategorySlice, type: EntryType, state: AnalyticsState,
+    modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val color = CinematicTokens.category(slice.category, type == EntryType.INCOME)
+    Row(modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Box(Modifier.size(46.dp).background(color.copy(alpha = .12f), CircleShape), contentAlignment = Alignment.Center) {
+            Icon(slice.category.icon(), null, tint = color)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(stringResource(slice.category.label()))
+            Text(stringResource(R.string.category_transaction_count, slice.count), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
+        }
+        Column(horizontalAlignment = Alignment.End) {
+            Text(formatReferenceMoney(if (type == EntryType.INCOME) slice.minor else -slice.minor, state.preferences.currency, state.preferences.language), color = LocalAppearance.current.type(type))
+            Text(percent(slice.basisPoints, state.preferences.language), color = CinematicTokens.Muted, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.analytics
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.semmyx.ledger.domain.*
+import java.time.Clock
+import java.time.LocalDate
+import java.time.YearMonth
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+
+data class AnalyticsFocus(val type: EntryType, val category: Category? = null)
+data class AnalyticsState(
+    val preferences: UserPreferences = UserPreferences(),
+    val month: YearMonth? = null,
+    val totals: List<CategoryTotal> = emptyList(),
+    val buckets: List<CashBucket> = emptyList(),
+    val previousExpenseMinor: Long? = null,
+    val focus: AnalyticsFocus? = null,
+    val transactions: List<LedgerEntry> = emptyList(),
+    val canLoadMore: Boolean = false,
+    val loading: Boolean = true,
+    val failed: Boolean = false,
+) {
+    val expenseMinor: Long get() = totals.sumOf { it.expenseMinor }
+    val incomeMinor: Long get() = totals.sumOf { it.incomeMinor }
+}
+private data class AnalyticsSpec(val month: YearMonth?, val focus: AnalyticsFocus? = null, val limit: Int = 50, val retry: Int = 0)
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class AnalyticsViewModel(private val repository: EntryRepository, preferences: PreferencesRepository,
+    private val clock: Clock) : ViewModel() {
+    private val spec = MutableStateFlow(AnalyticsSpec(YearMonth.now(clock)))
+    private val today = flow {
+        while (true) {
+            val day = LocalDate.now(clock); emit(day)
+            delay((day.plusDays(1).atStartOfDay(clock.zone).toInstant().toEpochMilli() - clock.millis()).coerceAtLeast(1000))
+        }
+    }
+    val state = combine(preferences.preferences, spec, today) { prefs, request, day -> Triple(prefs, request, day) }
+        .flatMapLatest { (prefs, request, day) ->
+            val from = request.month?.atDay(1) ?: FinanceWindow.EARLIEST
+            val through = minOf(request.month?.atEndOfMonth() ?: day, day)
+            val previous = request.month?.minusMonths(1)
+            // For the current month compare equal elapsed days, not partial month vs full past month.
+            val previousThrough = previous?.let { if (request.month == YearMonth.from(day))
+                it.atDay(day.dayOfMonth.coerceAtMost(it.lengthOfMonth())) else it.atEndOfMonth() }
+            val comparison = if (previous != null && previousThrough != null)
+                repository.observeCategoryTotals(prefs.currency, previous.atDay(1), previousThrough).map { rows -> rows.sumOf { it.expenseMinor } }
+                else flowOf<Long?>(null)
+            val detail = request.focus?.let { focus -> repository.observeEntries(EntryFilter(prefs.currency,
+                type = focus.type, limit = request.limit + 1, category = focus.category, from = from, through = through)) }
+                ?: flowOf(emptyList<LedgerEntry>())
+            combine(repository.observeCategoryTotals(prefs.currency, from, through),
+                repository.observeActivity(prefs.currency, from, through), comparison, detail) { totals, activity, prior, entries ->
+                AnalyticsState(prefs, request.month, totals, AnalyticsMath.buckets(activity, request.month, through), prior,
+                    request.focus, entries.take(request.limit), entries.size > request.limit, loading = false)
+            }.catch { e ->
+                if (e is CancellationException) throw e
+                emit(AnalyticsState(preferences = prefs, month = request.month, focus = request.focus, loading = false, failed = true))
+            }
+        }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AnalyticsState(month = YearMonth.now(clock)))
+    fun month(value: YearMonth?) { if (value == null || value in YearMonth.of(2000, 1)..YearMonth.now(clock)) spec.update { it.copy(month = value, limit = 50) } }
+    fun focus(value: AnalyticsFocus?) { spec.update { it.copy(focus = value, limit = 50) } }
+    fun more() { spec.update { it.copy(limit = if (it.limit < Int.MAX_VALUE - 51) it.limit + 50 else Int.MAX_VALUE - 1) } }
+    fun retry() { spec.update { it.copy(retry = it.retry + 1) } }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.auth
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.PinPolicy
 import com.semmyx.ledger.domain.PinResult
 import com.semmyx.ledger.domain.SecurityRepository
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.guarded
 import java.security.MessageDigest
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -1863,10 +1518,10 @@ class AuthViewModel(setup: Boolean, private val security: SecurityRepository) : 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/auth/AuthenticationScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.auth
+package com.semmyx.ledger.auth
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -1911,7 +1566,7 @@ fun AuthenticationScreen(
         Text(stringResource(heading), style = MaterialTheme.typography.headlineMedium)
         Text(stringResource(if (state.setup) R.string.pin_setup_subtitle else R.string.pin_unlock_subtitle),
             color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-        Row(Modifier.padding(vertical = 8.dp).clearAndSetSemantics { contentDescription = description }.testTag("pinDots"),
+        Row(Modifier.padding(vertical = 8.dp).testTag("pinDots").clearAndSetSemantics { contentDescription = description },
             horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             repeat(6) { index ->
                 Box(Modifier.size(16.dp).clip(CircleShape).background(if (index < state.digits) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface)
@@ -1966,10 +1621,291 @@ private fun PinKey(value: Int, enabled: Boolean, onClick: () -> Unit, modifier: 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/bank/BankScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.bank
+package com.semmyx.ledger.bank
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+
+/** Never let a right-hand amount squeeze the bank/category name into a few letters. */
+@Composable
+fun BankAmountRow(label: String, amount: String, color: Color? = null,
+    onClick: (() -> Unit)? = null, labelTag: String = "") {
+    val labelStyle = MaterialTheme.typography.bodyMedium
+    val amountStyle = MaterialTheme.typography.titleSmall
+    val measurer = rememberTextMeasurer()
+    BoxWithConstraints(Modifier.fillMaxWidth().then(if (onClick == null) Modifier else Modifier.clickable(onClick = onClick)).padding(vertical = 4.dp)) {
+        val available = with(LocalDensity.current) { maxWidth.toPx() }
+        val desired = measurer.measure(label, style = labelStyle, softWrap = false).size.width +
+            measurer.measure(amount, style = amountStyle, softWrap = false).size.width +
+            with(LocalDensity.current) { (if (color == null) 12.dp else 44.dp).toPx() }
+        @Composable fun Label(modifier: Modifier) {
+            Text(label, modifier.testTag(labelTag), style = labelStyle)
+        }
+        @Composable fun Dot() { color?.let { Box(Modifier.size(18.dp).background(it,CircleShape)) } }
+        if (desired > available) Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Dot(); Label(Modifier.weight(1f))
+            }
+            Text(amount, modifier = Modifier.fillMaxWidth(), style = amountStyle)
+        } else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Dot(); Label(Modifier.weight(1f)); Text(amount, style = amountStyle)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.content.ComponentName
+import android.content.Context
+import android.service.notification.NotificationListenerService
+import androidx.core.app.NotificationManagerCompat
+import androidx.work.*
+import com.semmyx.ledger.LedgerApplication
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+
+/**
+ * Keeps bank import alive without the app being open:
+ *  - re-binds the notification listener if the system dropped it (its start-up replays pending notifications),
+ *  - API mode: pulls new operations from monobank; SMS mode: imports bank SMS received while the app was closed.
+ * Runs every 15 minutes, after reboot, and once whenever the app process starts.
+ */
+class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        return try {
+            val repository = (applicationContext as LedgerApplication).container.bankImport
+            if (!repository.enabled) return Result.success()
+            when (repository.importMode) {
+                "API" -> { repository.syncMonobank(); repository.syncPrivat() }
+                "SMS" -> BankSmsCatchUp.run(applicationContext, repository)
+                else -> if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
+                    ensureListenerBound(applicationContext, repository)
+                }
+            }
+            Result.success()
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            Result.retry()
+        }
+    }
+
+    companion object {
+        /**
+         * The system sometimes leaves a notification listener unbound after an app update, a crash or aggressive
+         * battery management. First ask politely; if it is still not connected, toggle the component, which makes
+         * Android bind it again (and it then replays the notifications still in the shade).
+         */
+        suspend fun ensureListenerBound(context: Context, repository: com.semmyx.ledger.data.bank.BankImportRepository) {
+            if (repository.diagnostics.value.connected && BankNotificationListener.replayIfConnected()) return
+            val component = ComponentName(context, BankNotificationListener::class.java)
+            runCatching { NotificationListenerService.requestRebind(component) }
+            kotlinx.coroutines.delay(3_000)
+            if (repository.diagnostics.value.connected) return
+            val pm = context.packageManager
+            runCatching {
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+                pm.setComponentEnabledSetting(component, android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED, android.content.pm.PackageManager.DONT_KILL_APP)
+            }
+        }
+
+        /** Runs one import pass right now (after switching mode, connecting, or pressing "Sync now"). */
+        fun runNow(context: Context) {
+            WorkManager.getInstance(context).enqueueUniqueWork("bank-import-now", ExistingWorkPolicy.REPLACE,
+                OneTimeWorkRequestBuilder<BankImportWorker>().build())
+        }
+
+        fun schedule(context: Context) {
+            val work = WorkManager.getInstance(context)
+            work.enqueueUniquePeriodicWork("bank-import-keepalive", ExistingPeriodicWorkPolicy.UPDATE,
+                PeriodicWorkRequestBuilder<BankImportWorker>(15, TimeUnit.MINUTES).build())
+            work.enqueueUniqueWork("bank-import-now", ExistingWorkPolicy.KEEP, OneTimeWorkRequestBuilder<BankImportWorker>().build())
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.app.Notification
+import androidx.core.app.NotificationCompat
+import com.semmyx.ledger.domain.bank.Bank
+import com.semmyx.ledger.domain.bank.BankParser
+
+/** No network, no raw message persistence. Handles plain, big, inbox and messaging styles. */
+object BankNotificationDecoder {
+    data class Message(val text: String, val at: Long)
+
+    fun messages(notification: Notification, bank: Bank, postedAt: Long): List<Message> {
+        val extras = notification.extras ?: return emptyList()
+        // Some apps re-post an old notification. Preserve its original event time when valid.
+        val at = notification.`when`.takeIf { it in 1..(postedAt + 300_000) } ?: postedAt
+        val title = (extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
+            ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString()?.trim().orEmpty()
+        val messaging = runCatching { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)?.messages }.getOrNull().orEmpty()
+        if (messaging.isNotEmpty()) return messaging.mapNotNull { message ->
+            val text = message.text?.toString()?.trim().orEmpty()
+            if (text.isEmpty()) null else Message("$title\n$text", message.timestamp.takeIf { it in 1..(postedAt + 300_000) } ?: at)
+        }.distinct()
+        val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES).orEmpty()
+            .map { it.toString().trim() }.filter { it.isNotEmpty() }
+        // Inbox style can contain several independent payments. Do not merge their amounts.
+        val payments = lines.map { Message("$title\n$it", at) }
+            .filter { BankParser.parse(bank, it.text, it.at) != null }
+        if (payments.isNotEmpty()) return payments.distinct()
+        val parts = linkedSetOf<String>()
+        fun add(value: CharSequence?) { value?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(parts::add) }
+        add(title)
+        add(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_TEXT))
+        lines.forEach(::add)
+        add(extras.getCharSequence(Notification.EXTRA_SUB_TEXT))
+        if (parts.size < 2) add(notification.tickerText)
+        val text = parts.filter { part -> parts.none { other -> other.length > part.length && other.contains(part) } }
+            .joinToString("\n")
+        return if (text.isBlank()) emptyList() else listOf(Message(text, at))
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.app.Notification
+import android.content.ComponentName
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+import com.semmyx.ledger.LedgerApplication
+import kotlinx.coroutines.*
+
+/**
+ * Reads bank / wallet notifications in the background, with no Activity needed.
+ *
+ * Imports are written straight to the database by [com.semmyx.ledger.data.bank.BankImportRepository];
+ * the same notification delivered twice (live + replay) is ignored by its event key, and one card tap
+ * reported by two apps (e.g. Google Pay + PrivatBank) is collapsed by cross-source deduplication.
+ *
+ * Catch-up: every time the system (re)binds this service we replay the notifications that are still
+ * in the shade, so anything that arrived while the service was dead, the phone rebooted or the app
+ * process was killed is still recorded. Force-stop requires opening the app again; dismissed
+ * notifications are not recoverable through this Android API.
+ */
+class BankNotificationListener : NotificationListenerService() {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private fun repository() = (application as LedgerApplication).container.bankImport
+
+    override fun onListenerConnected() {
+        current = java.lang.ref.WeakReference(this)
+        try {
+            repository().connected(true)
+            replayActive()
+        } catch (e: Exception) {
+            android.util.Log.w("BankImport", "Catch-up failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    override fun onListenerDisconnected() {
+        runCatching { repository().connected(false) }
+        // Ask for an immediate rebind instead of waiting for the OS back-off timer.
+        runCatching { requestRebind(ComponentName(this, BankNotificationListener::class.java)) }
+    }
+
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        sbn ?: return
+        try { handle(sbn) } catch (e: Exception) {
+            // A failure here must never crash the process: that would stop all background import.
+            android.util.Log.w("BankImport", "Notification handling failed: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun handle(sbn: StatusBarNotification) {
+        // Our own "imported" confirmations must never be re-read as bank messages.
+        if (sbn.packageName == packageName) return
+        val repository = repository()
+        if (repository.importMode != "NOTIFY") return
+        val bank = repository.bankForPackage(sbn.packageName)
+        repository.note(
+            if (bank == null) "UNSUPPORTED_APP" else "BANK_RECEIVED",
+            sbn.packageName, notification = true, bankMessage = bank != null,
+        )
+        bank ?: return
+
+        val notification = sbn.notification
+        // Group summaries carry no transaction data.
+        if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
+
+        val messages = BankNotificationDecoder.messages(notification, bank, sbn.postTime)
+        if (messages.isEmpty()) { repository.note("EMPTY_TEXT"); return }
+        if (!repository.enabled) { repository.note("DISABLED"); return }
+        scope.launch {
+            // Finish a started database import if Android tears down the listener mid-write.
+            withContext(NonCancellable) {
+                messages.forEach { message ->
+                    try {
+                        repository.receive(bank, message.text,
+                            eventKey = "PUSH:${sbn.packageName}:${sbn.key}:${message.at}:${message.text}",
+                            at = message.at, origin = "PUSH")
+                    } catch (_: Exception) {
+                        repository.note("ERROR")
+                        android.util.Log.w("BankImport", "Background import failed; no message contents logged")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun replayActive() {
+        runCatching { activeNotifications?.sortedBy { it.postTime }?.forEach(::handle) }
+            .onFailure { repository().note("ERROR") }
+    }
+
+    companion object {
+        @Volatile private var current = java.lang.ref.WeakReference<BankNotificationListener>(null)
+        /** Also used when switching into push mode while the listener is already bound. */
+        fun replayIfConnected(): Boolean {
+            val listener = current.get() ?: return false
+            listener.replayActive()
+            return true
+        }
+    }
+
+    override fun onDestroy() {
+        if (current.get() === this) current.clear()
+        runCatching { repository().connected(false) }
+        scope.cancel()
+        super.onDestroy()
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt
+
+```kotlin
+package com.semmyx.ledger.bank
 
 import android.Manifest
 import android.content.Intent
@@ -1993,8 +1929,10 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -2004,8 +1942,8 @@ import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
 import com.semmyx.ledger.domain.bank.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
 import kotlinx.coroutines.*
 import java.time.Instant
 import java.time.ZoneId
@@ -2014,7 +1952,7 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit, onPremium: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val reviews by model.reviews.collectAsStateWithLifecycle()
@@ -2023,10 +1961,14 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val automatic by model.auto.collectAsStateWithLifecycle()
     val failed by model.error.collectAsStateWithLifecycle()
     val revision by model.revision.collectAsStateWithLifecycle()
+    val mode by model.mode.collectAsStateWithLifecycle()
+    val mono by model.mono.collectAsStateWithLifecycle()
+    val privat by model.privat.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val palette = LocalAppearance.current
     var notificationAccess by remember { mutableStateOf(false) }
+    var confirmationAccess by remember { mutableStateOf(false) }
     var smsAccess by remember { mutableStateOf(false) }
     var exportFailed by remember { mutableStateOf(false) }
     var pasteDialog by remember { mutableStateOf(false) }
@@ -2034,12 +1976,23 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     var categoryDialog by remember { mutableStateOf(false) }
     var privacy by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
+    var token by remember { mutableStateOf("") }
+    var privatToken by remember { mutableStateOf("") }
+    var connectingPrivat by remember { mutableStateOf(false) }
+    var connecting by remember { mutableStateOf(false) }
+    var smsScan by remember { mutableStateOf<BankSmsCatchUp.Result?>(null) }
+    var scanning by remember { mutableStateOf(false) }
+    var setupExpanded by remember { mutableStateOf(false) }
     
     fun openSettings(action: String, data: Uri? = null) {
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { exportFailed = true }
     }
-    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { smsAccess = it }
+    val confirmationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { confirmationAccess = it }
+    val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
+        smsAccess = result[Manifest.permission.RECEIVE_SMS] == true
+        if (smsAccess) BankImportWorker.schedule(context)
+    }
     val export = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("text/csv")) { uri: Uri? ->
         if (uri != null) scope.launch {
             try { withContext(Dispatchers.IO) {
@@ -2059,7 +2012,9 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     }
     LifecycleResumeEffect(Unit) {
         notificationAccess = context.packageName in NotificationManagerCompat.getEnabledListenerPackages(context)
+        confirmationAccess = android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         smsAccess = ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+        if (repository.importMode == "NOTIFY") BankImportWorker.runNow(context)
         onPauseOrDispose { }
     }
     val currency = state.preferences.currency
@@ -2068,25 +2023,116 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
     val budget = remember(currency, revision) { model.budget(currency) }
     var budgetText by remember(currency, budget) { mutableStateOf(if (budget > 0) Money.editable(budget) else "") }
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.bank_dashboard)) }, navigationIcon = {
-        IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, stringResource(R.string.back)) }
+        IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
     }, actions = { IconButton(onClick = onAdd) { Icon(Icons.Default.Add, stringResource(R.string.add_entry)) } }) }) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding).testTag("bankList"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            item {
+                OutlinedButton(onClick = { setupExpanded = !setupExpanded }, modifier = Modifier.fillMaxWidth().testTag("bankSetup")) {
+                    Icon(if (setupExpanded) Icons.Default.ExpandLess else Icons.Default.Settings, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.bank_setup))
+                }
+            }
+            if (setupExpanded) {
             item { ContentCard {
                 Text(stringResource(R.string.bank_import_title), style = MaterialTheme.typography.titleMedium)
                 Text(stringResource(R.string.bank_consent), color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_enabled), Modifier.weight(1f)); Switch(enabled, model::enabled) }
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_auto), Modifier.weight(1f)); Switch(automatic, model::auto, enabled = enabled) }
-                Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
-                OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
-                if (BuildConfig.FLAVOR == "legacyV7") {
-                    Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
-                    OutlinedButton(onClick = { smsPermission.launch(Manifest.permission.RECEIVE_SMS) }) { Text(stringResource(R.string.bank_sms_permission)) }
-                } else Text(stringResource(R.string.bank_play_sms), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(stringResource(R.string.import_mode_title), style = MaterialTheme.typography.titleSmall)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("NOTIFY" to R.string.import_mode_notify, "API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms).forEach { (value, title) ->
+                        FilterChip(selected = mode == value, onClick = { model.mode(value); BankImportWorker.runNow(context) }, label = { Text(stringResource(title)) })
+                    }
+                }
+                when (mode) {
+                    "API" -> {
+                        Text(stringResource(R.string.api_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://api.monobank.ua/")) }) { Text(stringResource(R.string.api_open_site)) }
+                        if (!mono.connected) {
+                            OutlinedTextField(token, { token = it.trim().take(200) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.api_token_label)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                                isError = mono.error == "BAD_TOKEN")
+                            Button(enabled = token.length >= 20 && !connecting, onClick = {
+                                connecting = true
+                                scope.launch {
+                                    if (repository.connectMonobank(token)) { token = ""; BankImportWorker.runNow(context) }
+                                    connecting = false
+                                }
+                            }) { Text(stringResource(if (connecting) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.api_connected, mono.accounts.coerceAtLeast(1)), color = MaterialTheme.colorScheme.secondary)
+                            if (mono.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(mono.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))) + " · " +
+                                stringResource(R.string.api_imported_last, mono.lastImported), style = MaterialTheme.typography.bodySmall)
+                            if (mono.syncing) Text(stringResource(R.string.api_syncing), style = MaterialTheme.typography.bodySmall)
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(enabled = !mono.syncing, onClick = { BankImportWorker.runNow(context) }) { Text(stringResource(R.string.api_sync_now)) }
+                                TextButton(onClick = { scope.launch { repository.disconnectMonobank() } }) { Text(stringResource(R.string.api_disconnect)) }
+                            }
+                        }
+                        mono.error?.let { code ->
+                            Text(stringResource(when (code) {
+                                "BAD_TOKEN" -> R.string.api_error_bad_token; "RATE_LIMIT" -> R.string.api_error_rate
+                                "NO_ACCOUNTS" -> R.string.api_error_no_accounts; else -> R.string.api_error_network
+                            }), color = MaterialTheme.colorScheme.error)
+                        }
+                        HorizontalDivider()
+                        Text(stringResource(R.string.privat_api_title), style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.privat_api_howto), style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://privatbank.ua/business/intehratsiya")) }) { Text(stringResource(R.string.privat_api_site)) }
+                        if (!privat.connected) {
+                            OutlinedTextField(privatToken, { privatToken = it.trim().take(2048) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.privat_api_token)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                            Button(enabled = privatToken.length >= 20 && !connectingPrivat, onClick = {
+                                connectingPrivat = true
+                                scope.launch {
+                                    try { if (repository.connectPrivat(privatToken)) { privatToken = ""; BankImportWorker.runNow(context) } }
+                                    finally { connectingPrivat = false }
+                                }
+                            }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(if (connectingPrivat) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.privat_api_connected))
+                            if (privat.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(privat.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))), style = MaterialTheme.typography.bodySmall)
+                            OutlinedButton(enabled = !privat.syncing, onClick = { BankImportWorker.runNow(context) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_sync_now)) }
+                            TextButton(onClick = { scope.launch { repository.disconnectPrivat() } }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_disconnect)) }
+                        }
+                        privat.error?.let { Text(stringResource(R.string.privat_api_error), color = MaterialTheme.colorScheme.error) }
+                        Text(stringResource(R.string.other_api_note), style = MaterialTheme.typography.bodySmall)
+                    }
+                    "SMS" -> {
+                        Text(stringResource(R.string.sms_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(stringResource(if (smsAccess) R.string.bank_sms_yes else R.string.bank_sms_no))
+                        if (!smsAccess) Button(onClick = { smsPermission.launch(arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS)) }) { Text(stringResource(R.string.bank_sms_permission)) }
+                        OutlinedButton(enabled = smsAccess && !scanning, onClick = {
+                            scanning = true
+                            scope.launch { smsScan = withContext(Dispatchers.IO) { BankSmsCatchUp.run(context, repository, 30) }; scanning = false }
+                        }) { Text(stringResource(if (scanning) R.string.sms_scanning else R.string.sms_scan)) }
+                        smsScan?.let { r ->
+                            Text(if (!r.permission) stringResource(R.string.bank_sms_no)
+                                else stringResource(R.string.sms_scan_result, r.bankMessages, r.imported, r.queued), style = MaterialTheme.typography.bodySmall)
+                        }
+                        Text(stringResource(R.string.sms_restricted_tip), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    else -> {
+                        Text(stringResource(R.string.push_howto), style = MaterialTheme.typography.bodySmall)
+                        Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
+                        OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
+                    }
+                }
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
+                TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
+                if (!confirmationAccess && android.os.Build.VERSION.SDK_INT >= 33) OutlinedButton(onClick = { confirmationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.import_confirm_permission)) }
+                else Text(stringResource(R.string.import_confirm_enabled), style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
                 Text(stringResource(R.string.import_diagnostics), style = MaterialTheme.typography.titleMedium)
+                if (mode == "NOTIFY") {
                 Text(stringResource(if (diagnostics.connected) R.string.import_connected else R.string.import_disconnected))
                 Text(stringResource(R.string.import_counts, diagnostics.notificationCount, diagnostics.bankMessageCount))
                 Text(stringResource(importReason(diagnostics.lastCode)), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -2097,13 +2143,16 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                     catch (_: Exception) { exportFailed = true }
                 }) { Text(stringResource(R.string.import_reconnect)) }
                 TextButton(onClick = { packageDialog = true }) { Text(stringResource(R.string.import_package_settings)) }
+                }
                 Button(onClick = { pasteDialog = true }) { Text(stringResource(R.string.import_paste)) }
                 Text(stringResource(R.string.import_queue_note), color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
-            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            }
             item { FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("DAY" to R.string.bank_day, "WEEK" to R.string.bank_week, "MONTH" to R.string.bank_month, "ALL" to R.string.all_time).forEach { (period, title) ->
-                    FilterChip(selected = state.filter.period == period, onClick = { model.period(period) }, label = { Text(stringResource(title)) })
+                    FilterChip(modifier = Modifier.testTag("bankPeriod:$period"), selected = state.filter.period == period, onClick = { if (period == "DAY" || state.premium) model.period(period) else onPremium() }, label = {
+                        Text(stringResource(title) + if (period != "DAY" && !state.premium) " · Plus" else "")
+                    })
                 }
             } }
             item { ContentCard {
@@ -2112,9 +2161,8 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 FilterChip(selected = state.filter.source == null, onClick = { model.source(null) }, label = { Text(stringResource(R.string.all)) })
                 state.sources.forEach { source ->
                     val name = when (source.sourceType) { "CASH" -> stringResource(R.string.bank_cash); "CARD" -> Banks.name(source.bankId); else -> stringResource(R.string.bank_unknown) }
-                    Row(Modifier.fillMaxWidth().clickable { model.source(source.sourceType, source.bankId) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(name, Modifier.weight(1f)); Text(formatMoney(source.totalMinor, currency, language))
-                    }
+                    BankAmountRow(name, formatMoney(source.totalMinor, currency, language),
+                        onClick = { model.source(source.sourceType, source.bankId) })
                 }
                 if (state.filter.period == "MONTH" && budget > 0) {
                     Text(stringResource(R.string.bank_budget_progress, formatMoney(state.sources.sumOf { it.totalMinor }, currency, language), formatMoney(budget, currency, language)))
@@ -2125,11 +2173,8 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
                 Text(stringResource(R.string.bank_category_stats), style = MaterialTheme.typography.titleMedium)
                 state.categories.forEach { cat ->
                     val color = cat.colorHex?.let { Color(0xFF000000L or it.removePrefix("#").toLong(16)) } ?: palette.category(cat.category, false)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(Modifier.size(22.dp).background(color, CircleShape))
-                        Text(cat.customName ?: stringResource(cat.category.label()), Modifier.weight(1f))
-                        Text(formatMoney(cat.totalMinor, currency, language))
-                    }
+                    BankAmountRow(cat.customName ?: stringResource(cat.category.label()),
+                        formatMoney(cat.totalMinor, currency, language), color, labelTag = "bankCategoryLabel:${cat.category.name}")
                     LinearProgressIndicator(progress = { if (total == 0L) 0f else (cat.totalMinor.toDouble() / total).toFloat() }, modifier = Modifier.fillMaxWidth(), color = color)
                 }
                 TextButton(onClick = { categoryDialog = true }) { Text(stringResource(R.string.bank_new_category)) }
@@ -2137,19 +2182,57 @@ fun BankScreen(model: BankViewModel, repository: BankRepository, onBack: () -> U
             } }
             if (reviews.isNotEmpty()) item { Text(stringResource(R.string.bank_review_count, reviews.size), style = MaterialTheme.typography.titleLarge) }
             items(reviews, key = { "review-" + it.id }) { item -> ContentCard {
-                Text(Banks.name(item.bankId) + " · " + item.merchant)
-                Text(formatMoney(item.amountMinor, item.currency, language), style = MaterialTheme.typography.titleMedium)
-                Text(Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss", Locale.forLanguageTag(language.tag))))
-                item.cardLast4?.let { Text("•••• $it") }
-                if (!item.timeFromMessage) Text(stringResource(R.string.bank_time_received), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (item.status == "DUPLICATE_REVIEW") Text(stringResource(R.string.bank_duplicate), color = MaterialTheme.colorScheme.error)
-                if (item.transfer) Text(stringResource(R.string.bank_transfer_review))
+                // Bank name + merchant — can be long, allow 2 lines
+                Text(
+                    Banks.name(item.bankId) + " · " + item.merchant.ifBlank { "—" },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    formatMoney(item.amountMinor, item.currency, language),
+                    style = MaterialTheme.typography.headlineSmall,
+                    color = palette.type(item.type),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault())
+                        .format(DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss", Locale.forLanguageTag(language.tag))),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                item.cardLast4?.let { Text("•••• $it", style = MaterialTheme.typography.bodySmall) }
+                if (!item.timeFromMessage) Text(stringResource(R.string.bank_time_received), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+                if (item.transfer) Text(stringResource(R.string.bank_transfer_review), style = MaterialTheme.typography.bodySmall)
+                // Duplicate warnings
+                when (item.status) {
+                    "DUPLICATE_REVIEW" -> Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.errorContainer,
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Warning, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.error)
+                            Text(stringResource(R.string.bank_duplicate), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                    "CROSS_DUPLICATE_REVIEW" -> Surface(
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                    ) {
+                        Row(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.SwapHoriz, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.tertiary)
+                            Text("Можливий дублікат з іншого банку/гаманця", color = MaterialTheme.colorScheme.tertiary, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                }
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     TextButton(onClick = { model.accept(item.id, EntryType.EXPENSE) }) { Text(stringResource(R.string.expenses), color = palette.type(EntryType.EXPENSE)) }
                     TextButton(onClick = { model.accept(item.id, EntryType.INCOME) }) { Text(stringResource(R.string.income), color = palette.type(EntryType.INCOME)) }
                     TextButton(onClick = { model.ignore(item.id) }) { Text(stringResource(R.string.bank_ignore)) }
                 }
             } }
+
             item { Text(stringResource(R.string.bank_recent), style = MaterialTheme.typography.titleLarge) }
             items(state.entries, key = { it.id }) { entry -> ContentCard(Modifier.clickable { onEdit(entry.id) }) {
                 Text(entry.title)
@@ -2235,7 +2318,7 @@ private fun importReason(code: String): Int = when (code) {
     "GROUP_SUMMARY" -> R.string.import_group
     "UNRECOGNIZED" -> R.string.import_unrecognized
     "AUTO_IMPORTED" -> R.string.import_auto_done
-    "QUEUED" -> R.string.import_queued
+    "QUEUED", "REVIEW", "CROSS_DUPLICATE_REVIEW" -> R.string.import_queued
     "DUPLICATE_REVIEW" -> R.string.bank_duplicate
     "REDELIVERED" -> R.string.import_repeated
     "ERROR" -> R.string.storage_error
@@ -2243,10 +2326,102 @@ private fun importReason(code: String): Int = when (code) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/bank/BankViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.bank
+package com.semmyx.ledger.bank
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.provider.Telephony
+import androidx.core.content.ContextCompat
+import com.semmyx.ledger.data.bank.BankImportRepository
+import com.semmyx.ledger.domain.bank.Banks
+import java.util.concurrent.TimeUnit
+
+/**
+ * Reads bank SMS that arrived while the app was closed (needs READ_SMS).
+ * Without the permission it does nothing. Messages already recorded are skipped by event key.
+ */
+object BankSmsCatchUp {
+    private const val FIRST_RUN_DAYS = 30L
+    private const val OVERLAP_MINUTES = 10L
+
+    data class Result(val permission: Boolean, val bankMessages: Int = 0, val imported: Int = 0, val queued: Int = 0)
+
+    /** [days] != null rescans that many days of the inbox regardless of the last scan (manual "Scan now"). */
+    suspend fun run(context: Context, repository: BankImportRepository, days: Long? = null): Result {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return Result(false)
+        var bankMessages = 0; var imported = 0; var queued = 0
+        val prefs = context.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
+        val now = System.currentTimeMillis()
+        val since = if (days != null) now - TimeUnit.DAYS.toMillis(days)
+            else prefs.getLong("sms_scan_at", now - TimeUnit.DAYS.toMillis(FIRST_RUN_DAYS)) - TimeUnit.MINUTES.toMillis(OVERLAP_MINUTES)
+        val projection = arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE, Telephony.Sms.DATE_SENT)
+        context.contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, projection, "${Telephony.Sms.DATE} > ?",
+            arrayOf(since.toString()), "${Telephony.Sms.DATE} ASC")?.use { cursor ->
+            while (cursor.moveToNext()) {
+                val sender = cursor.getString(0).orEmpty()
+                val bank = Banks.bySender(sender) ?: continue
+                val text = cursor.getString(1).orEmpty().take(8001)
+                if (text.isBlank()) continue
+                val sent = cursor.getLong(3)
+                val at = if (sent > 0) sent else cursor.getLong(2)
+                // Same event key as BankSmsReceiver so a live message and its catch-up copy are one record.
+                bankMessages++
+                when (repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS")) {
+                    "AUTO_IMPORTED" -> imported++
+                    "REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW" -> queued++
+                }
+            }
+        }
+        if (days == null) prefs.edit().putLong("sms_scan_at", now).apply()
+        return Result(true, bankMessages, imported, queued)
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.provider.Telephony
+import com.semmyx.ledger.LedgerApplication
+import com.semmyx.ledger.domain.bank.Banks
+import kotlinx.coroutines.*
+
+/** SMS import mode: reads each new bank SMS as it arrives (historical inbox is read by [BankSmsCatchUp]). */
+class BankSmsReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != Telephony.Sms.Intents.SMS_RECEIVED_ACTION) return
+        val messages = Telephony.Sms.Intents.getMessagesFromIntent(intent)
+        if (messages.isEmpty()) return
+        val sender = messages.first().originatingAddress.orEmpty()
+        val bank = Banks.bySender(sender) ?: return
+        val repository = (context.applicationContext as LedgerApplication).container.bankImport
+        if (!repository.enabled || repository.importMode != "SMS") return
+        val text = messages.joinToString("") { it.messageBody.orEmpty() }.take(8001)
+        val at = messages.minOf { it.timestampMillis }
+        val pending = goAsync()
+        (context.applicationContext as LedgerApplication).applicationScope.launch(Dispatchers.IO) {
+            try { withTimeout(7000) { repository.receive(bank, text, "SMS:$sender:$at:$text", at, "SMS") } }
+            catch (error: CancellationException) { throw error }
+            catch (_: Exception) { android.util.Log.w("BankImport", "Local SMS import failed; no message contents logged") }
+            finally { pending.finish() }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.bank
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -2256,12 +2431,12 @@ import java.time.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-data class BankFilter(val period: String = "MONTH", val source: String? = null, val bank: String? = null)
+data class BankFilter(val period: String = "DAY", val source: String? = null, val bank: String? = null)
 data class BankDashboardState(val preferences: UserPreferences = UserPreferences(), val filter: BankFilter = BankFilter(),
     val sources: List<BankSourceSpend> = emptyList(), val categories: List<BankCategorySpend> = emptyList(),
-    val entries: List<LedgerEntry> = emptyList(), val failed: Boolean = false)
+    val entries: List<LedgerEntry> = emptyList(), val premium: Boolean = false, val failed: Boolean = false)
 @OptIn(ExperimentalCoroutinesApi::class)
-class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, private val clock: Clock) : ViewModel() {
+class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, premium: PremiumRepository, private val clock: Clock) : ViewModel() {
     private val filter = MutableStateFlow(BankFilter())
     private val today = MutableStateFlow(LocalDate.now(clock))
     init { viewModelScope.launch {
@@ -2276,15 +2451,21 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
     val customCategories = repo.categories().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val reviews = repo.reviews().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val enabled = MutableStateFlow(repo.enabled)
+    val mode = MutableStateFlow(repo.importMode)
+    val privat = repo.privatStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
+    val mono = repo.monobankStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
+    fun mode(value: String) { repo.importMode = value; mode.value = value }
     val auto = MutableStateFlow(repo.autoImport)
     val error = MutableStateFlow(false)
     val revision = MutableStateFlow(0)
-    val state = combine(preferences.preferences, filter, today) { prefs, selected, date -> Triple(prefs, selected, date) }.flatMapLatest { (prefs, selected, through) ->
-        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.withDayOfMonth(1) }
+    val state = combine(preferences.preferences, premium.state, filter, today) { prefs, access, selected, date ->
+        Request(prefs, access.entitled, selected.copy(period = BankPeriodAccess.effective(selected.period, access.entitled)), date)
+    }.flatMapLatest { (prefs, entitled, selected, through) ->
+        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.minusDays(29) }
         combine(repo.sources(prefs.currency, from, through), repo.categorySpending(prefs.currency, from, through, selected.source, selected.bank),
-            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries) }
+            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries, premium = entitled) }
     }.catch { emit(BankDashboardState(failed = true)) }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BankDashboardState())
-    fun period(value: String) { filter.update { it.copy(period = value) } }
+    fun period(value: String) { if (value in BankPeriodAccess.periods) filter.update { it.copy(period = value) } }
     fun source(value: String?, bank: String? = null) { filter.update { it.copy(source = value, bank = bank) } }
     fun enabled(value: Boolean) { repo.enabled = value; enabled.value = value }
     fun auto(value: Boolean) { repo.autoImport = value; auto.value = value }
@@ -2298,17 +2479,314 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
         val parsed = Money.parseMinor(amount) ?: kotlin.error("Invalid amount")
         repo.setBudget(currency, parsed); revision.value++
     }
+    private data class Request(val prefs: UserPreferences, val entitled: Boolean, val selected: BankFilter, val through: LocalDate)
     private fun task(block: suspend () -> Unit) { viewModelScope.launch { try { block(); error.value = false }
         catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { error.value = true } } }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/common/Components.kt
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.common
+package com.semmyx.ledger.cat
+
+import androidx.compose.foundation.Image
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.repeatOnLifecycle
+import com.semmyx.ledger.R
+import kotlinx.coroutines.isActive
+import kotlin.math.*
+
+/** Engine-neutral, stable rig channels. Realistic artwork is supplied separately, never fabricated. */
+data class CatPose(val breath: Float = 0f, val blink: Float = 0f, val yawDegrees: Float = 0f,
+    val pitchDegrees: Float = 0f, val pleased: Float = 0f, val serious: Float = 0f, val listening: Boolean = false)
+
+interface CatRig {
+    fun morph(name: String, weight: Float)
+    fun head(yawDegrees: Float, pitchDegrees: Float)
+}
+
+/** Complete mapping from controller output to a rig; a Filament adapter implements CatRig. */
+class CatRigDriver(private val rig: CatRig) {
+    fun apply(pose: CatPose) {
+        rig.morph("breath", pose.breath)
+        rig.morph("blinkLeft", pose.blink)
+        rig.morph("blinkRight", pose.blink)
+        rig.morph("pleased", pose.pleased)
+        rig.morph("serious", pose.serious)
+        rig.morph("earsForward", if (pose.listening) 1f else .2f)
+        rig.head(pose.yawDegrees, pose.pitchDegrees)
+    }
+}
+
+class CatMotionController {
+    private var yaw = 0f
+    private var pitch = 0f
+    private var happy = .5f
+    private var lastTime = 0.0
+    fun step(seconds: Double, balanceMinor: Long, listening: Boolean, target: Offset): CatPose {
+        val dt = if (lastTime == 0.0) 1.0 / 120 else (seconds - lastTime).coerceIn(0.0, .1)
+        lastTime = seconds
+        val smooth = (1.0 - exp(-9.0 * dt)).toFloat()
+        yaw += (target.x.coerceIn(-1f, 1f) * 18f - yaw) * smooth
+        pitch += (target.y.coerceIn(-1f, 1f) * -10f - pitch) * smooth
+        val destination = if (balanceMinor < 0) 0f else if (balanceMinor > 0) 1f else .5f
+        happy += (destination - happy) * smooth
+        val cycle = seconds % 4.7
+        val blink = if (cycle < .22) sin(cycle / .22 * PI).toFloat().coerceIn(0f, 1f) else 0f
+        return CatPose(((sin(seconds * 2 * PI / 3.6) + 1) / 2).toFloat(), blink, yaw, pitch,
+            happy, 1f - happy, listening)
+    }
+}
+
+/** Install a licensed asset-backed implementation at the composition root to enable real 3D. */
+fun interface CatAssetRenderer {
+    @Composable fun Render(pose: CatPose, modifier: Modifier)
+}
+object CatAssetRegistry {
+    var renderer: CatAssetRenderer? by mutableStateOf(null)
+}
+object CatTouchBus {
+    var target by mutableStateOf(Offset.Zero)
+}
+
+/** Observe, don't consume: ordinary taps, scrolling, editing and speech buttons still work. */
+fun Modifier.trackCatTouch(): Modifier = pointerInput(Unit) {
+    awaitPointerEventScope {
+        while (true) {
+            val event = awaitPointerEvent(PointerEventPass.Initial)
+            event.changes.firstOrNull { it.pressed }?.let { change ->
+                CatTouchBus.target = Offset((change.position.x / size.width.coerceAtLeast(1) - .5f) * 2,
+                    (change.position.y / size.height.coerceAtLeast(1) - .5f) * 2)
+            }
+        }
+    }
+}
+
+@Composable
+fun LiveCatHost(balanceMinor: Long, listening: Boolean, skin: String, modifier: Modifier, motionEnabled: Boolean = true) {
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val controller = remember { CatMotionController() }
+    val balance by rememberUpdatedState(balanceMinor)
+    val hears by rememberUpdatedState(listening)
+    var pose by remember { mutableStateOf(CatPose()) }
+    LaunchedEffect(lifecycle, controller, motionEnabled) {
+        if (!motionEnabled) return@LaunchedEffect
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (isActive) withFrameNanos { time ->
+                pose = controller.step(time / 1e9, balance, hears, CatTouchBus.target)
+            }
+        }
+    }
+    val renderer = CatAssetRegistry.renderer
+    if (renderer != null) renderer.Render(pose, modifier)
+    else CatMeshRenderer(if (motionEnabled) pose else CatPose(pleased = if (balanceMinor > 0) 1f else 0f), modifier, skin = skin)
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.dp
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.AppLanguage
+
+@Composable
+fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
+    modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
+    onText: (String) -> Unit = {}, balanceMinor: Long = 0, locked: Boolean = false) {
+    var text by remember { mutableStateOf("") }
+    var typing by remember { mutableStateOf(false) }
+    val label = stringResource(R.string.voice_assistant_button)
+    Surface(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(24.dp)) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                @Composable fun Cat(modifier: Modifier) {
+                    LiveCatHost(balanceMinor, listening, skin, modifier
+                        .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
+                        .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
+                }
+                @Composable fun Caption(modifier: Modifier) {
+                    Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                        Text(if (locked) stringResource(R.string.cat_locked_hint) else if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (!locked) TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_write_short)) }
+                    }
+                }
+                if (LocalDensity.current.fontScale > 1.5f || maxWidth < 250.dp) Column {
+                    Cat(Modifier.fillMaxWidth().height(104.dp))
+                    Caption(Modifier.fillMaxWidth())
+                } else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Cat(Modifier.size(104.dp))
+                    Caption(Modifier.weight(1f))
+                }
+            }
+            AnimatedVisibility(typing && !locked, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+                Column {
+                    OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
+                        label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)
+                    TextButton(enabled = text.isNotBlank() && !listening, onClick = { val value = text; text = ""; onText(value) }) {
+                        Text(stringResource(R.string.assistant_send))
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import kotlin.math.*
+
+/** One texture, continuously deformed vertices. No eye-open/closed resource switching. */
+class CatFaceMesh(val columns: Int = 80, val rows: Int = 80) {
+    val vertices = FloatArray((columns + 1) * (rows + 1) * 2)
+    private val xs = FloatArray(vertices.size / 2)
+    private val ys = FloatArray(xs.size)
+    private val head = FloatArray(xs.size)
+    private val depth = FloatArray(xs.size)
+    private val lids = FloatArray(xs.size)
+    private val body = FloatArray(xs.size)
+    init {
+        var i = 0
+        for (row in 0..rows) for (column in 0..columns) {
+            val x = column.toFloat() / columns; val y = row.toFloat() / rows
+            xs[i] = x; ys[i] = y
+            head[i] = exp(-(((x - .5f) / .35f).toDouble().pow(4) + ((y - .37f) / .30f).toDouble().pow(4))).toFloat()
+            depth[i] = .10f * exp(-(((x - .5f) / .26f).toDouble().pow(2) + ((y - .42f) / .25f).toDouble().pow(2))).toFloat()
+            // Actual eye landmarks measured on cat_amber_base.webp, in normalized texture coordinates.
+            val eyeY = .396f
+            val left = exp(-(((x - .404f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
+            val right = exp(-(((x - .611f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
+            lids[i] = -(y - eyeY) * maxOf(left, right) * .98f
+            body[i] = exp(-(((x - .5f) / .38f).toDouble().pow(4) + ((y - .72f) / .25f).toDouble().pow(4))).toFloat()
+            i++
+        }
+    }
+    fun update(pose: CatPose, textureWidth: Int, textureHeight: Int): FloatArray {
+        val yaw = pose.yawDegrees.coerceIn(-18f, 18f) * PI.toFloat() / 180f
+        val pitch = pose.pitchDegrees.coerceIn(-10f, 10f) * PI.toFloat() / 180f
+        val cosine = cos(yaw); val sine = sin(yaw)
+        val blink = pose.blink.coerceIn(0f, 1f)
+        val expression = (pose.pleased * .045f).coerceIn(0f, .045f)
+        for (i in xs.indices) {
+            val x = xs[i]; val y = ys[i]
+            val h = head[i]
+            val dx = h * ((x - .5f) * (cosine - 1) + depth[i] * sine)
+            val dy = h * depth[i] * sin(pitch)
+            // Upper/lower fur regions move together around the iris. The eye aperture closes continuously.
+            val lid = lids[i] * (blink + expression * (1 - blink))
+            val breathing = pose.breath * .010f * body[i]
+            vertices[i * 2] = (x + dx + (x - .5f) * breathing) * textureWidth
+            vertices[i * 2 + 1] = (y + dy + lid - breathing * .25f) * textureHeight
+        }
+        return vertices
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt
+
+```kotlin
+package com.semmyx.ledger.cat
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Paint
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.platform.LocalContext
+import com.semmyx.ledger.R
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+/** A single decoded bitmap + a real-time mesh. Blink/yaw never change the resource. */
+@Composable
+fun CatMeshRenderer(pose: CatPose, modifier: Modifier, skin: String = "gray") {
+    val app = LocalContext.current.applicationContext
+    // Decode each appearance once. Frame updates and blinking only deform the shared mesh.
+    val textures by produceState<Pair<Bitmap?, Bitmap?>?>(initialValue = null, key1 = app) {
+        value = withContext(Dispatchers.IO) {
+            BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_base) to
+                BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_sky)
+        }
+    }
+    val bitmap = if (skin == "sky") textures?.second ?: textures?.first else textures?.first
+    val mesh = remember { CatFaceMesh() }
+    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG) }
+    Canvas(modifier) {
+        val image = bitmap ?: return@Canvas
+        val scale = minOf(size.width / image.width, size.height / image.height)
+        val left = (size.width - image.width * scale) / 2f
+        val top = (size.height - image.height * scale) / 2f
+        val verts = mesh.update(pose, image.width, image.height)
+        drawIntoCanvas { wrapper ->
+            val native = wrapper.nativeCanvas
+            val saved = native.save()
+            native.translate(left, top)
+            native.scale(scale, scale)
+            native.drawBitmapMesh(image, mesh.columns, mesh.rows, verts, 0, null, 0, paint)
+            native.restoreToCount(saved)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt
+
+```kotlin
+package com.semmyx.ledger.common
 
 import androidx.annotation.StringRes
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
@@ -2317,15 +2795,18 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
 import java.math.BigDecimal
@@ -2338,104 +2819,230 @@ import java.time.format.FormatStyle
 import java.util.Currency
 import java.util.Locale
 
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
 fun formatMoney(minor: Long, currency: LedgerCurrency, language: AppLanguage): String =
     NumberFormat.getCurrencyInstance(Locale.forLanguageTag(language.tag)).apply {
         this.currency = Currency.getInstance(currency.name)
-        minimumFractionDigits = 2; maximumFractionDigits = 2
+        minimumFractionDigits = 2
+        maximumFractionDigits = 2
     }.format(BigDecimal.valueOf(minor, 2))
 
 fun formatDate(date: LocalDate, language: AppLanguage): String =
     date.format(DateTimeFormatter.ofLocalizedDate(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
 
 /** Used for the developer-activation expiry date, which is a real instant rather than a calendar day. */
-fun formatDateTime(epochMillis: Long, language: AppLanguage): String = Instant.ofEpochMilli(epochMillis)
-    .atZone(ZoneId.systemDefault())
-    .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
+fun formatDateTime(epochMillis: Long, language: AppLanguage): String =
+    Instant.ofEpochMilli(epochMillis)
+        .atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofLocalizedDateTime(FormatStyle.MEDIUM).withLocale(Locale.forLanguageTag(language.tag)))
+
+// ---------------------------------------------------------------------------
+// Category / message labels
+// ---------------------------------------------------------------------------
 
 @StringRes fun Category.label(): Int = when (this) {
-    Category.FOOD -> R.string.category_food; Category.TRANSPORT -> R.string.category_transport
-    Category.HOME -> R.string.category_home; Category.HEALTH -> R.string.category_health
-    Category.LEISURE -> R.string.category_leisure; Category.SALARY -> R.string.category_salary
-    Category.OTHER -> R.string.category_other
-    Category.TRANSFER -> R.string.category_transfer; Category.DINING -> R.string.category_dining; Category.CASHBACK -> R.string.category_cashback
+    Category.FOOD      -> R.string.category_food
+    Category.TRANSPORT -> R.string.category_transport
+    Category.HOME      -> R.string.category_home
+    Category.HEALTH    -> R.string.category_health
+    Category.LEISURE   -> R.string.category_leisure
+    Category.SALARY    -> R.string.category_salary
+    Category.OTHER     -> R.string.category_other
+    Category.TRANSFER  -> R.string.category_transfer
+    Category.DINING    -> R.string.category_dining
+    Category.CASHBACK  -> R.string.category_cashback
 }
+
 fun Category.icon(): ImageVector = when (this) {
-    Category.FOOD -> Icons.Default.ShoppingCart; Category.TRANSPORT -> Icons.Default.DirectionsBus
-    Category.HOME -> Icons.Default.Home; Category.HEALTH -> Icons.Default.FavoriteBorder
-    Category.LEISURE -> Icons.Default.LocalActivity; Category.SALARY -> Icons.Default.WorkOutline
-    Category.OTHER -> Icons.Default.ReceiptLong
-    Category.TRANSFER -> Icons.Default.DoubleArrow; Category.DINING -> Icons.Default.Restaurant; Category.CASHBACK -> Icons.Default.CurrencyExchange
+    Category.FOOD      -> Icons.Default.ShoppingCart
+    Category.TRANSPORT -> Icons.Default.DirectionsBus
+    Category.HOME      -> Icons.Default.Home
+    Category.HEALTH    -> Icons.Default.FavoriteBorder
+    Category.LEISURE   -> Icons.Default.LocalActivity
+    Category.SALARY    -> Icons.Default.WorkOutline
+    Category.OTHER     -> Icons.Default.ReceiptLong
+    Category.TRANSFER  -> Icons.Default.DoubleArrow
+    Category.DINING    -> Icons.Default.Restaurant
+    Category.CASHBACK  -> Icons.Default.CurrencyExchange
 }
+
 @StringRes fun UiMessage.label(): Int = when (this) {
-    UiMessage.STORAGE -> R.string.storage_error
-    UiMessage.SAVED -> R.string.saved
-    UiMessage.DELETED -> R.string.entry_deleted
-    UiMessage.UNDO_EXPIRED -> R.string.undo_expired
-    UiMessage.RATE_OFFLINE -> R.string.rate_offline
+    UiMessage.STORAGE              -> R.string.storage_error
+    UiMessage.SAVED                -> R.string.saved
+    UiMessage.DELETED              -> R.string.entry_deleted
+    UiMessage.UNDO_EXPIRED         -> R.string.undo_expired
+    UiMessage.RATE_OFFLINE         -> R.string.rate_offline
     UiMessage.BIOMETRIC_UNAVAILABLE -> R.string.biometric_unavailable
-    UiMessage.NAME_INVALID -> R.string.name_invalid
-    UiMessage.NOT_FOUND -> R.string.entry_not_found
-    UiMessage.PREMIUM_ACTIVATED -> R.string.premium_activated
-    UiMessage.ACTIVATION_INVALID -> R.string.activation_invalid
+    UiMessage.NAME_INVALID         -> R.string.name_invalid
+    UiMessage.NOT_FOUND            -> R.string.entry_not_found
+    UiMessage.PREMIUM_ACTIVATED    -> R.string.premium_activated
+    UiMessage.ACTIVATION_INVALID   -> R.string.activation_invalid
 }
+
 @StringRes fun BillingIssue.label(): Int = when (this) {
-    BillingIssue.UNAVAILABLE -> R.string.billing_unavailable
-    BillingIssue.CONFIGURATION -> R.string.billing_configuration
-    BillingIssue.NETWORK -> R.string.billing_network
-    BillingIssue.PENDING -> R.string.billing_pending
-    BillingIssue.VERIFICATION -> R.string.billing_verification
+    BillingIssue.UNAVAILABLE    -> R.string.billing_unavailable
+    BillingIssue.CONFIGURATION  -> R.string.billing_configuration
+    BillingIssue.NETWORK        -> R.string.billing_network
+    BillingIssue.PENDING        -> R.string.billing_pending
+    BillingIssue.VERIFICATION   -> R.string.billing_verification
     BillingIssue.ACKNOWLEDGEMENT -> R.string.billing_acknowledgement
     BillingIssue.ACTIVATION_CODE -> R.string.billing_activation_code
 }
+
+// ---------------------------------------------------------------------------
+// Brand mark
+// ---------------------------------------------------------------------------
 
 @Composable
 fun LedgerMark(modifier: Modifier = Modifier, color: Color = LocalAppearance.current.color("icons")) {
     Canvas(modifier.size(40.dp)) {
         val w = size.width / 5f
         listOf(0.42f, 0.68f, 1f).forEachIndexed { index, height ->
-            drawRoundRect(color, Offset(index * w * 1.6f, size.height * (1 - height)), Size(w, size.height * height), CornerRadius(w * .2f))
+            drawRoundRect(
+                color,
+                Offset(index * w * 1.6f, size.height * (1 - height)),
+                Size(w, size.height * height),
+                CornerRadius(w * .2f),
+            )
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Navigation bar
+// ---------------------------------------------------------------------------
 
 @Composable
 fun LedgerBottomBar(selected: Int, onSelect: (Int) -> Unit) {
-    val labels = listOf(R.string.overview, R.string.settings, R.string.help, R.string.analytics_title, R.string.bank_dashboard)
-    val icons = listOf(Icons.Default.SpaceDashboard, Icons.Default.Tune, Icons.Default.HelpOutline, Icons.Default.BarChart, Icons.Default.AccountBalance)
-    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
+    val labels = listOf(
+        R.string.overview, R.string.settings, R.string.help,
+        R.string.analytics_title, R.string.bank_dashboard,
+    )
+    val icons = listOf(
+        Icons.Default.SpaceDashboard, Icons.Default.Tune, Icons.Default.HelpOutline,
+        Icons.Default.BarChart, Icons.Default.AccountBalance,
+    )
+    NavigationBar(
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp,
+    ) {
         labels.forEachIndexed { index, label ->
-            NavigationBarItem(selected = index == selected, onClick = { onSelect(index) }, icon = { Icon(icons[index], null, tint = LocalAppearance.current.color("icons").copy(alpha = if (index == selected) 1f else .65f)) }, label = { Text(stringResource(label)) })
+            val isSelected = index == selected
+            NavigationBarItem(
+                selected = isSelected,
+                onClick  = { onSelect(index) },
+                icon = {
+                    Icon(
+                        icons[index], null,
+                        tint = LocalAppearance.current.color("icons")
+                            .copy(alpha = if (isSelected) 1f else .55f),
+                    )
+                },
+                label = {
+                    Text(
+                        stringResource(label),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                },
+            )
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Content card  — used everywhere for grouped sections
+// ---------------------------------------------------------------------------
+
+/**
+ * Premium card with a subtle gradient tint on the top-left corner.
+ * Text inside never overflows: Columns use fillMaxWidth; callers must
+ * supply maxLines / overflow on individual Text composables as needed.
+ */
 @Composable
 fun ContentCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
-    Card(modifier.fillMaxWidth(), shape = androidx.compose.foundation.shape.RoundedCornerShape(20.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
+    Card(
+        modifier.fillMaxWidth(),
+        shape  = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp, pressedElevation = 4.dp),
+    ) {
+        Column(
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+            content = content,
+        )
     }
 }
 
+// ---------------------------------------------------------------------------
+// Empty / loading states
+// ---------------------------------------------------------------------------
+
 @Composable
-fun EmptyState(title: String, description: String, action: String, onAction: () -> Unit, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxWidth().padding(vertical = 24.dp, horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Icon(Icons.Default.ReceiptLong, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
-        Text(title, style = MaterialTheme.typography.titleLarge, textAlign = TextAlign.Center)
-        Text(description, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
-        Button(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(action) }
+fun EmptyState(
+    title: String,
+    description: String,
+    action: String,
+    onAction: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier.fillMaxWidth().padding(vertical = 32.dp, horizontal = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Surface(
+            shape = MaterialTheme.shapes.extraLarge,
+            color = MaterialTheme.colorScheme.primaryContainer,
+        ) {
+            Icon(
+                Icons.Default.ReceiptLong, null,
+                Modifier.padding(20.dp).size(36.dp),
+                tint = MaterialTheme.colorScheme.onPrimaryContainer,
+            )
+        }
+        Text(
+            title,
+            style     = MaterialTheme.typography.titleLarge,
+            textAlign = TextAlign.Center,
+            maxLines  = 3,
+            overflow  = TextOverflow.Ellipsis,
+        )
+        Text(
+            description,
+            color     = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            style     = MaterialTheme.typography.bodyMedium,
+            maxLines  = 5,
+            overflow  = TextOverflow.Ellipsis,
+        )
+        FilledTonalButton(
+            onClick   = onAction,
+            modifier  = Modifier.heightIn(min = 48.dp),
+        ) { Text(action, maxLines = 1, overflow = TextOverflow.Ellipsis) }
     }
 }
 
 @Composable
 fun LoadingState(modifier: Modifier = Modifier) {
-    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+    Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(
+            strokeWidth = 3.dp,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/common/ViewModelSupport.kt
+## app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.common
+package com.semmyx.ledger.common
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -2475,10 +3082,10 @@ enum class UiMessage {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/ActivityChart.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateFloatAsState
@@ -2497,8 +3104,8 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.ContentCard
-import com.semmyx.ledger.presentation.common.formatMoney
+import com.semmyx.ledger.common.ContentCard
+import com.semmyx.ledger.common.formatMoney
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
@@ -2570,10 +3177,10 @@ fun ActivityChart(days: List<DailyActivity>, currency: LedgerCurrency, language:
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/CategoryDetails.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -2593,11 +3200,11 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.analytics.*
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.analytics.*
 
 /** Reference-style category cards on the MAIN screen, not hidden in a separate analytics route. */
 @Composable
@@ -2732,10 +3339,10 @@ fun CategoryDetails(state: DashboardState, initialType: EntryType, onClose: () -
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/DashboardScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import android.Manifest
 import android.content.Intent
@@ -2743,6 +3350,8 @@ import android.content.pm.PackageManager
 import androidx.activity.result.ActivityResultLauncher
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -2761,23 +3370,24 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.premium.AssistantCharacterCard
-import com.semmyx.ledger.presentation.premium.trackCatTouch
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.cat.CatAssistantCard
+import com.semmyx.ledger.cat.trackCatTouch
 import android.widget.Toast
 import com.semmyx.ledger.voice.OptionalVoiceAssistant
 import com.semmyx.ledger.voice.VoiceCommand
 import com.semmyx.ledger.voice.VoiceEntryParser
 import com.semmyx.ledger.voice.VoiceSmallTalk
 import java.time.LocalDate
-import com.semmyx.ledger.voice.FinanceQuery
-import com.semmyx.ledger.voice.SpokenMoney
+import com.semmyx.ledger.voice.VoiceFinanceQuery
+import com.semmyx.ledger.voice.SpokenMoneyFormatter
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2811,16 +3421,16 @@ fun DashboardRoute(model: DashboardViewModel, host: FragmentActivity, onNavigate
         } })
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: FragmentActivity, onNavigate: (Int) -> Unit,
     onAdd: () -> Unit, onEdit: (String) -> Unit, onDelete: (String) -> Unit, onSearch: (String) -> Unit,
     onFilter: (EntryType?) -> Unit, onDays: (Int) -> Unit, onLoadMore: () -> Unit, onRetry: () -> Unit,
-    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft) -> Unit,
+    onVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit,
     speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
     setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit,
     onCategory: (Category?) -> Unit, onMoreCategory: () -> Unit,
-    onStatistics: (FinanceQuery.Statistics, (Long) -> Unit) -> Unit) {
+    onStatistics: (VoiceFinanceQuery.Statistics, (Long) -> Unit) -> Unit) {
     var categoryDetailType by remember { mutableStateOf(EntryType.EXPENSE) }
     if (state.selectedCategory != null) CategoryDetails(state, initialType = categoryDetailType,
         onClose = { onCategory(null) }, onDays = onDays, onMore = onMoreCategory,
@@ -2874,45 +3484,69 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
         // Speech results are handled in one place: first try to read the phrase as a whole ledger
         // entry ("I bought 1 kg of tomatoes for 100 UAH"), and only fall back to the small set of
         // fixed commands (balance / spent today / open add-entry) when no amount could be found.
+        var pendingVoice by remember { mutableStateOf<com.semmyx.ledger.voice.VoiceEntryDraft?>(null) }
+        val finishVoiceEntry: (com.semmyx.ledger.voice.VoiceEntryDraft, String) -> Unit = { ready, source ->
+            pendingVoice = null
+            onVoiceEntry(ready, source)
+            val language = state.preferences.language
+            val typeLabel = voiceContext.getString(if (ready.type == EntryType.INCOME) R.string.income else R.string.expense)
+            val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
+                formatMoney(ready.amountMinor, state.preferences.currency, language), ready.title, voiceContext.getString(ready.category.label()))
+            lastReply = reply
+            ensureAssistant().speak(reply, language)
+        }
+        pendingVoice?.let { ready ->
+            AlertDialog(onDismissRequest = { pendingVoice = null }, title = { Text(stringResource(R.string.voice_ask_source)) },
+                text = { Text(ready.title + " · " + formatMoney(ready.amountMinor, state.preferences.currency, state.preferences.language)) },
+                confirmButton = { Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { finishVoiceEntry(ready, "CARD") }, modifier = Modifier.testTag("voiceSourceCard")) { Text(stringResource(R.string.bank_card)) }
+                    Button(onClick = { finishVoiceEntry(ready, "CASH") }, modifier = Modifier.testTag("voiceSourceCash")) { Text(stringResource(R.string.bank_cash)) }
+                } },
+                dismissButton = { TextButton(onClick = { pendingVoice = null }) { Text(stringResource(R.string.cancel)) } })
+        }
         val processInput: (String?) -> Unit = { heard ->
                 listening = false
                 val assistant = ensureAssistant()
                 val language = state.preferences.language
-                val query = heard?.let { FinanceQuery.parse(it) }
+                val query = heard?.let { VoiceFinanceQuery.parse(it) }
                 val draft = if (query == null) heard?.let { VoiceEntryParser.parse(it) } else null
                 when {
-                    query == FinanceQuery.Balance -> {
+                    query == VoiceFinanceQuery.Balance -> {
                         val reply = voiceContext.getString(R.string.voice_reply_balance,
-                            SpokenMoney.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
+                            SpokenMoneyFormatter.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
                         lastReply = reply; assistant.speak(reply, language)
                     }
-                    query is FinanceQuery.Statistics -> onStatistics(query) { amount ->
+                    query is VoiceFinanceQuery.Statistics -> onStatistics(query) { amount ->
                         val period = voiceContext.getString(when (query.period) {
-                            FinanceQuery.Period.TODAY -> R.string.period_today
-                            FinanceQuery.Period.WEEK -> R.string.last_7_days
-                            FinanceQuery.Period.MONTH -> R.string.period_month
-                            FinanceQuery.Period.YEAR -> R.string.period_year
-                            FinanceQuery.Period.ALL -> R.string.all_time
+                            VoiceFinanceQuery.Period.TODAY -> R.string.period_today
+                            VoiceFinanceQuery.Period.WEEK -> R.string.last_7_days
+                            VoiceFinanceQuery.Period.MONTH -> R.string.period_month
+                            VoiceFinanceQuery.Period.YEAR -> R.string.period_year
+                            VoiceFinanceQuery.Period.ALL -> R.string.all_time
                         })
                         val category = query.category?.let { voiceContext.getString(it.label()) } ?: voiceContext.getString(R.string.all_categories)
                         val kind = voiceContext.getString(if (query.type == EntryType.EXPENSE) R.string.expenses else R.string.income)
                         val reply = voiceContext.getString(R.string.voice_statistics, kind, period, category,
-                            SpokenMoney.format(amount, state.preferences.currency, language))
+                            SpokenMoneyFormatter.format(amount, state.preferences.currency, language))
                         lastReply = reply; assistant.speak(reply, language)
                     }
                     draft != null -> {
                         val title = draft.title.ifBlank { voiceContext.getString(draft.category.label()) }
-                        onVoiceEntry(draft.copy(title = title))
-                        val typeLabel = voiceContext.getString(if (draft.type == EntryType.INCOME) R.string.income else R.string.expense)
-                        val reply = voiceContext.getString(R.string.voice_entry_added, typeLabel,
-                            formatMoney(draft.amountMinor, state.preferences.currency, language), title, voiceContext.getString(draft.category.label()))
-                        lastReply = reply
-                        assistant.speak(reply, language)
+                        val ready = draft.copy(title = title)
+                        val said = heard?.let { VoiceEntryParser.detectSource(it) }
+                        if (said != null) finishVoiceEntry(ready, said)
+                        else {
+                            // The cat always needs to know how it was paid before it writes the entry.
+                            pendingVoice = ready
+                            val ask = voiceContext.getString(R.string.voice_ask_source)
+                            lastReply = ask
+                            assistant.speak(ask, language)
+                        }
                     }
                     heard != null -> when (OptionalVoiceAssistant.classify(heard)) {
                         VoiceCommand.ShowBalance -> {
                             val reply = voiceContext.getString(R.string.voice_reply_balance,
-                                SpokenMoney.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
+                                SpokenMoneyFormatter.format(state.snapshot.balance.netMinor, state.preferences.currency, language))
                             lastReply = reply
                             assistant.speak(reply, language)
                         }
@@ -2977,7 +3611,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
             else if (state.failed) EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry)
             else LazyColumn(Modifier.widthIn(max = 720.dp).fillMaxSize().testTag("ledgerList"),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 100.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item(key = "greeting", contentType = "heading") {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(if (state.preferences.displayName.isBlank()) stringResource(R.string.dashboard_heading)
@@ -2985,15 +3619,17 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                         Text(stringResource(R.string.dashboard_subtitle), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
-                if (state.premium && state.preferences.premiumAssistantEnabled) {
+                item(key = "balance", contentType = "summary") { CompactBalanceSummary(state) }
+                // The cat is always on the home screen; without Premium it is shown locked and opens the Premium card.
+                if (!state.premium || state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
-                        AssistantCharacterCard(state.preferences.language, listening, lastReply, onTalk = onVoice,
+                        CatAssistantCard(state.preferences.language, listening, lastReply,
+                            onTalk = if (state.premium) onVoice else ({ onNavigate(1) }),
                             skin = state.preferences.mascotSkin, animations = state.preferences.mascotAnimations,
-                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor)
+                            onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor, locked = !state.premium)
                     }
                 }
-                item(key = "balance", contentType = "summary") { BalanceCard(state) }
-                item(key = "totals", contentType = "summary") { BalanceBreakdown(state) }
+
                 item(key = "chart", contentType = "chart") {
                     ActivityChart(state.snapshot.activity, state.preferences.currency, state.preferences.language, state.premium,
                         state.days, onDays, onPremium = { onNavigate(1) })
@@ -3009,7 +3645,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                             singleLine = true, label = { Text(stringResource(R.string.search_entries)) },
                             leadingIcon = { Icon(Icons.Default.Search, null) },
                             trailingIcon = { if (state.query.isNotEmpty()) IconButton(onClick = { onSearch("") }) { Icon(Icons.Default.Close, stringResource(R.string.clear_search)) } })
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilterChip(selected = state.type == null, onClick = { onFilter(null) }, label = { Text(stringResource(R.string.all)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.secondary, selectedLabelColor = MaterialTheme.colorScheme.secondary, selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f)), selected = state.type == EntryType.INCOME, onClick = { onFilter(EntryType.INCOME) }, label = { Text(stringResource(R.string.income)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.tertiary, selectedLabelColor = MaterialTheme.colorScheme.tertiary, selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f)), selected = state.type == EntryType.EXPENSE, onClick = { onFilter(EntryType.EXPENSE) }, label = { Text(stringResource(R.string.expenses)) })
@@ -3067,38 +3703,36 @@ private fun smallTalkReply(context: android.content.Context, heard: String): Str
         null -> null
     }
 
+/** One compact card instead of a tall balance card and two separate totals. */
 @Composable
-private fun BalanceCard(state: DashboardState) {
-    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface, contentColor = MaterialTheme.colorScheme.onSurface)) {
-        Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(stringResource(R.string.total_balance), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                Icon(Icons.Default.AccountBalanceWallet, null, tint = LocalAppearance.current.color("icons"))
+fun CompactBalanceSummary(state: DashboardState) {
+    ContentCard(Modifier.testTag("balanceSummary")) {
+        val balance = state.snapshot.balance
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val compact = maxWidth >= 300.dp && LocalDensity.current.fontScale <= 1.3f &&
+                listOf(balance.netMinor, balance.incomeMinor, balance.expenseMinor).all {
+                    formatMoney(it, state.preferences.currency, state.preferences.language).length <= 14
+                }
+            @Composable fun Metric(label: Int, amount: Long, color: Color, tag: String, modifier: Modifier = Modifier) {
+                Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = if (compact) Modifier.heightIn(min = with(LocalDensity.current) { 32.sp.toDp() }) else Modifier)
+                    BasicText(formatMoney(amount, state.preferences.currency, state.preferences.language),
+                        style = MaterialTheme.typography.titleMedium.copy(color = color),
+                        maxLines = 1, autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = 16.sp, stepSize = 1.sp),
+                        modifier = Modifier.fillMaxWidth().testTag(tag))
+                }
             }
-            Text(formatMoney(state.snapshot.balance.netMinor, state.preferences.currency, state.preferences.language),
-                style = MaterialTheme.typography.headlineLarge, modifier = Modifier.testTag("totalBalance"))
-            Text(stringResource(R.string.currency_scope, state.preferences.currency.name), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-        }
-    }
-}
-
-@Composable
-private fun BalanceBreakdown(state: DashboardState) {
-    val language = state.preferences.language
-    val currency = state.preferences.currency
-    @Composable fun Metric(income: Boolean, modifier: Modifier) {
-        ContentCard(modifier) {
-            Text(stringResource(if (income) R.string.income else R.string.expenses), style = MaterialTheme.typography.bodyMedium,
-                color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-            Text(formatMoney(if (income) state.snapshot.balance.incomeMinor else state.snapshot.balance.expenseMinor, currency, language),
-                style = MaterialTheme.typography.titleMedium, color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-        }
-    }
-    BoxWithConstraints {
-        if (maxWidth < 340.dp || LocalDensity.current.fontScale > 1.3f) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { Metric(true, Modifier); Metric(false, Modifier) }
-        } else Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Metric(true, Modifier.weight(1f)); Metric(false, Modifier.weight(1f))
+            if (compact) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance", Modifier.weight(1f))
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome", Modifier.weight(1f))
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses", Modifier.weight(1f))
+            } else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance")
+                // Each metric gets the entire line at large system font sizes.
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome")
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses")
+            }
         }
     }
 }
@@ -3106,39 +3740,70 @@ private fun BalanceBreakdown(state: DashboardState) {
 @Composable
 private fun EntryRow(entry: LedgerEntry, language: AppLanguage, onEdit: () -> Unit, onDelete: () -> Unit) {
     val categoryTint = LocalAppearance.current.category(entry.category, entry.type == EntryType.INCOME)
-    OutlinedCard(Modifier.fillMaxWidth().testTag("entry:${entry.id}")) {
-        Column(Modifier.fillMaxWidth().clickable(onClick = onEdit).padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Surface(shape = MaterialTheme.shapes.small, color = categoryTint.copy(alpha = .16f)) {
-                    Icon(entry.category.icon(), null, Modifier.padding(10.dp).size(22.dp), tint = categoryTint)
-                }
-                Column(Modifier.weight(1f)) {
-                    Text(entry.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
-                    Text(stringResource(entry.category.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                }
-                IconButton(onClick = onDelete) { Icon(Icons.Default.DeleteOutline, stringResource(R.string.delete_named_entry, entry.title)) }
+    val isIncome = entry.type == EntryType.INCOME
+    Card(
+        modifier  = Modifier.fillMaxWidth().testTag("entry:${entry.id}"),
+        shape     = MaterialTheme.shapes.large,
+        colors    = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp, pressedElevation = 3.dp),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onEdit)
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment     = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            // Category icon in a soft pill — fixed size, never squishes
+            Surface(shape = MaterialTheme.shapes.medium, color = categoryTint.copy(alpha = .14f)) {
+                Icon(entry.category.icon(), null, Modifier.padding(11.dp).size(22.dp), tint = categoryTint)
             }
-            Row(Modifier.fillMaxWidth().padding(top = 8.dp, end = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(formatDate(entry.date, language), Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-                Text(stringResource(if (entry.type == EntryType.INCOME) R.string.positive_amount else R.string.negative_amount,
-                    formatMoney(entry.amountMinor, entry.currency, language)), Modifier.weight(1.2f), textAlign = TextAlign.End,
-                    fontWeight = FontWeight.SemiBold, color = if (entry.type == EntryType.INCOME) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
+            // Title + date — weight(1f) ensures it never pushes the amount off-screen
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(entry.title, maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    "${stringResource(entry.category.label())} · ${formatDate(entry.date, language)}",
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            // Amount + delete icon — right-aligned, amounts never wrap
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    stringResource(
+                        if (isIncome) R.string.positive_amount else R.string.negative_amount,
+                        formatMoney(entry.amountMinor, entry.currency, language),
+                    ),
+                    style      = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color      = if (isIncome) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary,
+                    maxLines   = 1,
+                    overflow   = TextOverflow.Ellipsis,
+                )
+                Icon(
+                    Icons.Default.DeleteOutline,
+                    contentDescription = stringResource(R.string.delete_named_entry, entry.title),
+                    modifier = Modifier.size(16.dp).clickable(onClick = onDelete),
+                    tint     = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = .45f),
+                )
             }
         }
     }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/dashboard/DashboardViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.dashboard
+package com.semmyx.ledger.dashboard
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import com.semmyx.ledger.voice.VoiceEntryDraft
 import java.time.Clock
 import java.time.LocalDate
@@ -3234,7 +3899,7 @@ class DashboardViewModel(
     // Saves an entry parsed from a free-form spoken sentence (see VoiceEntryParser). The current
     // display currency is attached here rather than in the parser, since the parser has no access
     // to user preferences and money spoken aloud is always assumed to be in the user's own currency.
-    fun addVoiceEntry(draft: VoiceEntryDraft) {
+    fun addVoiceEntry(draft: VoiceEntryDraft, sourceType: String = "UNKNOWN") {
         guarded(onError = { eventChannel.trySend(DashboardEvent.Message(UiMessage.STORAGE)) }) {
             saveEntry(LedgerEntry(
                 id = UUID.randomUUID().toString(),
@@ -3245,10 +3910,11 @@ class DashboardViewModel(
                 category = draft.category,
                 date = LocalDate.now(clock),
                 note = draft.note,
+                sourceType = sourceType,
             ))
         }
     }
-    suspend fun answerStatistics(request: com.semmyx.ledger.voice.FinanceQuery.Statistics): Long {
+    suspend fun answerStatistics(request: com.semmyx.ledger.voice.VoiceFinanceQuery.Statistics): Long {
         val now = LocalDate.now(clock)
         return entries.statistics(state.value.preferences.currency, request.from(now), now, request.type, request.category)
     }
@@ -3256,10 +3922,68 @@ class DashboardViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/editor/EntryScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.editor
+package com.semmyx.ledger.diagnostics
+
+import android.content.Context
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * Persists the most recent uncaught crash to app-internal storage so it survives the process
+ * dying, and can be viewed later from Settings -> Support without needing adb/logcat access.
+ *
+ * Only the exception class name, message, and stack trace (file/line/method names) are stored --
+ * never entry titles, PINs, purchase tokens, or other user data, matching the existing logging
+ * rule in LedgerApplication.
+ */
+object CrashLogger {
+    private const val FILE_NAME = "last_crash.txt"
+
+    /** Wraps the app's existing uncaught-exception handler so every fatal crash is saved first. */
+    fun install(context: Context) {
+        val appContext = context.applicationContext
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            try {
+                writeCrash(appContext, error)
+            } catch (_: Throwable) {
+                // The logger itself must never cause a second crash while handling the first.
+            }
+            previous?.uncaughtException(thread, error)
+        }
+    }
+
+    private fun writeCrash(context: Context, error: Throwable) {
+        val writer = StringWriter()
+        error.printStackTrace(PrintWriter(writer))
+        val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+        val text = "TG Ledger crash - $timestamp\n\n$writer"
+        File(context.filesDir, FILE_NAME).writeText(text)
+    }
+
+    /** Returns the saved crash report, if any, or null when the app hasn't crashed since it was last cleared. */
+    fun readLastCrash(context: Context): String? {
+        val file = File(context.filesDir, FILE_NAME)
+        return if (file.exists()) file.readText() else null
+    }
+
+    fun clear(context: Context) {
+        File(context.filesDir, FILE_NAME).delete()
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt
+
+```kotlin
+package com.semmyx.ledger.editor
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
@@ -3272,15 +3996,17 @@ import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.theme.LocalAppearance
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneOffset
@@ -3305,62 +4031,57 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
         if (state.loading) LoadingState(Modifier.padding(padding))
         else if (state.loadFailed) EmptyState(stringResource(R.string.load_error_title), stringResource(state.error?.label() ?: R.string.storage_error),
             stringResource(R.string.back), onBack, Modifier.padding(padding))
-        else Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)) {
-            Text(stringResource(R.string.entry_currency_notice, state.currency.name), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.expense)) })
-                FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
-                    label = { Text(stringResource(R.string.income)) })
-            }
-            OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
-                suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryAmount"),
-                supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
-            OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
-                isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"),
-                supportingText = { Text(stringResource(if (state.validation == ValidationIssue.TITLE) R.string.title_invalid else R.string.title_hint)) })
-            Text(stringResource(R.string.bank_source), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, label = { Text(stringResource(R.string.bank_cash)) })
-                FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, label = { Text(stringResource(R.string.bank_card)) })
-            }
-            if (state.sourceType == "CARD") {
+        else {
+            val fallbackTitle = customCategories.firstOrNull { it.id == state.customCategoryId }?.name ?: stringResource(state.category.label())
+            val amountFocus = remember { FocusRequester() }
+            LaunchedEffect(state.loading) { if (!state.editing) runCatching { amountFocus.requestFocus() } }
+            Column(Modifier.fillMaxSize().padding(padding).imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                // Form: type, amount, optional title, category, date, save. Empty title falls back to the category name.
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.tertiary), selected = state.type == EntryType.EXPENSE, onClick = { model.type(EntryType.EXPENSE) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.expense)) })
+                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f), selectedLabelColor = MaterialTheme.colorScheme.secondary), selected = state.type == EntryType.INCOME, onClick = { model.type(EntryType.INCOME) }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.income)) })
+                }
+                OutlinedTextField(value = state.amount, onValueChange = model::amount, label = { Text(stringResource(R.string.amount)) },
+                    suffix = { Text(state.currency.name) }, singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    isError = state.validation == ValidationIssue.AMOUNT, enabled = !state.busy,
+                    modifier = Modifier.fillMaxWidth().focusRequester(amountFocus).testTag("entryAmount"),
+                    supportingText = { if (state.validation == ValidationIssue.AMOUNT) Text(stringResource(R.string.amount_invalid)) })
+                Text(stringResource(R.string.pay_source_title), style = MaterialTheme.typography.titleSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(selected = state.sourceType == "CARD", onClick = { model.source("CARD") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_card)) }, modifier = Modifier.testTag("sourceCard"))
+                    FilterChip(selected = state.sourceType == "CASH", onClick = { model.source("CASH") }, enabled = !state.busy,
+                        label = { Text(stringResource(R.string.bank_cash)) }, modifier = Modifier.testTag("sourceCash"))
+                }
+                if (state.sourceMissing) Text(stringResource(R.string.pay_source_required), color = MaterialTheme.colorScheme.error)
+                OutlinedTextField(value = state.title, onValueChange = model::title, label = { Text(stringResource(R.string.entry_title)) }, singleLine = true,
+                    placeholder = { Text(fallbackTitle) }, supportingText = { Text(stringResource(R.string.title_optional_hint)) },
+                    isError = state.validation == ValidationIssue.TITLE, enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("entryTitle"))
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    com.semmyx.ledger.domain.bank.Banks.all.forEach { bank ->
-                        FilterChip(selected = state.bankId == bank.id, onClick = { model.bank(bank.id) }, label = { Text(bank.name) })
+                    Category.entries.forEach { category ->
+                        FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
+                            label = { Text(stringResource(category.label())) })
+                    }
+                    customCategories.forEach { category ->
+                        FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
+                            label = { Text(category.name) })
                     }
                 }
-            }
-            Text(stringResource(R.string.category), style = MaterialTheme.typography.titleMedium)
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Category.entries.forEach { category ->
-                    FilterChip(colors = FilterChipDefaults.filterChipColors(selectedContainerColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME).copy(alpha = .18f), selectedLabelColor = LocalAppearance.current.category(category, state.type == EntryType.INCOME)), selected = state.customCategoryId == null && state.category == category, onClick = { model.category(category) }, enabled = !state.busy,
-                        label = { Text(stringResource(category.label())) })
+                TextButton(onClick = { dateDialog = true }, enabled = !state.busy) {
+                    Icon(Icons.Default.CalendarMonth, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(formatDate(state.date, language))
+                }
+                if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
+                state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
+                Button(onClick = { model.save(fallbackTitle) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("saveEntry")) {
+                    if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                    else Text(stringResource(R.string.save_entry))
                 }
             }
-            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                customCategories.forEach { category ->
-                    FilterChip(selected = state.customCategoryId == category.id, onClick = { model.customCategory(category.id) },
-                        label = { Text(category.name) })
-                }
-            }
-            OutlinedButton(onClick = { dateDialog = true }, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) {
-                Icon(Icons.Default.CalendarMonth, null)
-                Spacer(Modifier.width(12.dp))
-                Text(formatDate(state.date, language))
-            }
-            if (state.validation == ValidationIssue.DATE) Text(stringResource(R.string.date_invalid), color = MaterialTheme.colorScheme.error)
-            OutlinedTextField(value = state.note, onValueChange = model::note, label = { Text(stringResource(R.string.note_optional)) },
-                modifier = Modifier.fillMaxWidth(), minLines = 2, maxLines = 5, enabled = !state.busy,
-                supportingText = { Text(stringResource(R.string.character_count, state.note.length, 240)) })
-            state.error?.let { Text(stringResource(it.label()), color = MaterialTheme.colorScheme.error) }
-            Button(onClick = model::save, enabled = !state.busy, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).testTag("saveEntry")) {
-                if (state.busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                else Text(stringResource(R.string.save_entry))
-            }
-            Spacer(Modifier.height(16.dp))
         }
     }
     if (discardDialog) AlertDialog(onDismissRequest = { discardDialog = false }, title = { Text(stringResource(R.string.discard_title)) },
@@ -3389,16 +4110,16 @@ fun EntryRoute(model: EntryViewModel, language: AppLanguage, onBack: () -> Unit,
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/editor/EntryViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.editor
+package com.semmyx.ledger.editor
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import java.time.Clock
 import java.time.LocalDate
 import java.util.UUID
@@ -3421,7 +4142,9 @@ data class EditorState(
     val validation: ValidationIssue? = null,
     val error: UiMessage? = null,
     val loadFailed: Boolean = false,
-    val sourceType: String = "CASH",
+    /** "CASH" or "CARD" once chosen; new entries cannot be saved until the user picks one. */
+    val sourceType: String = "UNKNOWN",
+    val sourceMissing: Boolean = false,
     val bankId: String? = null,
     val cardLast4: String? = null,
     val customCategoryId: String? = null,
@@ -3460,19 +4183,23 @@ class EntryViewModel(
     fun type(value: EntryType) { mutableState.update { it.copy(type = value) } }
     fun category(value: Category) { mutableState.update { it.copy(category = value, customCategoryId = null) } }
     fun customCategory(id: String) { mutableState.update { it.copy(category = Category.OTHER, customCategoryId = id) } }
-    fun source(value: String) { require(value in listOf("UNKNOWN", "CASH", "CARD")); mutableState.update { it.copy(sourceType = value, bankId = if (value == "CARD") it.bankId ?: "privat" else null, cardLast4 = if (value == "CARD") it.cardLast4 else null) } }
+    fun source(value: String) {
+        require(value in listOf("UNKNOWN", "CASH", "CARD"))
+        mutableState.update { it.copy(sourceType = value, sourceMissing = false, cardLast4 = if (value == "CARD") it.cardLast4 else null, bankId = if (value == "CARD") it.bankId else null) }
+    }
     fun bank(id: String) { mutableState.update { it.copy(bankId = id, sourceType = "CARD") } }
     fun date(value: LocalDate) { mutableState.update { it.copy(date = value, eventAtMillis = value.atStartOfDay(clock.zone).toInstant().toEpochMilli(), validation = null) } }
     fun note(value: String) { mutableState.update { it.copy(note = value.take(240), validation = null) } }
-    fun save() {
+    fun save(fallbackTitle: String = "") {
         if (state.value.busy || state.value.loading || state.value.loadFailed) return
         val form = state.value
         val minor = Money.parseMinor(form.amount)
         if (minor == null) { mutableState.update { it.copy(validation = ValidationIssue.AMOUNT) }; return }
+        if (!form.editing && form.sourceType != "CASH" && form.sourceType != "CARD") { mutableState.update { it.copy(sourceMissing = true) }; return }
         mutableState.update { it.copy(busy = true, error = null) }
         viewModelScope.launch {
             try {
-                saveEntry(LedgerEntry(id, form.title, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
+                saveEntry(LedgerEntry(id, form.title.ifBlank { fallbackTitle.take(60) }, minor, form.currency, form.type, form.category, form.date, form.note, form.sourceType, form.bankId, form.cardLast4,
                     form.eventAtMillis ?: if (form.date == LocalDate.now(clock)) clock.millis() else form.date.atStartOfDay(clock.zone).toInstant().toEpochMilli(),
                     form.customCategoryId, form.origin))
                 savedChannel.send(Unit)
@@ -3489,10 +4216,10 @@ class EntryViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/history/HistoryScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.history
+package com.semmyx.ledger.history
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -3509,8 +4236,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.EntryType
 import com.semmyx.ledger.domain.bank.Banks
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -3546,10 +4273,10 @@ fun HistoryScreen(model: HistoryViewModel, onBack: () -> Unit, onEdit: (String) 
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/history/HistoryViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.history
+package com.semmyx.ledger.history
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -3578,10 +4305,257 @@ class HistoryViewModel(repository: EntryRepository, preferences: PreferencesRepo
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/onboarding/OnboardingScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.onboarding
+package com.semmyx.ledger.navigation
+
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import com.semmyx.ledger.history.*
+import java.time.YearMonth
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LifecycleResumeEffect
+import com.semmyx.ledger.platform.HighRefreshRate
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavType
+import androidx.navigation.compose.*
+import androidx.navigation.navArgument
+import com.semmyx.ledger.AppContainer
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.ThemeMode
+import com.semmyx.ledger.platform.BiometricUnlocker
+import com.semmyx.ledger.support.SupportNavigator
+import com.semmyx.ledger.auth.*
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.dashboard.*
+import com.semmyx.ledger.analytics.*
+import com.semmyx.ledger.bank.*
+import com.semmyx.ledger.editor.*
+import com.semmyx.ledger.onboarding.OnboardingScreen
+import com.semmyx.ledger.settings.*
+import com.semmyx.ledger.support.*
+import com.semmyx.ledger.theme.*
+
+@Composable
+fun AppRoot(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
+    CompositionLocalProvider(LocalActivityResultRegistryOwner provides host, LocalOnBackPressedDispatcherOwner provides host) {
+        AppRootContent(host, model, container)
+    }
+}
+
+@Composable
+private fun AppRootContent(host: FragmentActivity, model: AppViewModel, container: AppContainer) {
+    val state by model.state.collectAsStateWithLifecycle()
+    LifecycleResumeEffect(state.preferences.refreshRateHz) {
+        HighRefreshRate.request(host, state.preferences.refreshRateHz)
+        onPauseOrDispose { }
+    }
+    var supportVisible by remember { mutableStateOf(false) }
+    // Registered unconditionally here, in AppRoot's very first composition (before the PIN
+    // screen even shows), never inside the Dashboard graph. An Activity Result launcher must be
+    // registered before the host Activity passes STARTED; the Dashboard route is only entered
+    // after the user unlocks with their PIN -- long after the Activity is already STARTED -- so
+    // registering it there always throws "LifecycleOwners must call register before they are
+    // STARTED", whether that registration sits inside a lazy list item or at the top of the
+    // screen. Only the *handling* of a result is Dashboard-specific, so that part is supplied
+    // later via a mutable callback the Dashboard route swaps in once it has real data.
+    var onSpeechResult by remember { mutableStateOf<(Intent?) -> Unit>({}) }
+    var onMicPermissionResult by remember { mutableStateOf<(Boolean) -> Unit>({}) }
+    val speechRecognizerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result -> onSpeechResult(result.data) }
+    val micPermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted -> onMicPermissionResult(granted) }
+    LocalizedContent(state.preferences.language) {
+        LedgerTheme(state.preferences.theme, state.preferences.colorOverrides) {
+            val dark = when (state.preferences.theme) {
+                ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false
+            }
+            SideEffect {
+                WindowCompat.getInsetsController(host.window, host.window.decorView).apply {
+                    isAppearanceLightStatusBars = !dark
+                    isAppearanceLightNavigationBars = !dark
+                }
+            }
+            Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                // Never cross-fade private content into a lock screen.
+                when {
+                    !state.ready -> LoadingState()
+                    state.failed -> Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.security_error), stringResource(R.string.retry), model::retry)
+                        TextButton(onClick = { supportVisible = true }) { Text(stringResource(R.string.need_help)) }
+                    }
+                    !state.preferences.onboardingComplete -> OnboardingScreen(model::completeOnboarding)
+                    !state.unlocked -> AuthenticationRoute(host, container, state, onUnlock = {
+                        if (host.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) model.unlock()
+                    }, onSupport = { supportVisible = true })
+                    else -> UnlockedGraph(host, container, state, model::lock, { container.billing.launchPurchase(host) }, { supportVisible = true },
+                        speechRecognizerLauncher, micPermissionLauncher, { onSpeechResult = it }, { onMicPermissionResult = it })
+                }
+                if (supportVisible) SupportSheet(onDismiss = { supportVisible = false }, onContact = {
+                    supportVisible = false
+                    SupportNavigator.open(host)
+                })
+            }
+        }
+    }
+}
+
+@Composable
+private fun AuthenticationRoute(host: FragmentActivity, container: AppContainer, appState: AppState, onUnlock: () -> Unit, onSupport: () -> Unit) {
+    // The auth-attempt owner is disposed on background lock; cancellation wipes PIN buffers.
+    val store = remember(appState.lockEpoch) { ViewModelStore() }
+    val owner = remember(store) { object : ViewModelStoreOwner { override val viewModelStore = store } }
+    DisposableEffect(store) { onDispose { store.clear() } }
+    val model: AuthViewModel = viewModel(viewModelStoreOwner = owner, factory = LedgerViewModelFactory(AuthViewModel::class.java) {
+        AuthViewModel(!appState.hasPin, container.security)
+    })
+    val auth by model.state.collectAsStateWithLifecycle()
+    val unlocker = remember(store, host) { BiometricUnlocker(host, container.biometricKeys) }
+    DisposableEffect(unlocker) { onDispose { unlocker.cancel() } }
+    LaunchedEffect(model) { model.unlocked.collect { onUnlock() } }
+    val title = stringResource(R.string.biometric_title)
+    val subtitle = stringResource(R.string.biometric_subtitle)
+    val negative = stringResource(R.string.use_pin)
+    AuthenticationScreen(auth, appState.preferences.biometricsEnabled && container.biometricAvailable(), model::digit, model::erase,
+        model::startOver, onBiometric = { unlocker.authenticate(title, subtitle, negative, onUnlock, model::biometricFailed) }, onSupport = onSupport)
+}
+
+@Composable
+private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appState: AppState, onLock: () -> Unit, onPurchase: () -> Unit, onSupport: () -> Unit,
+    speechRecognizerLauncher: ActivityResultLauncher<Intent>, micPermissionLauncher: ActivityResultLauncher<String>,
+    setOnSpeechResult: ((Intent?) -> Unit) -> Unit, setOnMicPermissionResult: ((Boolean) -> Unit) -> Unit) {
+    val nav = rememberNavController()
+    val routes = listOf("dashboard", "settings", "help", "analytics", "banks")
+    val onNavigate: (Int) -> Unit = { index ->
+        // Home is the only screen with the bottom bar. Every other tab opens as its own full screen
+        // with a close (X) button; closing, or pressing Back, always returns to Home.
+        if (index == 0) nav.popBackStack("dashboard", inclusive = false)
+        else nav.navigate(routes[index]) {
+            popUpTo("dashboard")
+            launchSingleTop = true
+        }
+    }
+    NavHost(navController = nav, startDestination = "dashboard") {
+        composable("dashboard") {
+            val model: DashboardViewModel = viewModel(factory = LedgerViewModelFactory(DashboardViewModel::class.java) {
+                DashboardViewModel(container.entries, container.preferences, container.premium, container.observeDashboard, container.clock, container.saveEntry)
+            })
+            DashboardRoute(model, host, onNavigate, onAdd = { nav.navigate("entry/new") }, onEdit = { nav.navigate("entry/$it") },
+                speechRecognizerLauncher = speechRecognizerLauncher, micPermissionLauncher = micPermissionLauncher,
+                setOnSpeechResult = setOnSpeechResult, setOnMicPermissionResult = setOnMicPermissionResult)
+        }
+        composable("settings") {
+            val model: SettingsViewModel = viewModel(factory = LedgerViewModelFactory(SettingsViewModel::class.java) {
+                SettingsViewModel(container.preferences, container.premium, container.rates, container::configureBiometrics)
+            })
+            SettingsRoute(model, container.biometricAvailable(), onNavigate, onPurchase, onSupport, onLock)
+        }
+        composable("help") { HelpScreen(onClose = { onNavigate(0) }, onSupport = onSupport) }
+        composable("analytics") {
+            val model: AnalyticsViewModel = viewModel(factory = LedgerViewModelFactory(AnalyticsViewModel::class.java) {
+                AnalyticsViewModel(container.entries, container.preferences, container.clock)
+            })
+            AnalyticsRoute(model, onBack = { onNavigate(0) }, onCurrency = { onNavigate(1) },
+                onEdit = { nav.navigate("entry/$it") },
+                onHistory = { month -> nav.navigate(if (month == null) "history" else "history?month=$month") })
+        }
+        composable("history?month={month}", arguments = listOf(navArgument("month") { type = NavType.StringType; nullable = true; defaultValue = null })) { backStack ->
+            val month = backStack.arguments?.getString("month")?.let { value -> runCatching { YearMonth.parse(value) }.getOrNull() }
+            val historyModel: HistoryViewModel = viewModel(factory = LedgerViewModelFactory(HistoryViewModel::class.java) {
+                HistoryViewModel(container.entries, container.preferences, container.clock, month)
+            })
+            HistoryScreen(historyModel, onBack = { nav.popBackStack() }, onEdit = { nav.navigate("entry/$it") })
+        }
+        composable("banks") {
+            val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
+                BankViewModel(container.bankImport, container.preferences, container.premium, container.clock)
+            })
+            BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
+                onEdit = { nav.navigate("entry/$it") }, onPremium = { onNavigate(1) })
+        }
+        composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
+            val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }
+            val model: EntryViewModel = viewModel(factory = LedgerViewModelFactory(EntryViewModel::class.java) {
+                EntryViewModel(id, container.entries, container.preferences, container.saveEntry, container.clock)
+            })
+            val categories by container.bankImport.categories().collectAsStateWithLifecycle(initialValue = emptyList())
+            EntryRoute(model, appState.preferences.language, onBack = { nav.popBackStack() }, customCategories = categories)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt
+
+```kotlin
+package com.semmyx.ledger.navigation
+
+import androidx.lifecycle.ViewModel
+import com.semmyx.ledger.domain.PreferencesRepository
+import com.semmyx.ledger.domain.SecurityRepository
+import com.semmyx.ledger.domain.UserPreferences
+import com.semmyx.ledger.common.guarded
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+data class AppState(
+    val ready: Boolean = false,
+    val preferences: UserPreferences = UserPreferences(),
+    val hasPin: Boolean = false,
+    val unlocked: Boolean = false,
+    val failed: Boolean = false,
+    val lockEpoch: Long = 0,
+)
+
+class AppViewModel(private val preferences: PreferencesRepository, private val security: SecurityRepository) : ViewModel() {
+    private val mutableState = MutableStateFlow(AppState())
+    val state = mutableState.asStateFlow()
+    private var bootstrap: Job? = null
+    init { retry() }
+
+    fun retry() {
+        bootstrap?.cancel()
+        mutableState.value = AppState()
+        bootstrap = guarded(onError = { mutableState.update { it.copy(ready = true, failed = true, unlocked = false) } }) {
+            val configured = security.hasPin()
+            mutableState.update { it.copy(hasPin = configured) }
+            preferences.preferences.collect { prefs ->
+                mutableState.update { it.copy(ready = true, preferences = prefs, failed = false) }
+            }
+        }
+    }
+    fun completeOnboarding() {
+        guarded(onError = { mutableState.update { it.copy(failed = true) } }) { preferences.completeOnboarding() }
+    }
+    /** Called only by the PIN verifier event or a successful crypto-bound biometric callback. */
+    fun unlock() { mutableState.update { it.copy(unlocked = true, hasPin = true) } }
+    fun lock() { mutableState.update { it.copy(unlocked = false, lockEpoch = it.lockEpoch + 1) } }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt
+
+```kotlin
+package com.semmyx.ledger.onboarding
 
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.foundation.Image
@@ -3604,7 +4578,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
-import com.semmyx.ledger.presentation.common.LedgerMark
+import com.semmyx.ledger.common.LedgerMark
 import kotlinx.coroutines.launch
 
 @Composable
@@ -3656,288 +4630,153 @@ fun OnboardingScreen(onComplete: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/CatFaceMesh.kt
+## app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.premium
+package com.semmyx.ledger.platform
 
-import kotlin.math.*
-
-/** One texture, continuously deformed vertices. No eye-open/closed resource switching. */
-class CatFaceMesh(val columns: Int = 80, val rows: Int = 80) {
-    val vertices = FloatArray((columns + 1) * (rows + 1) * 2)
-    private val xs = FloatArray(vertices.size / 2)
-    private val ys = FloatArray(xs.size)
-    private val head = FloatArray(xs.size)
-    private val depth = FloatArray(xs.size)
-    private val lids = FloatArray(xs.size)
-    private val body = FloatArray(xs.size)
-    init {
-        var i = 0
-        for (row in 0..rows) for (column in 0..columns) {
-            val x = column.toFloat() / columns; val y = row.toFloat() / rows
-            xs[i] = x; ys[i] = y
-            head[i] = exp(-(((x - .5f) / .35f).toDouble().pow(4) + ((y - .37f) / .30f).toDouble().pow(4))).toFloat()
-            depth[i] = .10f * exp(-(((x - .5f) / .26f).toDouble().pow(2) + ((y - .42f) / .25f).toDouble().pow(2))).toFloat()
-            // Actual eye landmarks measured on cat_amber_base.webp, in normalized texture coordinates.
-            val eyeY = .396f
-            val left = exp(-(((x - .404f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
-            val right = exp(-(((x - .611f) / .054f).toDouble().pow(4) + ((y - eyeY) / .042f).toDouble().pow(4))).toFloat()
-            lids[i] = -(y - eyeY) * maxOf(left, right) * .98f
-            body[i] = exp(-(((x - .5f) / .38f).toDouble().pow(4) + ((y - .72f) / .25f).toDouble().pow(4))).toFloat()
-            i++
-        }
-    }
-    fun update(pose: CatPose, textureWidth: Int, textureHeight: Int): FloatArray {
-        val yaw = pose.yawDegrees.coerceIn(-18f, 18f) * PI.toFloat() / 180f
-        val pitch = pose.pitchDegrees.coerceIn(-10f, 10f) * PI.toFloat() / 180f
-        val cosine = cos(yaw); val sine = sin(yaw)
-        val blink = pose.blink.coerceIn(0f, 1f)
-        val expression = (pose.pleased * .045f).coerceIn(0f, .045f)
-        for (i in xs.indices) {
-            val x = xs[i]; val y = ys[i]
-            val h = head[i]
-            val dx = h * ((x - .5f) * (cosine - 1) + depth[i] * sine)
-            val dy = h * depth[i] * sin(pitch)
-            // Upper/lower fur regions move together around the iris. The eye aperture closes continuously.
-            val lid = lids[i] * (blink + expression * (1 - blink))
-            val breathing = pose.breath * .010f * body[i]
-            vertices[i * 2] = (x + dx + (x - .5f) * breathing) * textureWidth
-            vertices[i * 2 + 1] = (y + dy + lid - breathing * .25f) * textureHeight
-        }
-        return vertices
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/LiveCatMotion.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import androidx.compose.foundation.Image
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.foundation.layout.*
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.ColorFilter
-import androidx.compose.ui.graphics.BlendMode
-import androidx.compose.ui.input.pointer.PointerEventPass
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.unit.dp
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.repeatOnLifecycle
-import com.semmyx.ledger.R
-import kotlinx.coroutines.isActive
-import kotlin.math.*
+import com.semmyx.ledger.data.security.BiometricKeys
+import java.security.SecureRandom
 
-/** Engine-neutral, stable rig channels. Realistic artwork is supplied separately, never fabricated. */
-data class CatPose(val breath: Float = 0f, val blink: Float = 0f, val yawDegrees: Float = 0f,
-    val pitchDegrees: Float = 0f, val pleased: Float = 0f, val serious: Float = 0f, val listening: Boolean = false)
-
-interface CatRig {
-    fun morph(name: String, weight: Float)
-    fun head(yawDegrees: Float, pitchDegrees: Float)
-}
-
-/** Complete mapping from controller output to a rig; a Filament adapter implements CatRig. */
-class CatRigDriver(private val rig: CatRig) {
-    fun apply(pose: CatPose) {
-        rig.morph("breath", pose.breath)
-        rig.morph("blinkLeft", pose.blink)
-        rig.morph("blinkRight", pose.blink)
-        rig.morph("pleased", pose.pleased)
-        rig.morph("serious", pose.serious)
-        rig.morph("earsForward", if (pose.listening) 1f else .2f)
-        rig.head(pose.yawDegrees, pose.pitchDegrees)
-    }
-}
-
-class CatMotionController {
-    private var yaw = 0f
-    private var pitch = 0f
-    private var happy = .5f
-    private var lastTime = 0.0
-    fun step(seconds: Double, balanceMinor: Long, listening: Boolean, target: Offset): CatPose {
-        val dt = if (lastTime == 0.0) 1.0 / 120 else (seconds - lastTime).coerceIn(0.0, .1)
-        lastTime = seconds
-        val smooth = (1.0 - exp(-9.0 * dt)).toFloat()
-        yaw += (target.x.coerceIn(-1f, 1f) * 18f - yaw) * smooth
-        pitch += (target.y.coerceIn(-1f, 1f) * -10f - pitch) * smooth
-        val destination = if (balanceMinor < 0) 0f else if (balanceMinor > 0) 1f else .5f
-        happy += (destination - happy) * smooth
-        val cycle = seconds % 4.7
-        val blink = if (cycle < .22) sin(cycle / .22 * PI).toFloat().coerceIn(0f, 1f) else 0f
-        return CatPose(((sin(seconds * 2 * PI / 3.6) + 1) / 2).toFloat(), blink, yaw, pitch,
-            happy, 1f - happy, listening)
-    }
-}
-
-/** Install a licensed asset-backed implementation at the composition root to enable real 3D. */
-fun interface CatAssetRenderer {
-    @Composable fun Render(pose: CatPose, modifier: Modifier)
-}
-object CatAssetRegistry {
-    var renderer: CatAssetRenderer? by mutableStateOf(null)
-}
-object CatTouchBus {
-    var target by mutableStateOf(Offset.Zero)
-}
-
-/** Observe, don't consume: ordinary taps, scrolling, editing and speech buttons still work. */
-fun Modifier.trackCatTouch(): Modifier = pointerInput(Unit) {
-    awaitPointerEventScope {
-        while (true) {
-            val event = awaitPointerEvent(PointerEventPass.Initial)
-            event.changes.firstOrNull { it.pressed }?.let { change ->
-                CatTouchBus.target = Offset((change.position.x / size.width.coerceAtLeast(1) - .5f) * 2,
-                    (change.position.y / size.height.coerceAtLeast(1) - .5f) * 2)
-            }
-        }
-    }
-}
-
-@Composable
-fun LiveCatHost(balanceMinor: Long, listening: Boolean, skin: String, modifier: Modifier, motionEnabled: Boolean = true) {
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
-    val controller = remember { CatMotionController() }
-    val balance by rememberUpdatedState(balanceMinor)
-    val hears by rememberUpdatedState(listening)
-    var pose by remember { mutableStateOf(CatPose()) }
-    LaunchedEffect(lifecycle, controller, motionEnabled) {
-        if (!motionEnabled) return@LaunchedEffect
-        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            while (isActive) withFrameNanos { time ->
-                pose = controller.step(time / 1e9, balance, hears, CatTouchBus.target)
-            }
-        }
-    }
-    val renderer = CatAssetRegistry.renderer
-    if (renderer != null) renderer.Render(pose, modifier)
-    else MeshCatRenderer(if (motionEnabled) pose else CatPose(pleased = if (balanceMinor > 0) 1f else 0f), modifier, skin = skin)
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/MeshCatRenderer.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.Paint
-import androidx.compose.foundation.Canvas
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.platform.LocalContext
-import com.semmyx.ledger.R
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-
-/** A single decoded bitmap + a real-time mesh. Blink/yaw never change the resource. */
-@Composable
-fun MeshCatRenderer(pose: CatPose, modifier: Modifier, skin: String = "gray") {
-    val app = LocalContext.current.applicationContext
-    // Decode each appearance once. Frame updates and blinking only deform the shared mesh.
-    val textures by produceState<Pair<Bitmap?, Bitmap?>?>(initialValue = null, key1 = app) {
-        value = withContext(Dispatchers.IO) {
-            BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_base) to
-                BitmapFactory.decodeResource(app.resources, R.drawable.cat_amber_sky)
-        }
-    }
-    val bitmap = if (skin == "sky") textures?.second ?: textures?.first else textures?.first
-    val mesh = remember { CatFaceMesh() }
-    val paint = remember { Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG or Paint.DITHER_FLAG) }
-    Canvas(modifier) {
-        val image = bitmap ?: return@Canvas
-        val scale = minOf(size.width / image.width, size.height / image.height)
-        val left = (size.width - image.width * scale) / 2f
-        val top = (size.height - image.height * scale) / 2f
-        val verts = mesh.update(pose, image.width, image.height)
-        drawIntoCanvas { wrapper ->
-            val native = wrapper.nativeCanvas
-            val saved = native.save()
-            native.translate(left, top)
-            native.scale(scale, scale)
-            native.drawBitmapMesh(image, mesh.columns, mesh.rows, verts, 0, null, 0, paint)
-            native.restoreToCount(saved)
-        }
-    }
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/presentation/premium/PremiumMascotAssistant.kt
-
-```kotlin
-package com.semmyx.ledger.presentation.premium
-
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.contentDescription
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.unit.dp
-import com.semmyx.ledger.R
-import com.semmyx.ledger.domain.AppLanguage
-
-@Composable
-fun AssistantCharacterCard(language: AppLanguage, listening: Boolean, lastReply: String?, onTalk: () -> Unit,
-    modifier: Modifier = Modifier, skin: String = "gray", animations: Boolean = true,
-    onText: (String) -> Unit = {}, balanceMinor: Long = 0) {
-    var text by remember { mutableStateOf("") }
-    var typing by remember { mutableStateOf(false) }
-    val label = stringResource(R.string.voice_assistant_button)
-    Surface(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(24.dp)) {
-        Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
-                .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
-                .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
-            Text(if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
-                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
-            AnimatedVisibility(typing, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
-                Column {
-                    OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
-                        label = { Text(stringResource(R.string.assistant_text_hint)) }, singleLine = true)
-                    TextButton(enabled = text.isNotBlank() && !listening, onClick = { val value = text; text = ""; onText(value) }) {
-                        Text(stringResource(R.string.assistant_send))
+/** A callback without the crypto object is never sufficient to unlock. */
+class BiometricUnlocker(
+    private val activity: FragmentActivity,
+    private val keys: BiometricKeys,
+) {
+    private var prompt: BiometricPrompt? = null
+    fun authenticate(title: String, subtitle: String, negative: String, success: () -> Unit, failure: () -> Unit) {
+        try {
+            val cipher = keys.authenticationCipher()
+            val challenge = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val biometricPrompt = BiometricPrompt(activity, ContextCompat.getMainExecutor(activity),
+                object : BiometricPrompt.AuthenticationCallback() {
+                    override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                        try {
+                            val authenticated = requireNotNull(result.cryptoObject?.cipher)
+                            require(authenticated === cipher)
+                            authenticated.doFinal(challenge) // Keystore enforces a fresh strong-biometric auth.
+                            if (activity.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) success()
+                        } catch (_: Exception) { failure() }
+                        finally { challenge.fill(0) }
                     }
-                }
-            }
+                    override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                        challenge.fill(0)
+                        if (errorCode != BiometricPrompt.ERROR_USER_CANCELED && errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON && errorCode != BiometricPrompt.ERROR_CANCELED) failure()
+                    }
+                    override fun onAuthenticationFailed() { failure() }
+                })
+            prompt = biometricPrompt
+            val info = BiometricPrompt.PromptInfo.Builder().setTitle(title).setSubtitle(subtitle)
+                .setNegativeButtonText(negative).setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+                .setConfirmationRequired(true).build()
+            biometricPrompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        } catch (_: Exception) {
+            // Invalidated enrollment keys are not recreated at the lock screen; use the PIN.
+            failure()
+        }
+    }
+    fun cancel() { prompt?.cancelAuthentication(); prompt = null }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt
+
+```kotlin
+package com.semmyx.ledger.platform
+
+import android.app.Activity
+import android.view.Display
+import kotlin.math.abs
+
+object HighRefreshRate {
+    fun supported(display: Display?): Set<Int> {
+        if (display == null) return setOf(60)
+        val current = display.mode
+        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        return listOf(60, 90, 120).filter { rate -> modes.any { abs(it.refreshRate - rate) <= 1.1f } }.toSet()
+    }
+    fun request(activity: Activity, requestedHz: Int = 0) {
+        val display = activity.window.decorView.display ?: return
+        val current = display.mode
+        val modes = display.supportedModes.filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        val exact = modes.filter { requestedHz > 0 && abs(it.refreshRate - requestedHz) <= 1.1f }.firstOrNull()
+        val selected = if (requestedHz == 0) null else (exact
+            ?: modes.filter { it.refreshRate <= requestedHz + 1.1f }.maxByOrNull { it.refreshRate }
+            ?: modes.minByOrNull { it.refreshRate })
+        activity.window.attributes = activity.window.attributes.apply {
+            // Auto releases the override back to Android, rather than forcing the maximum forever.
+            preferredDisplayModeId = selected?.modeId ?: 0
+            preferredRefreshRate = selected?.refreshRate ?: 0f
         }
     }
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/ColorSettings.kt
+## app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.platform
+
+/**
+ * Copyright (c) 2026 Semmyx (semmyx666). All rights reserved. See LICENSE.
+ *
+ * Ownership seal: SHA-256("TG Ledger|semmyx666|semmyxofficial666@gmail.com|2026"), first 32 hex chars.
+ * It is published in docs/OWNERSHIP.md and is present in every build (APK/AAB), so a copy of the app can be
+ * traced back to this project even after it is renamed or re-signed.
+ */
+object OwnershipSeal {
+    const val OWNER = "Semmyx (semmyx666)"
+    const val ID = "11b3e1bb7fc072422cf2d25d258c65c8"
+
+    /** Keeps the seal referenced so that shrinking/obfuscation can never strip it from release builds. */
+    fun register() { System.setProperty("com.semmyx.ledger.seal", "$OWNER|$ID") }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
+
+```kotlin
+package com.semmyx.ledger.platform
+
+import android.content.Context
+import androidx.work.*
+import com.semmyx.ledger.LedgerApplication
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+
+/** Only public rates are refreshed in the background; personal entries never leave Room. */
+class RateRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
+        val container = (applicationContext as LedgerApplication).container
+        return try {
+            container.entries.purgeDeletedBefore(container.clock.millis() - TimeUnit.DAYS.toMillis(1))
+            container.rates.refresh()
+            Result.success()
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            if (runAttemptCount >= 4) Result.failure() else Result.retry()
+        }
+    }
+    companion object {
+        fun schedule(context: Context) {
+            val constraints = Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).setRequiresBatteryNotLow(true).build()
+            val periodic = PeriodicWorkRequestBuilder<RateRefreshWorker>(24, TimeUnit.HOURS)
+                .setConstraints(constraints).setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS).build()
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork("reference-rates", ExistingPeriodicWorkPolicy.UPDATE, periodic)
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt
+
+```kotlin
+package com.semmyx.ledger.settings
 
 import android.graphics.Color as AndroidColor
 import androidx.compose.foundation.background
@@ -3956,9 +4795,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
-import com.semmyx.ledger.presentation.theme.LocalAppearance
-import com.semmyx.ledger.presentation.theme.readableOn
+import com.semmyx.ledger.common.*
+import com.semmyx.ledger.theme.LocalAppearance
+import com.semmyx.ledger.theme.readableOn
 import java.util.Locale
 
 @OptIn(ExperimentalLayoutApi::class)
@@ -4076,10 +4915,33 @@ private fun roleLabel(role: String): Int = when (role) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/SettingsScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.settings
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import com.semmyx.ledger.R
+
+@Composable
+fun RestorePurchasesAction(enabled: Boolean, onClick: () -> Unit) {
+    // A dedicated full-width line, never the squeezed last child of a button row.
+    TextButton(onClick = onClick, enabled = enabled,
+        modifier = Modifier.fillMaxWidth().testTag("restorePurchases")) {
+        Text(stringResource(R.string.restore_purchases), modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt
+
+```kotlin
+package com.semmyx.ledger.settings
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -4104,7 +4966,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.semmyx.ledger.R
 import com.semmyx.ledger.diagnostics.CrashLogger
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.*
+import com.semmyx.ledger.common.*
 import java.text.NumberFormat
 import java.util.Locale
 import kotlinx.coroutines.launch
@@ -4128,9 +4990,11 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
         EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.back), { onNavigate(0) })
         return
     }
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, actions = {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.settings)) }, navigationIcon = {
+        IconButton(onClick = { onNavigate(0) }) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }, actions = {
         IconButton(onClick = onLock) { Icon(Icons.Default.Lock, stringResource(R.string.lock_now)) }
-    }) }, bottomBar = { LedgerBottomBar(1, onNavigate) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
+    }) }, snackbarHost = { SnackbarHost(snackbar) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item(key = "profile") { ContentCard {
                 Text(stringResource(R.string.profile), style = MaterialTheme.typography.titleLarge)
@@ -4244,10 +5108,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 }
                 if (!state.premium.entitled && state.premium.trialAvailable) {
                     Text(stringResource(R.string.trial_explanation))
-                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = { model.startTrial(7) }) { Text(stringResource(R.string.trial_7)) }
-                        OutlinedButton(onClick = { model.startTrial(14) }) { Text(stringResource(R.string.trial_14)) }
-                    }
+                    OutlinedButton(onClick = { model.startTrial(TrialPolicy.DAYS) }) { Text(stringResource(R.string.trial_14)) }
                 }
                 if (state.premium.entitled) {
                     Text(stringResource(R.string.mascot_style))
@@ -4266,7 +5127,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION }?.let {
                     Text(stringResource(it.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
-                TextButton(onClick = model::restorePurchases, enabled = !state.premium.busy) { Text(stringResource(R.string.restore_purchases)) }
+                RestorePurchasesAction(enabled = !state.premium.busy, onClick = model::restorePurchases)
             } }
             if (state.premium.developerPurchaseEnabled && (!state.premium.entitled || state.premium.expiresAtMillis != null)) item(key = "developerPurchase") { ContentCard {
                 Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
@@ -4348,16 +5209,16 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/settings/SettingsViewModel.kt
+## app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.settings
+package com.semmyx.ledger.settings
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.common.UiMessage
-import com.semmyx.ledger.presentation.common.guarded
+import com.semmyx.ledger.common.UiMessage
+import com.semmyx.ledger.common.guarded
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.*
 
@@ -4432,27 +5293,31 @@ class SettingsViewModel(
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/support/HelpScreen.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.support
+package com.semmyx.ledger.support
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
-import com.semmyx.ledger.presentation.common.ContentCard
-import com.semmyx.ledger.presentation.common.LedgerBottomBar
+import com.semmyx.ledger.common.ContentCard
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
-    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }) }, bottomBar = { LedgerBottomBar(2, onNavigate) }) { padding ->
+fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
+    Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.help)) }, navigationIcon = {
+        IconButton(onClick = onClose) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
+    }) }) { padding ->
         LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
             item { ContentCard {
                 Text(stringResource(R.string.help_heading), style = MaterialTheme.typography.headlineMedium)
@@ -4460,8 +5325,17 @@ fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
                 Button(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.contact_telegram)) }
             } }
             item { ContentCard {
+                Text(stringResource(R.string.major_release_title, BuildConfig.VERSION_NAME), style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.testTag("releaseHighlights"))
+                Text(stringResource(R.string.major_release_body), modifier = Modifier.testTag("releaseHighlightsBody"))
+            } }
+            item { ContentCard {
                 Text(stringResource(R.string.help_entries_title), style = MaterialTheme.typography.titleLarge)
                 Text(stringResource(R.string.help_entries_body))
+            } }
+            item { ContentCard {
+                Text(stringResource(R.string.help_banks_title), style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.help_banks_body))
             } }
             item { ContentCard {
                 Text(stringResource(R.string.help_privacy_title), style = MaterialTheme.typography.titleLarge)
@@ -4481,10 +5355,50 @@ fun HelpScreen(onNavigate: (Int) -> Unit, onSupport: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/support/SupportSheet.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.support
+package com.semmyx.ledger.support
+
+import android.app.Activity
+import android.content.ActivityNotFoundException
+import android.content.ComponentName
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+
+object SupportNavigator {
+    const val HANDLE = "@semmyxth"
+    const val WEB_URL = "https://t.me/semmyxth"
+    private val officialPackages = listOf("org.telegram.messenger", "org.telegram.messenger.web", "org.thunderdog.challegram")
+
+    fun open(activity: Activity) {
+        if (!openTelegram(activity)) activity.startActivity(Intent(activity, SupportWebActivity::class.java))
+    }
+    fun openTelegram(activity: Activity): Boolean {
+        for (packageName in officialPackages) {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse("tg://resolve?domain=semmyxth")).setPackage(packageName)
+            @Suppress("DEPRECATION")
+            val resolved = activity.packageManager.resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)?.activityInfo
+            if (resolved == null || !resolved.exported || resolved.packageName != packageName) continue
+            intent.component = ComponentName(resolved.packageName, resolved.name) // Explicit, not a hijackable chooser.
+            try {
+                activity.startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+                // App could have been removed between resolution and launch; try the next official client.
+                continue
+            } catch (_: SecurityException) { continue }
+        }
+        return false
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt
+
+```kotlin
+package com.semmyx.ledger.support
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -4504,8 +5418,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.R
-import com.semmyx.ledger.platform.SupportNavigator
-import com.semmyx.ledger.presentation.common.ContentCard
+import com.semmyx.ledger.common.ContentCard
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -4541,10 +5454,119 @@ fun SupportSheet(onDismiss: () -> Unit, onContact: () -> Unit) {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/theme/AppearancePalette.kt
+## app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.theme
+package com.semmyx.ledger.support
+
+import android.annotation.SuppressLint
+import android.os.Bundle
+import android.view.ViewGroup
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.semmyx.ledger.LedgerApplication
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.UserPreferences
+import com.semmyx.ledger.theme.LedgerTheme
+import com.semmyx.ledger.theme.LocalizedContent
+
+/** Non-exported HTTPS-only fallback. No JS bridge, file access, SSL bypass, or arbitrary URL input. */
+class SupportWebActivity : ComponentActivity() {
+    @OptIn(ExperimentalMaterial3Api::class)
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            val prefs by (application as LedgerApplication).container.preferences.preferences
+                .collectAsStateWithLifecycle(initialValue = UserPreferences())
+            LocalizedContent(prefs.language) {
+                LedgerTheme(prefs.theme) {
+                    var error by remember { mutableStateOf(false) }
+                    var loading by remember { mutableStateOf(true) }
+                    var webView by remember { mutableStateOf<WebView?>(null) }
+                    BackHandler { if (webView?.canGoBack() == true) webView?.goBack() else finish() }
+                    DisposableEffect(Unit) {
+                        onDispose {
+                            webView?.let { view ->
+                                view.stopLoading()
+                                (view.parent as? ViewGroup)?.removeView(view)
+                                view.destroy()
+                            }
+                            webView = null
+                        }
+                    }
+                    Scaffold(topBar = {
+                        TopAppBar(title = { Text(stringResource(R.string.telegram_support)) }, navigationIcon = {
+                            IconButton(onClick = { finish() }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, stringResource(R.string.back)) }
+                        })
+                    }) { padding ->
+                        Column(Modifier.fillMaxSize().padding(padding)) {
+                            if (loading && !error) LinearProgressIndicator(Modifier.fillMaxWidth())
+                            if (error) {
+                                Column(Modifier.fillMaxWidth().padding(24.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                                    Text(stringResource(R.string.support_network_error))
+                                    Button(onClick = { error = false; loading = true; webView?.loadUrl(SupportNavigator.WEB_URL) }) {
+                                        Text(stringResource(R.string.retry))
+                                    }
+                                }
+                            }
+                            AndroidView(modifier = Modifier.fillMaxWidth().weight(1f), factory = { context ->
+                                WebView(context).apply {
+                                    settings.javaScriptEnabled = false
+                                    settings.allowFileAccess = false
+                                    settings.allowContentAccess = false
+                                    settings.domStorageEnabled = false
+                                    settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                                    settings.safeBrowsingEnabled = true
+                                    webViewClient = object : WebViewClient() {
+                                        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                                            val uri = request.url
+                                            if (uri.scheme == "tg" && request.hasGesture()) {
+                                                SupportNavigator.openTelegram(this@SupportWebActivity)
+                                                return true
+                                            }
+                                            return uri.scheme != "https" || uri.host != "t.me"
+                                        }
+                                        override fun onPageFinished(view: WebView, url: String) { loading = false }
+                                        override fun onReceivedError(view: WebView, request: WebResourceRequest, failure: WebResourceError) {
+                                            if (request.isForMainFrame) { error = true; loading = false }
+                                        }
+                                    }
+                                    webView = this
+                                    loadUrl(SupportNavigator.WEB_URL)
+                                }
+                            })
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+## app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt
+
+```kotlin
+package com.semmyx.ledger.theme
 
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
@@ -4569,10 +5591,10 @@ val LocalAppearance = staticCompositionLocalOf { AppearancePalette() }
 fun readableOn(background: Color): Color = if (background.luminance() > .179f) Color.Black else Color.White
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/presentation/theme/Theme.kt
+## app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation.theme
+package com.semmyx.ledger.theme
 
 import android.content.res.Configuration
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -4593,64 +5615,174 @@ import com.semmyx.ledger.domain.AppLanguage
 import com.semmyx.ledger.domain.ThemeMode
 import java.util.Locale
 
+// ---------------------------------------------------------------------------
+// Premium color palette
+// Light: warm white surfaces + deep indigo primary + emerald income
+// Dark : pure OLED black + soft periwinkle + vivid emerald — no grey wash
+// ---------------------------------------------------------------------------
+
 private val LightColors = lightColorScheme(
-    primary = Color(0xFF1665C8), onPrimary = Color.White,
-    primaryContainer = Color(0xFFE7F0FF), onPrimaryContainer = Color(0xFF123460),
-    secondary = Color(0xFF216D56), onSecondary = Color.White,
-    secondaryContainer = Color(0xFFE2F2EA), onSecondaryContainer = Color(0xFF15533D),
-    background = Color(0xFFF6F8FC), onBackground = Color(0xFF142238),
-    surface = Color.White, onSurface = Color(0xFF142238),
-    surfaceVariant = Color(0xFFEAF0F7), onSurfaceVariant = Color(0xFF526175),
-    outline = Color(0xFF788697), outlineVariant = Color(0xFFDCE4EE),
-    error = Color(0xFFB3261E), onError = Color.White,
-)
-private val DarkColors = darkColorScheme(
-    primary = Color(0xFF6FAEFF), onPrimary = Color(0xFF061D3C),
-    primaryContainer = Color(0xFF152C49), onPrimaryContainer = Color(0xFFD0E4FF),
-    secondary = Color(0xFF35CB77), onSecondary = Color(0xFF002D15),
-    secondaryContainer = Color(0xFF0C3321), onSecondaryContainer = Color(0xFFB5F5CE),
-    background = Color.Black, onBackground = Color(0xFFF5F5F6),
-    surface = Color(0xFF1C1D1D), onSurface = Color(0xFFF5F5F6),
-    surfaceVariant = Color(0xFF252626), onSurfaceVariant = Color(0xFFA1A4A2),
-    outline = Color(0xFF6C706D), outlineVariant = Color(0xFF333633),
-    error = Color(0xFFFF6683), onError = Color(0xFF320009),
-)
-private val LedgerTypography = Typography(
-    headlineLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 32.sp, lineHeight = 40.sp),
-    headlineMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 28.sp, lineHeight = 36.sp),
-    titleLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 28.sp),
-    titleMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 24.sp),
-    bodyLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal, fontSize = 16.sp, lineHeight = 24.sp),
-    bodyMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal, fontSize = 14.sp, lineHeight = 20.sp),
-    labelLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp),
+    primary            = Color(0xFF3D5AFE),   // Indigo A400 — vibrant but not garish
+    onPrimary          = Color.White,
+    primaryContainer   = Color(0xFFE8EAFF),
+    onPrimaryContainer = Color(0xFF001480),
+
+    secondary            = Color(0xFF00875A),   // Emerald — income
+    onSecondary          = Color.White,
+    secondaryContainer   = Color(0xFFD7F5E8),
+    onSecondaryContainer = Color(0xFF00391F),
+
+    tertiary            = Color(0xFFFF5252),    // Crimson — expense
+    onTertiary          = Color.White,
+    tertiaryContainer   = Color(0xFFFFDEDE),
+    onTertiaryContainer = Color(0xFF7F0000),
+
+    background   = Color(0xFFF5F6FF),           // Slightly blue-tinted white
+    onBackground = Color(0xFF0D0E1A),
+
+    surface        = Color(0xFFFFFFFF),
+    onSurface      = Color(0xFF0D0E1A),
+    surfaceVariant = Color(0xFFEDEEFF),
+    onSurfaceVariant = Color(0xFF4A4C6B),
+
+    outline        = Color(0xFF9496B4),
+    outlineVariant = Color(0xFFD8D9F0),
+
+    error   = Color(0xFFB00020),
+    onError = Color.White,
 )
 
+private val DarkColors = darkColorScheme(
+    primary            = Color(0xFF8EA7FF),   // Soft periwinkle on pure black
+    onPrimary          = Color(0xFF001480),
+    primaryContainer   = Color(0xFF1A237E),
+    onPrimaryContainer = Color(0xFFCDD5FF),
+
+    secondary            = Color(0xFF2ECC71),   // Bright emerald
+    onSecondary          = Color(0xFF00391F),
+    secondaryContainer   = Color(0xFF00512E),
+    onSecondaryContainer = Color(0xFFA7F3C6),
+
+    tertiary            = Color(0xFFFF6E6E),    // Bright red
+    onTertiary          = Color(0xFF7F0000),
+    tertiaryContainer   = Color(0xFF5C0000),
+    onTertiaryContainer = Color(0xFFFFCDD2),
+
+    background   = Color(0xFF000000),           // Pure OLED
+    onBackground = Color(0xFFF0F0FF),
+
+    surface        = Color(0xFF111218),         // Very dark blue-grey
+    onSurface      = Color(0xFFF0F0FF),
+    surfaceVariant = Color(0xFF1C1E30),
+    onSurfaceVariant = Color(0xFFB0B3D8),
+
+    outline        = Color(0xFF5C5E80),
+    outlineVariant = Color(0xFF2A2C46),
+
+    error   = Color(0xFFFF6680),
+    onError = Color(0xFF4A0010),
+)
+
+// ---------------------------------------------------------------------------
+// Typography — slightly larger line-heights prevent text clipping
+// ---------------------------------------------------------------------------
+
+private val LedgerTypography = Typography(
+    displayLarge  = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold,     fontSize = 57.sp, lineHeight = 64.sp, letterSpacing = (-0.25).sp),
+    displayMedium = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Bold,     fontSize = 45.sp, lineHeight = 52.sp),
+    headlineLarge = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 32.sp, lineHeight = 42.sp),
+    headlineMedium= TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 28.sp, lineHeight = 38.sp),
+    headlineSmall = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 24.sp, lineHeight = 32.sp),
+    titleLarge    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 22.sp, lineHeight = 30.sp),
+    titleMedium   = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 16.sp, lineHeight = 24.sp, letterSpacing = 0.15.sp),
+    titleSmall    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    bodyLarge     = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 16.sp, lineHeight = 26.sp, letterSpacing = 0.5.sp),
+    bodyMedium    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 14.sp, lineHeight = 22.sp, letterSpacing = 0.25.sp),
+    bodySmall     = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,   fontSize = 12.sp, lineHeight = 18.sp, letterSpacing = 0.4.sp),
+    labelLarge    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.SemiBold, fontSize = 14.sp, lineHeight = 20.sp, letterSpacing = 0.1.sp),
+    labelMedium   = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 12.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp),
+    labelSmall    = TextStyle(fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Medium,   fontSize = 11.sp, lineHeight = 16.sp, letterSpacing = 0.5.sp),
+)
+
+// ---------------------------------------------------------------------------
+// Premium shape scale — softer corners everywhere
+// ---------------------------------------------------------------------------
+
+private val LedgerShapes = Shapes(
+    extraSmall = RoundedCornerShape(6.dp),
+    small      = RoundedCornerShape(12.dp),
+    medium     = RoundedCornerShape(16.dp),
+    large      = RoundedCornerShape(24.dp),
+    extraLarge = RoundedCornerShape(28.dp),
+)
+
+// ---------------------------------------------------------------------------
+// Theme entry point
+// ---------------------------------------------------------------------------
+
 @Composable
-fun LedgerTheme(mode: ThemeMode = ThemeMode.SYSTEM, overrides: Map<String, String> = emptyMap(), content: @Composable () -> Unit) {
-    val dark = when (mode) { ThemeMode.SYSTEM -> isSystemInDarkTheme(); ThemeMode.DARK -> true; ThemeMode.LIGHT -> false }
-    val palette = remember(overrides, dark) { AppearancePalette(overrides,
-        if (dark) emptyMap() else mapOf("background" to "#F6F8FC", "surface" to "#FFFFFF", "text" to "#142238", "muted" to "#526175")) }
-    val base = if (dark) DarkColors else LightColors
+fun LedgerTheme(
+    mode: ThemeMode = ThemeMode.SYSTEM,
+    overrides: Map<String, String> = emptyMap(),
+    content: @Composable () -> Unit,
+) {
+    val dark = when (mode) {
+        ThemeMode.SYSTEM -> isSystemInDarkTheme()
+        ThemeMode.DARK   -> true
+        ThemeMode.LIGHT  -> false
+    }
+    val palette = remember(overrides, dark) {
+        AppearancePalette(
+            overrides,
+            if (dark) emptyMap()
+            else mapOf(
+                "background" to "#F5F6FF",
+                "surface"    to "#FFFFFF",
+                "text"       to "#0D0E1A",
+                "muted"      to "#4A4C6B",
+            ),
+        )
+    }
+    val base   = if (dark) DarkColors else LightColors
     val accent = palette.color("accent")
-    val scheme = base.copy(primary = accent, onPrimary = readableOn(accent),
-        primaryContainer = accent.copy(alpha = .18f), onPrimaryContainer = accent,
-        secondary = palette.color("income"), onSecondary = readableOn(palette.color("income")),
-        secondaryContainer = palette.color("income").copy(alpha = .18f), onSecondaryContainer = palette.color("income"),
-        surfaceTint = accent, error = palette.color("error"), onError = readableOn(palette.color("error")),
-        tertiaryContainer = palette.color("expense").copy(alpha = .18f), onTertiaryContainer = palette.color("expense"),
-        tertiary = palette.color("expense"), onTertiary = readableOn(palette.color("expense")),
-        background = if (dark || overrides.containsKey("background")) palette.color("background") else base.background,
-        surface = if (dark || overrides.containsKey("surface")) palette.color("surface") else base.surface,
-        onBackground = if (dark || overrides.containsKey("text")) palette.color("text") else base.onBackground,
-        onSurface = if (dark || overrides.containsKey("text")) palette.color("text") else base.onSurface,
-        surfaceVariant = if (dark || overrides.containsKey("surface")) palette.color("surface") else base.surfaceVariant,
-        onSurfaceVariant = if (dark || overrides.containsKey("muted")) palette.color("muted") else base.onSurfaceVariant,
-        outline = palette.color("grid"), outlineVariant = palette.color("grid"))
+    val scheme = base.copy(
+        primary              = accent,
+        onPrimary            = readableOn(accent),
+        primaryContainer     = accent.copy(alpha = .18f),
+        onPrimaryContainer   = accent,
+        secondary            = palette.color("income"),
+        onSecondary          = readableOn(palette.color("income")),
+        secondaryContainer   = palette.color("income").copy(alpha = .18f),
+        onSecondaryContainer = palette.color("income"),
+        surfaceTint          = accent,
+        error                = palette.color("error"),
+        onError              = readableOn(palette.color("error")),
+        tertiaryContainer    = palette.color("expense").copy(alpha = .18f),
+        onTertiaryContainer  = palette.color("expense"),
+        tertiary             = palette.color("expense"),
+        onTertiary           = readableOn(palette.color("expense")),
+        background           = if (dark || overrides.containsKey("background")) palette.color("background") else base.background,
+        surface              = if (dark || overrides.containsKey("surface"))    palette.color("surface")    else base.surface,
+        onBackground         = if (dark || overrides.containsKey("text"))       palette.color("text")       else base.onBackground,
+        onSurface            = if (dark || overrides.containsKey("text"))       palette.color("text")       else base.onSurface,
+        surfaceVariant       = if (dark || overrides.containsKey("surface"))    palette.color("surface")    else base.surfaceVariant,
+        onSurfaceVariant     = if (dark || overrides.containsKey("muted"))      palette.color("muted")      else base.onSurfaceVariant,
+        outline              = palette.color("grid"),
+        outlineVariant       = palette.color("grid"),
+    )
     CompositionLocalProvider(LocalAppearance provides palette) {
-        MaterialTheme(colorScheme = scheme, typography = LedgerTypography,
-            shapes = Shapes(small = RoundedCornerShape(10.dp), medium = RoundedCornerShape(14.dp), large = RoundedCornerShape(20.dp)), content = content)
+        MaterialTheme(
+            colorScheme = scheme,
+            typography  = LedgerTypography,
+            shapes      = LedgerShapes,
+            content     = content,
+        )
     }
 }
+
+// ---------------------------------------------------------------------------
+// Localization
+// ---------------------------------------------------------------------------
 
 /**
  * Compose-scoped configuration avoids Activity.recreate() and a process restart.
@@ -4660,72 +5792,18 @@ fun LedgerTheme(mode: ThemeMode = ThemeMode.SYSTEM, overrides: Map<String, Strin
  */
 @Composable
 fun LocalizedContent(language: AppLanguage, content: @Composable () -> Unit) {
-    val base = LocalContext.current
+    val base     = LocalContext.current
     val original = LocalConfiguration.current
-    val config = remember(original, language) {
+    val config   = remember(original, language) {
         Configuration(original).apply { setLocale(Locale.forLanguageTag(language.tag)) }
     }
     val localizedContext = remember(base, config) { base.createConfigurationContext(config) }
-    CompositionLocalProvider(LocalContext provides localizedContext, LocalConfiguration provides config,
-        LocalLayoutDirection provides LayoutDirection.Ltr, content = content)
-}
-```
-
-## app/src/main/kotlin/com/semmyx/ledger/voice/FinanceQuery.kt
-
-```kotlin
-package com.semmyx.ledger.voice
-
-import com.semmyx.ledger.domain.*
-import java.time.LocalDate
-
-/** Structured intent resolver. Queries are resolved BEFORE monetary entries, never saved as purchases. */
-sealed interface FinanceQuery {
-    data object Balance : FinanceQuery
-    enum class Period { TODAY, WEEK, MONTH, YEAR, ALL }
-    data class Statistics(val period: Period, val type: EntryType, val category: Category?) : FinanceQuery {
-        fun from(today: LocalDate): LocalDate = when (period) {
-            Period.TODAY -> today
-            Period.WEEK -> today.minusDays(6)
-            Period.MONTH -> today.withDayOfMonth(1)
-            Period.YEAR -> today.withDayOfYear(1)
-            Period.ALL -> FinanceWindow.EARLIEST
-        }
-    }
-    companion object {
-        fun parse(heard: String): FinanceQuery? {
-            val text = heard.lowercase().trim()
-            val balance = listOf("баланс", "balance", "скільки грошей", "сколько денег").any { it in text }
-            val hasNumber = Regex("\\d").containsMatchIn(text)
-            if (balance && !hasNumber) return Balance
-            val expense = listOf("витрат", "потрат", "расход", "spent", "spend", "expense").any { it in text }
-            val income = listOf("дохід", "доход", "заробив", "income", "earned").any { it in text }
-            if (!expense && !income) return null
-            val period = when {
-                listOf("весь час", "все время", "all time", "увесь час").any { it in text } -> Period.ALL
-                listOf("місяц", "месяц", "month").any { it in text } -> Period.MONTH
-                listOf("тиж", "недел", "week").any { it in text } -> Period.WEEK
-                listOf("за рік", "за год", "year").any { it in text } -> Period.YEAR
-                listOf("сьогодні", "сегодня", "today").any { it in text } -> Period.TODAY
-                else -> return null
-            }
-            // "I spent 100 today" describes an entry, not a statistics request.
-            if (hasNumber) return null
-            return Statistics(period, if (income) EntryType.INCOME else EntryType.EXPENSE, category(text))
-        }
-        fun category(text: String): Category? = listOf(
-            Category.TRANSFER to listOf("переказ", "перевод", "transfer"),
-            Category.DINING to listOf("ресторан", "restaurant", "кафе", "cafe"),
-            Category.CASHBACK to listOf("кешбек", "кэшбек", "cashback"),
-            Category.FOOD to listOf("продукт", "їж", "еду", "питан", "food", "grocer"),
-            Category.TRANSPORT to listOf("транспорт", "таксі", "такси", "transport", "fuel"),
-            Category.HOME to listOf("дім", "житло", "дом", "оренд", "комунал", "home", "rent"),
-            Category.HEALTH to listOf("здоров", "ліки", "лекар", "health", "medicine"),
-            Category.LEISURE to listOf("розваг", "развлеч", "leisure", "entertainment"),
-            Category.SALARY to listOf("зарплат", "salary"),
-            Category.OTHER to listOf("інше", "прочее", "other")
-        ).firstOrNull { (_, words) -> words.any { it in text } }?.first
-    }
+    CompositionLocalProvider(
+        LocalContext          provides localizedContext,
+        LocalConfiguration   provides config,
+        LocalLayoutDirection  provides LayoutDirection.Ltr,
+        content               = content,
+    )
 }
 ```
 
@@ -4861,7 +5939,7 @@ class OptionalVoiceAssistant(activity: Activity) {
         private val BALANCE_UK = listOf("баланс", "скільки в мене грошей", "скільки грошей")
         private val SPENT_EN = listOf("spent today", "spend today", "what did i spend")
         private val SPENT_UK = listOf("витратив сьогодні", "витратили сьогодні", "скільки витратив")
-        private val ADD_EN = listOf("add entry", "new entry", "add expense", "add income")
+        private val ADD_EN = listOf("add entry", "new entry", "add expense", "add income", "new expense", "new income")
         private val ADD_UK = listOf("додати запис", "новий запис", "додати витрату", "додати доход")
     }
 }
@@ -4873,7 +5951,7 @@ sealed interface VoiceCommand {
 }
 ```
 
-## app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoney.kt
+## app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt
 
 ```kotlin
 package com.semmyx.ledger.voice
@@ -4884,7 +5962,7 @@ import java.text.NumberFormat
 import java.util.Locale
 
 /** Explicit words for minus and currency: TTS must never depend on pronunciation of '-' or ₴. */
-object SpokenMoney {
+object SpokenMoneyFormatter {
     fun format(minor: Long, currency: LedgerCurrency, language: AppLanguage): String {
         val uk = language == AppLanguage.UKRAINIAN
         val value = BigDecimal.valueOf(minor, 2).abs()
@@ -4934,6 +6012,16 @@ data class VoiceEntryDraft(
 )
 
 object VoiceEntryParser {
+
+    private val CARD_WORDS = Regex("карт|card|безнал|безготівк", RegexOption.IGNORE_CASE)
+    private val CASH_WORDS = Regex("готівк|наличн|налом|cash", RegexOption.IGNORE_CASE)
+
+    /** "CARD" / "CASH" when the sentence already says how it was paid; null when the cat must ask. */
+    fun detectSource(heard: String): String? {
+        val card = CARD_WORDS.containsMatchIn(heard)
+        val cash = CASH_WORDS.containsMatchIn(heard)
+        return when { card && !cash -> "CARD"; cash && !card -> "CASH"; else -> null }
+    }
 
     fun parse(heard: String): VoiceEntryDraft? {
         val text = heard.trim()
@@ -5049,6 +6137,64 @@ object VoiceEntryParser {
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt
+
+```kotlin
+package com.semmyx.ledger.voice
+
+import com.semmyx.ledger.domain.*
+import java.time.LocalDate
+
+/** Structured intent resolver. Queries are resolved BEFORE monetary entries, never saved as purchases. */
+sealed interface VoiceFinanceQuery {
+    data object Balance : VoiceFinanceQuery
+    enum class Period { TODAY, WEEK, MONTH, YEAR, ALL }
+    data class Statistics(val period: Period, val type: EntryType, val category: Category?) : VoiceFinanceQuery {
+        fun from(today: LocalDate): LocalDate = when (period) {
+            Period.TODAY -> today
+            Period.WEEK -> today.minusDays(6)
+            Period.MONTH -> today.withDayOfMonth(1)
+            Period.YEAR -> today.withDayOfYear(1)
+            Period.ALL -> FinanceWindow.EARLIEST
+        }
+    }
+    companion object {
+        fun parse(heard: String): VoiceFinanceQuery? {
+            val text = heard.lowercase().trim()
+            val balance = listOf("баланс", "balance", "скільки грошей", "сколько денег").any { it in text }
+            val hasNumber = Regex("\\d").containsMatchIn(text)
+            if (balance && !hasNumber) return Balance
+            val expense = listOf("витрат", "потрат", "расход", "spent", "spend", "expense").any { it in text }
+            val income = listOf("дохід", "доход", "заробив", "income", "earned").any { it in text }
+            if (!expense && !income) return null
+            val period = when {
+                listOf("весь час", "все время", "all time", "увесь час").any { it in text } -> Period.ALL
+                listOf("місяц", "месяц", "month").any { it in text } -> Period.MONTH
+                listOf("тиж", "недел", "week").any { it in text } -> Period.WEEK
+                listOf("за рік", "за год", "year").any { it in text } -> Period.YEAR
+                listOf("сьогодні", "сегодня", "today").any { it in text } -> Period.TODAY
+                else -> return null
+            }
+            // "I spent 100 today" describes an entry, not a statistics request.
+            if (hasNumber) return null
+            return Statistics(period, if (income) EntryType.INCOME else EntryType.EXPENSE, category(text))
+        }
+        fun category(text: String): Category? = listOf(
+            Category.TRANSFER to listOf("переказ", "перевод", "transfer"),
+            Category.DINING to listOf("ресторан", "restaurant", "кафе", "cafe"),
+            Category.CASHBACK to listOf("кешбек", "кэшбек", "cashback"),
+            Category.FOOD to listOf("продукт", "їж", "еду", "питан", "food", "grocer"),
+            Category.TRANSPORT to listOf("транспорт", "таксі", "такси", "transport", "fuel"),
+            Category.HOME to listOf("дім", "житло", "дом", "оренд", "комунал", "home", "rent"),
+            Category.HEALTH to listOf("здоров", "ліки", "лекар", "health", "medicine"),
+            Category.LEISURE to listOf("розваг", "развлеч", "leisure", "entertainment"),
+            Category.SALARY to listOf("зарплат", "salary"),
+            Category.OTHER to listOf("інше", "прочее", "other")
+        ).firstOrNull { (_, words) -> words.any { it in text } }?.first
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt
 
 ```kotlin
@@ -5121,6 +6267,181 @@ object VoiceSmallTalk {
     <path android:fillColor="#91BAF2" android:pathData="M35,109 C42,59 100,23 144,70 C109,52 65,72 55,112 Z"/>
     <path android:strokeColor="#FFFFFF" android:strokeWidth="3" android:fillColor="#00000000" android:pathData="M47,124 L71,100 L90,112 L130,78"/>
     <path android:fillColor="#F4D89F" android:pathData="M127,42 L130,52 L140,55 L130,58 L127,68 L124,58 L114,55 L124,52 Z"/>
+</vector>
+```
+
+## app/src/main/res/drawable/ic_launcher_background.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M9,0L9,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,0L19,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,0L29,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,0L39,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,0L49,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,0L59,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,0L69,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,0L79,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M89,0L89,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M99,0L99,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,9L108,9"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,19L108,19"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,29L108,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,39L108,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,49L108,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,59L108,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,69L108,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,79L108,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,89L108,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,99L108,99"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,29L89,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,39L89,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,49L89,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,59L89,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,69L89,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,79L89,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,19L29,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,19L39,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,19L49,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,19L59,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,19L69,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,19L79,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
 </vector>
 ```
 
@@ -5244,6 +6565,7 @@ object VoiceSmallTalk {
     <string name="settings">Налаштування</string>
     <string name="help">Довідка</string>
     <string name="back">Назад</string>
+    <string name="close">Закрити</string>
     <string name="retry">Спробувати ще</string>
     <string name="next">Продовжити</string>
     <string name="skip">Пропустити</string>
@@ -5324,6 +6646,7 @@ object VoiceSmallTalk {
     <string name="entry_currency_notice">Валюта: %1$s. Наявні записи зберігають початкову валюту. Змініть типову валюту в налаштуваннях перед додаванням нового запису.</string>
     <string name="amount">Сума</string>
     <string name="amount_invalid">Введіть від 0,01 до 99 999 999,99 з не більш ніж двома десятковими знаками, без роздільників тисяч.</string>
+    <string name="title_optional_hint">Необов’язково — якщо порожньо, буде назва категорії</string>
     <string name="entry_title">Назва</string>
     <string name="title_invalid">Введіть назву від 1 до 60 символів.</string>
     <string name="title_hint">Наприклад: продукти або зарплата</string>
@@ -5411,7 +6734,7 @@ object VoiceSmallTalk {
     <string name="help_premium_title">Покупки й офлайн-доступ</string>
     <string name="help_premium_body">TG Plus у Google Play — довічна покупка без автоматичного продовження. Незавершений платіж не відкриває доступ. Відновлення — з тим самим Google Play акаунтом. Покупки Play потребують періодичної перевірки власності та працюють до 7 днів офлайн. Код розробника може бути довічним або строковим. Локальний пробний доступ надається один раз на 7 АБО 14 днів — без платіжних даних і списань.</string>
     <string name="app_version">Версія %1$s</string>
-    <string name="premium_feature_trends">Рух коштів за 30 днів і весь час із деталями категорій</string>
+    <string name="premium_feature_trends">Розширені графіки та статистика банків: 7 днів, 30 днів і весь час</string>
     <string name="premium_feature_mascot">Власний персонаж-помічник на головному екрані</string>
     <string name="premium_feature_support">Пріоритетна увага розробника в Telegram</string>
     <string name="premium_source_play">Активовано через Google Play</string>
@@ -5466,8 +6789,7 @@ object VoiceSmallTalk {
     <string name="assistant_send">Надіслати Скай</string>
     <string name="premium_source_trial">Пробний доступ · без автоматичних списань</string>
     <string name="premium_local_notice">Доступ перевіряється локально. Без автоматичного продовження чи списань.</string>
-    <string name="trial_explanation">Вибери ОДИН пробний період: 7 або 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення базовий облік залишається безкоштовним.</string>
-    <string name="trial_7">Безкоштовно · 7 днів</string>
+    <string name="trial_explanation">Один безкоштовний пробний період — 14 днів. Без платіжних даних, списань і автоматичного продовження. Після завершення основний облік лишається безкоштовним.</string>
     <string name="trial_14">Безкоштовно · 14 днів</string>
     <string name="mascot_style">Вигляд помічника</string>
     <string name="mascot_gray">Сірий кіт</string>
@@ -5533,7 +6855,7 @@ object VoiceSmallTalk {
     <string name="color_error">Помилки й попередження</string>
     <string name="bank_dashboard">Банки</string>
     <string name="bank_import_title">Локальний імпорт банківських операцій</string>
-    <string name="bank_consent">Добровільно. Обробляються лише банківські застосунки та банківські SMS-відправники. Увімкніть імпорт і надайте доступ. Типово всі операції потребують підтвердження.</string>
+    <string name="bank_consent">Push-сповіщення банків розпізнаються на телефоні. Один раз надайте доступ до сповіщень. Однозначні платежі зберігаються автоматично; сумнівні — у черзі перевірки. SMS — окремий необов’язковий спосіб.</string>
     <string name="bank_enabled">Увімкнути банківський імпорт</string>
     <string name="bank_auto">Автоімпорт однозначних операцій</string>
     <string name="bank_access_yes">Доступ до сповіщень надано</string>
@@ -5547,7 +6869,7 @@ object VoiceSmallTalk {
     <string name="bank_privacy_body">Розпізнавання банківських повідомлень відбувається на пристрої. Повні тексти, OTP-коди й повні номери карток не зберігаються та не надсилаються на сервери. Room зберігає виділені операції та записи підтвердження у приватному сховищі; системні резервні копії вимкнено. Зберігаються лише останні 4 цифри картки. Вимкнення імпорту зупиняє нові записи; для скасування системного доступу відкличте дозволи Android. CSV-експорт виконується лише за вашою дією; обрана папка може належати хмарному провайдеру. PIN блокує застосунок, але не шифрує базу. Курси валют, Play і системне розпізнавання голосу — окремі функції, які можуть використовувати мережу. Імпорт не є підтвердженою банком випискою.</string>
     <string name="bank_day">Сьогодні</string>
     <string name="bank_week">Останні 7 днів</string>
-    <string name="bank_month">Цей місяць</string>
+    <string name="bank_month">Останні 30 днів</string>
     <string name="bank_cash">Готівка</string>
     <string name="bank_card">Банківська картка</string>
     <string name="bank_unknown">Невідоме джерело (старі записи)</string>
@@ -5561,13 +6883,14 @@ object VoiceSmallTalk {
     <string name="bank_ignore">Ігнорувати / між своїми рахунками</string>
     <string name="bank_recent">Останні операції · натисніть для редагування</string>
     <string name="bank_limit_recent">Тут показано до 100 останніх операцій. Підсумки враховують усі записи; основний журнал має пошук і пагінацію.</string>
-    <string name="bank_budget">Місячний ліміт витрат</string>
-    <string name="bank_budget_progress">Витрати за місяць: %1$s / %2$s</string>
+    <string name="bank_budget">Ліміт витрат за 30 днів</string>
+    <string name="bank_budget_progress">Витрати за 30 днів: %1$s / %2$s</string>
     <string name="bank_export">Експортувати всі операції у CSV</string>
     <string name="bank_clear_history">Очистити історію розпізнавання</string>
     <string name="bank_clear_warning">Чергу підтвердження та відбитки дублікатів буде видалено. Збережені операції залишаться. Після очищення старі сповіщення можуть бути розпізнані знову.</string>
     <string name="bank_app_permissions">Дозволи застосунку Android</string>
-    <string name="bank_budget_disable">Вимкнути місячний ліміт</string>
+    <string name="bank_battery">Дозволити роботу у фоні (батарея)</string>
+    <string name="bank_budget_disable">Вимкнути ліміт витрат</string>
     <string name="history_search">Пошук операцій</string>
     <string name="import_diagnostics">Діагностика імпорту</string>
     <string name="import_connected">Сервіс сповіщень підключено</string>
@@ -5589,7 +6912,51 @@ object VoiceSmallTalk {
     <string name="import_auto_done">Операцію збережено автоматично.</string>
     <string name="import_queued">Операція очікує підтвердження нижче.</string>
     <string name="import_repeated">Повторну доставку проігноровано; дублікат не збережено.</string>
-    <string name="import_waiting">Очікування нового банківського сповіщення. Минулі сповіщення не скануються.</string>
+    <string name="import_waiting">Очікуємо push банку. Перепідключення читає сповіщення, що залишилися у шторці.</string>
+    <string name="import_mode_title">Спосіб імпорту</string>
+    <string name="import_mode_api">API банку</string>
+    <string name="import_mode_sms">SMS</string>
+    <string name="import_mode_notify">Push банку (рекомендовано)</string>
+    <string name="api_howto">1) Відкрийте api.monobank.ua і увійдіть через застосунок monobank. 2) Скопіюйте особистий токен. 3) Вставте його сюди. Застосунок лише читає виписку (read-only) і перевіряє нові платежі приблизно кожні 15 хвилин, навіть коли закритий. Токен зберігається на телефоні в зашифованому вигляді.</string>
+    <string name="api_open_site">Відкрити api.monobank.ua</string>
+    <string name="api_token_label">API-токен monobank</string>
+    <string name="api_connect">Підключити</string>
+    <string name="api_connecting">Підключення…</string>
+    <string name="api_connected">Підключено · рахунків: %1$d</string>
+    <string name="api_last_sync">Остання синхронізація: %1$s</string>
+    <string name="api_imported_last">нових: %1$d</string>
+    <string name="api_syncing">Синхронізація…</string>
+    <string name="api_sync_now">Синхронізувати зараз</string>
+    <string name="api_disconnect">Відключити</string>
+    <string name="api_error_bad_token">monobank не прийняв токен. Скопіюйте його ще раз з api.monobank.ua.</string>
+    <string name="api_error_rate">monobank дозволяє один запит на хвилину. Зачекайте хвилину й спробуйте знову.</string>
+    <string name="api_error_network">Не вдалося зʼєднатися з monobank. Перевірте інтернет.</string>
+    <string name="api_error_no_accounts">За цим токеном рахунків не знайдено.</string>
+    <string name="sms_howto">Застосунок читає SMS від банків (PRIVATBANK, monobank, SENSE, Ощад, ПУМБ…) одразу після надходження й сам додає платежі. Інші SMS ігноруються й не зберігаються.</string>
+    <string name="sms_scan">Сканувати SMS за 30 днів</string>
+    <string name="sms_scanning">Сканування…</string>
+    <string name="sms_scan_result">Банківських SMS знайдено: %1$d · додано: %2$d · потребують підтвердження: %3$d</string>
+    <string name="sms_restricted_tip">Якщо Android блокує доступ до SMS: Налаштування → Застосунки → TG Ledger → ⋮ → Дозволити обмежені налаштування, потім знову дозвольте SMS.</string>
+    <string name="pay_source_title">Чим оплачено</string>
+    <string name="pay_source_required">Оберіть: картка чи готівка</string>
+    <string name="voice_ask_source">Картка чи готівка?</string>
+    <string name="cat_locked_hint">Кіт-помічник входить у Premium. Торкніться, щоб розблокувати (14 днів безкоштовно).</string>
+    <string name="bank_setup">Налаштування імпорту</string>
+    <string name="push_howto">Увімкніть доступ до сповіщень, автоімпорт і роботу у фоні. Новий push банку читається без відкритого екрана. Повторне підключення також читає сповіщення, що ще є у шторці, навіть отримані кілька хвилин тому. Android не надає цьому застосунку історію вже прибраних сповіщень. Після «Примусово зупинити» відкрийте TG Ledger знову. На деяких телефонах спочатку потрібен дозвіл «Обмежені налаштування».</string>
+    <string name="privat_api_title">ПриватБанк · Бізнес / ФОП</string>
+    <string name="privat_api_howto">Для рахунків Приват24 для бізнесу / ФОП, не для звичайних особистих карток Приват24. Інтеграція (Автоклієнт) → API: створіть токен з доступом лише до балансів і транзакцій. Застосунок тільки читає виписку. Токен шифрується на телефоні. Перша синхронізація — за 30 днів, наступні — приблизно кожні 15 хвилин.</string>
+    <string name="privat_api_site">Інструкція API ПриватБанку</string>
+    <string name="privat_api_token">Токен Автоклієнта</string>
+    <string name="privat_api_connected">Приват24 для бізнесу підключено</string>
+    <string name="privat_api_error">Не вдалося прочитати виписку. Перевірте інтернет, токен Автоклієнта та дозвіл читання транзакцій. Токен має бути з Приват24 для бізнесу.</string>
+    <string name="other_api_note">Інші банки: універсального API-ключа немає. Open Banking потребує підтримуваної банком згоди та авторизованого постачальника. Для особистого Приват24 та інших банків оберіть push. Якщо застосунку немає у списку, додайте package у «Застосунки банків» → «Інший банк». Не вводьте тут пароль банку, PIN чи CVV.</string>
+    <string name="help_banks_title">Банки та автоматичний імпорт</string>
+    <string name="help_banks_body">Банки показують витрати за картками, готівкою та банками. Безкоштовно — сьогодні. TG Plus або активний пробний період — 7 днів, 30 днів і весь час. Період змінює статистику, а не збирання операцій.\n\nРекомендовано: Push банку → доступ до сповіщень → увімкнений автоімпорт. Розпізнавання локальне, без SMS і API-токена. Однозначні платежі записуються до журналу, коли екран застосунку закритий. Підтримуються звичайні, розгорнуті сповіщення, списки та повідомлення. OTP, відхилені платежі та лише баланс не додаються. Сумнівні суми, перекази та можливі дублікати потребують перевірки.\n\nПерепідключення / відкриття застосунку читає сповіщення банків, що ще залишилися у шторці. Прибрані повідомлення недоступні. «Примусово зупинити» вимикає фонову роботу до нового відкриття застосунку. Обмеження батареї можуть зупиняти або затримувати імпорт.\n\nAPI: особистий токен monobank та токен Автоклієнта Приват24 для бізнесу. Автоклієнт — для бізнесу / ФОП, не для звичайних особистих карток. API-синхронізація періодична, не миттєва. Інші банки потребують окремої авторизованої інтеграції Open Banking; за наявності використовуйте push. Відсутній застосунок можна додати як «Інший банк».\n\nДодаткові підтвердження потребують дозволу Android на сповіщення; він не впливає на збереження операцій. Імпорт не є підтвердженою банком випискою: звіряйте журнал із банком і перевіряйте чергу.</string>
+    <string name="import_confirm_permission">Дозволити сповіщення про збережені платежі</string>
+    <string name="import_confirm_enabled">Сповіщення про збережені платежі ввімкнено</string>
+    <string name="assistant_write_short">Написати</string>
+    <string name="major_release_title">Що нового у %1$s</string>
+    <string name="major_release_body">• API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
 </resources>
 ```
 
@@ -5604,6 +6971,21 @@ object VoiceSmallTalk {
 </resources>
 ```
 
+## app/src/main/res/values/colors.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
+```
+
 ## app/src/main/res/values/strings.xml
 
 ```xml
@@ -5614,6 +6996,7 @@ object VoiceSmallTalk {
     <string name="settings">Settings</string>
     <string name="help">Help</string>
     <string name="back">Back</string>
+    <string name="close">Close</string>
     <string name="retry">Try again</string>
     <string name="next">Continue</string>
     <string name="skip">Skip</string>
@@ -5694,6 +7077,7 @@ object VoiceSmallTalk {
     <string name="entry_currency_notice">Currency: %1$s. Existing entries keep their original currency. Change the default in Settings before adding a new entry.</string>
     <string name="amount">Amount</string>
     <string name="amount_invalid">Enter 0.01–99,999,999.99 with at most two decimal places; do not use thousands separators.</string>
+    <string name="title_optional_hint">Optional — the category name is used if empty</string>
     <string name="entry_title">Title</string>
     <string name="title_invalid">Enter a title of 1–60 characters.</string>
     <string name="title_hint">For example: groceries or salary</string>
@@ -5781,7 +7165,7 @@ object VoiceSmallTalk {
     <string name="help_premium_title">Purchases &amp; offline access</string>
     <string name="help_premium_body">TG Plus on Google Play is a non-consumable lifetime purchase, not an auto-renewing subscription. Pending payments never unlock access. Restore with the same Google Play account. Signed Play purchases require periodic ownership verification and allow up to 7 days offline. Developer codes may be lifetime or time-limited. A local trial is available once for 7 OR 14 days, without payment details or charges.</string>
     <string name="app_version">Version %1$s</string>
-    <string name="premium_feature_trends">30-day and all-time cash flow with category details</string>
+    <string name="premium_feature_trends">Extended trends and bank statistics: 7 days, 30 days and all time</string>
     <string name="premium_feature_mascot">Your own assistant character on the dashboard</string>
     <string name="premium_feature_support">Priority attention from the developer on Telegram</string>
     <string name="premium_source_play">Active via Google Play</string>
@@ -5836,8 +7220,7 @@ object VoiceSmallTalk {
     <string name="assistant_send">Send to Sky</string>
     <string name="premium_source_trial">Free trial · no automatic charges</string>
     <string name="premium_local_notice">Access is checked locally. No automatic renewal or charges.</string>
-    <string name="trial_explanation">Choose ONE trial: 7 or 14 days. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
-    <string name="trial_7">Try free · 7 days</string>
+    <string name="trial_explanation">One free 14-day trial. No payment details, charges, or automatic renewal. After it ends, core tracking remains free.</string>
     <string name="trial_14">Try free · 14 days</string>
     <string name="mascot_style">Assistant appearance</string>
     <string name="mascot_gray">Gray cat</string>
@@ -5903,7 +7286,7 @@ object VoiceSmallTalk {
     <string name="color_error">Errors and alerts</string>
     <string name="bank_dashboard">Banks</string>
     <string name="bank_import_title">Offline bank import</string>
-    <string name="bank_consent">Optional. Only enabled bank apps and bank SMS senders are examined. Turn import on, then grant access. Review mode is the default.</string>
+    <string name="bank_consent">Bank push notifications are parsed on this phone. Enable notification access once. Unambiguous payments are saved automatically; uncertain messages wait for review. SMS is optional, not required for push.</string>
     <string name="bank_enabled">Enable bank import</string>
     <string name="bank_auto">Auto-import confident operations</string>
     <string name="bank_access_yes">Notification access granted</string>
@@ -5917,7 +7300,7 @@ object VoiceSmallTalk {
     <string name="bank_privacy_body">Bank parsing happens on this device. Raw message texts, OTPs and full card numbers are not saved or sent to servers. Room stores extracted operations and review records in private app storage; system backup is disabled. Only the final four card digits are retained. Turning import off stops new ingestion; revoke notification/SMS access in Android settings to remove system access. CSV export is explicit and saves to the location you choose, which may be a cloud provider. PIN is an app lock, not database encryption. Optional exchange-rate, Play and system speech services are separate and may use the network. Imported statements are not bank-verified and must be reviewed.</string>
     <string name="bank_day">Today</string>
     <string name="bank_week">Last 7 days</string>
-    <string name="bank_month">This month</string>
+    <string name="bank_month">Last 30 days</string>
     <string name="bank_cash">Cash</string>
     <string name="bank_card">Bank card</string>
     <string name="bank_unknown">Unspecified source (older entries)</string>
@@ -5931,13 +7314,14 @@ object VoiceSmallTalk {
     <string name="bank_ignore">Ignore / own-account transfer</string>
     <string name="bank_recent">Recent operations · tap to edit</string>
     <string name="bank_limit_recent">This view shows up to 100 recent operations. Totals include every matching entry; the main ledger has search and paging.</string>
-    <string name="bank_budget">Monthly expense limit</string>
-    <string name="bank_budget_progress">Monthly spending: %1$s / %2$s</string>
+    <string name="bank_budget">30-day spending limit</string>
+    <string name="bank_budget_progress">Spending over 30 days: %1$s / %2$s</string>
     <string name="bank_export">Export all transactions to CSV</string>
     <string name="bank_clear_history">Clear recognition history</string>
     <string name="bank_clear_warning">Pending reviews and duplicate fingerprints will be deleted. Saved transactions are kept. Old notifications could be recognized again after clearing.</string>
     <string name="bank_app_permissions">Android app permissions</string>
-    <string name="bank_budget_disable">Disable monthly limit</string>
+    <string name="bank_battery">Allow background work (battery)</string>
+    <string name="bank_budget_disable">Disable spending limit</string>
     <string name="history_search">Search operations</string>
     <string name="import_diagnostics">Import diagnostics</string>
     <string name="import_connected">Notification service is connected</string>
@@ -5959,7 +7343,51 @@ object VoiceSmallTalk {
     <string name="import_auto_done">Operation saved automatically.</string>
     <string name="import_queued">Operation awaits confirmation below.</string>
     <string name="import_repeated">Repeated delivery ignored; no duplicate was saved.</string>
-    <string name="import_waiting">Waiting for a new bank notification. Past notification history is not scanned.</string>
+    <string name="import_waiting">Waiting for bank push. Reconnect scans notifications still in the shade.</string>
+    <string name="import_mode_title">Import method</string>
+    <string name="import_mode_api">Bank API</string>
+    <string name="import_mode_sms">SMS</string>
+    <string name="import_mode_notify">Bank push (recommended)</string>
+    <string name="api_howto">1) Open api.monobank.ua and sign in with the monobank app. 2) Copy your personal token. 3) Paste it here. The app only reads your statement (read-only) and checks for new payments every ~15 minutes, even when closed. The token is stored encrypted on this phone.</string>
+    <string name="api_open_site">Open api.monobank.ua</string>
+    <string name="api_token_label">monobank API token</string>
+    <string name="api_connect">Connect</string>
+    <string name="api_connecting">Connecting…</string>
+    <string name="api_connected">Connected · accounts: %1$d</string>
+    <string name="api_last_sync">Last sync: %1$s</string>
+    <string name="api_imported_last">new: %1$d</string>
+    <string name="api_syncing">Syncing…</string>
+    <string name="api_sync_now">Sync now</string>
+    <string name="api_disconnect">Disconnect</string>
+    <string name="api_error_bad_token">monobank rejected the token. Copy it again from api.monobank.ua.</string>
+    <string name="api_error_rate">monobank allows one request per minute. Wait a minute and try again.</string>
+    <string name="api_error_network">Could not reach monobank. Check the internet connection.</string>
+    <string name="api_error_no_accounts">No accounts found for this token.</string>
+    <string name="sms_howto">The app reads SMS from banks (PRIVATBANK, monobank, SENSE, Oschad, PUMB…) as they arrive and imports payments automatically. Other SMS are ignored and never stored.</string>
+    <string name="sms_scan">Scan SMS from the last 30 days</string>
+    <string name="sms_scanning">Scanning…</string>
+    <string name="sms_scan_result">Bank SMS found: %1$d · added: %2$d · need confirmation: %3$d</string>
+    <string name="sms_restricted_tip">If Android blocks SMS access: Settings → Apps → TG Ledger → ⋮ → Allow restricted settings, then allow SMS again.</string>
+    <string name="pay_source_title">Paid with</string>
+    <string name="pay_source_required">Choose card or cash</string>
+    <string name="voice_ask_source">Card or cash?</string>
+    <string name="cat_locked_hint">The cat assistant is part of Premium. Tap to unlock (14-day trial is free).</string>
+    <string name="bank_setup">Import settings</string>
+    <string name="push_howto">Enable access to notifications, turn on auto-import and allow background activity. New bank push is read without an open screen. Reconnect also reads bank notifications still visible in the shade, including recent ones. Android does not expose dismissed notification history to this app. After Force stop, open TG Ledger again. Some phones require Allow restricted settings before notification access.</string>
+    <string name="privat_api_title">PrivatBank · Business / sole proprietor</string>
+    <string name="privat_api_howto">For Privat24 Business AutoClient accounts, not ordinary retail Privat24 cards. In Privat24 Business → Integration (AutoClient) → API, create a token restricted to balances and transactions. Only statements are requested. The token is encrypted on this phone. First sync imports 30 days; later syncs run approximately every 15 minutes.</string>
+    <string name="privat_api_site">PrivatBank API instructions</string>
+    <string name="privat_api_token">AutoClient token</string>
+    <string name="privat_api_connected">Privat24 Business connected</string>
+    <string name="privat_api_error">Could not read the statement. Check internet, AutoClient token and its read permissions. This token must belong to Privat24 Business.</string>
+    <string name="other_api_note">Other banks: there is no universal API key. Open Banking needs a bank-supported consent flow and an authorised provider. For retail Privat24 and other banks, use push. Add the bank app package under App mapping → Other bank if it is missing. Never enter your bank password, PIN or CVV here.</string>
+    <string name="help_banks_title">Banks and automatic import</string>
+    <string name="help_banks_body">Banks shows card, cash and bank spending. Free access: today. TG Plus or an active trial: 7 days, 30 days and all time. A period changes statistics, not whether operations are captured.\n\nRecommended: Bank push → grant notification access → keep auto-import enabled. Recognition runs locally, without SMS or an API token, and writes clear payments into the ledger while its screen is closed. It supports plain, expanded, inbox and messaging notifications. OTPs, declines and balance-only messages are not operations. Ambiguous messages, transfers and possible duplicates need review.\n\nReconnect / opening the app reads bank notifications still in the notification shade. Dismissed messages cannot be recovered through notification access. Force-stop disables background work until you open the app again. Battery restrictions can delay or stop it.\n\nAPI: monobank personal token and Privat24 Business AutoClient token are supported. PrivatBank AutoClient is for business/sole proprietor accounts, not ordinary retail cards. API sync is periodic, not instant. Other banks need a bank-specific authorised Open Banking integration; use push where available. A missing bank app can be mapped under Other bank.\n\nOptional confirmations need Android notification permission. They do not affect saving. Import is not a certified bank statement: reconcile against your bank and check the review queue.</string>
+    <string name="import_confirm_permission">Allow saved-payment notifications</string>
+    <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
+    <string name="assistant_write_short">Write</string>
+    <string name="major_release_title">What is new in %1$s</string>
+    <string name="major_release_body">• monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
 </resources>
 ```
 
@@ -5981,6 +7409,24 @@ object VoiceSmallTalk {
     </style>
     <color name="launcher_background">#10223F</color>
 </resources>
+```
+
+## app/src/main/res/xml/backup_rules.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample backup rules file; uncomment and customize as necessary.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+   Note: This file is ignored for devices older than API 31
+   See https://developer.android.com/about/versions/12/backup-restore
+-->
+<full-backup-content>
+    <!--
+   <include domain="sharedpref" path="."/>
+   <exclude domain="sharedpref" path="device.xml"/>
+-->
+</full-backup-content>
 ```
 
 ## app/src/main/res/xml/data_extraction_rules.xml
@@ -6016,10 +7462,93 @@ object VoiceSmallTalk {
 </network-security-config>
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/presentation/MainDispatcherRule.kt
+## app/src/test/java/com/example/myapplication/ExampleUnitTest.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation
+package com.example.myapplication
+
+import org.junit.Test
+
+import org.junit.Assert.*
+
+/**
+ * Example local unit test, which will execute on the development machine (host).
+ *
+ * See [testing documentation](http://d.android.com/tools/testing).
+ */
+class ExampleUnitTest {
+    @Test
+    fun addition_isCorrect() {
+        assertEquals(4, 2 + 2)
+    }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt
+
+```kotlin
+package com.semmyx.ledger
+import androidx.lifecycle.ViewModelStore
+import com.semmyx.ledger.bank.BankViewModel
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.lang.reflect.Proxy
+import java.time.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.test.*
+import org.junit.*
+import org.junit.Assert.*
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class BankViewModelAccessTest {
+    @get:Rule val main = MainDispatcherRule()
+    @Test fun freeQueriesOnlyTodayAndExpiredPremiumCannotKeepThirtyDays() = runTest {
+        val now = LocalDate.of(2026,10,14)
+        var from: LocalDate? = null
+        val repo = Proxy.newProxyInstance(BankRepository::class.java.classLoader,arrayOf(BankRepository::class.java)) { _, method, args ->
+            when (method.name) {
+                "getDiagnostics" -> MutableStateFlow(ImportDiagnostics())
+                "getMonobankStatus", "getPrivatStatus" -> MutableStateFlow(MonobankStatus())
+                "getEnabled", "getAutoImport" -> true
+                "getImportMode" -> "NOTIFY"
+                "sources" -> { from = args!![1] as LocalDate; flowOf(emptyList<BankSourceSpend>()) }
+                "categorySpending" -> flowOf(emptyList<BankCategorySpend>())
+                "recent" -> flowOf(emptyList<LedgerEntry>())
+                "categories" -> flowOf(emptyList<CustomBankCategory>())
+                "reviews" -> flowOf(emptyList<ImportReview>())
+                else -> error("Unexpected method ${method.name}")
+            }
+        } as BankRepository
+        val preferences = Proxy.newProxyInstance(PreferencesRepository::class.java.classLoader,arrayOf(PreferencesRepository::class.java)) { _, _, _ -> MutableStateFlow(UserPreferences()) } as PreferencesRepository
+        val access = MutableStateFlow(PremiumState())
+        val premium = object : PremiumRepository {
+            override val state = access
+            override suspend fun refresh() {}
+            override suspend fun activateDeveloperToken(token: String) = false
+            override suspend fun developerInstallationId() = "test"
+            override fun clearIssue() {}
+        }
+        val model = BankViewModel(repo,preferences,premium,Clock.fixed(now.atStartOfDay(ZoneOffset.UTC).toInstant(),ZoneOffset.UTC))
+        val store = ViewModelStore().apply { put("bank",model) }
+        val collector = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { model.state.collect {} }
+        try {
+            model.period("MONTH"); runCurrent()
+            assertEquals("DAY",model.state.value.filter.period); assertEquals(now,from)
+            access.value = PremiumState(entitled=true, source=PremiumSource.TRIAL); runCurrent()
+            assertEquals(now.minusDays(29),from); assertEquals("MONTH",model.state.value.filter.period)
+            access.value = PremiumState(entitled=false); runCurrent()
+            assertEquals("DAY",model.state.value.filter.period); assertEquals(now,from)
+            model.period("ALL"); runCurrent(); assertEquals(now,from)
+        } finally { collector.cancel(); store.clear() }
+    }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt
+
+```kotlin
+package com.semmyx.ledger
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -6034,14 +7563,15 @@ class MainDispatcherRule(val dispatcher: TestDispatcher = StandardTestDispatcher
 }
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/presentation/ViewModelTest.kt
+## app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt
 
 ```kotlin
-package com.semmyx.ledger.presentation
+package com.semmyx.ledger
 
 import androidx.lifecycle.ViewModelStore
 import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.presentation.auth.AuthViewModel
+import com.semmyx.ledger.auth.AuthViewModel
+import com.semmyx.ledger.navigation.AppViewModel
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -6116,13 +7646,11 @@ private class TestPreferences : PreferencesRepository {
 }
 ```
 
-## app/src/test/kotlin/com/semmyx/ledger/voice/CatFaceMeshTest.kt
+## app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt
 
 ```kotlin
-package com.semmyx.ledger.voice
+package com.semmyx.ledger.cat
 
-import com.semmyx.ledger.presentation.premium.CatFaceMesh
-import com.semmyx.ledger.presentation.premium.CatPose
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -6167,28 +7695,28 @@ import org.junit.Test
 class FinanceUpgradeTest {
     private val today = LocalDate.of(2026, 10, 4)
     @Test fun monthlyQueryResolvesCurrentCalendarMonth() {
-        val query = FinanceQuery.parse("Скай витрати за місяць") as FinanceQuery.Statistics
+        val query = VoiceFinanceQuery.parse("Скай витрати за місяць") as VoiceFinanceQuery.Statistics
         assertEquals(EntryType.EXPENSE, query.type)
         assertEquals(LocalDate.of(2026, 10, 1), query.from(today))
         assertNull(query.category)
     }
     @Test fun monthlyFoodQuery() {
-        val query = FinanceQuery.parse("Скай витрати за місяць за продукти") as FinanceQuery.Statistics
+        val query = VoiceFinanceQuery.parse("Скай витрати за місяць за продукти") as VoiceFinanceQuery.Statistics
         assertEquals(Category.FOOD, query.category)
-        assertEquals(FinanceQuery.Period.MONTH, query.period)
+        assertEquals(VoiceFinanceQuery.Period.MONTH, query.period)
     }
     @Test fun russianAndEnglishQueries() {
-        assertEquals(Category.TRANSPORT, (FinanceQuery.parse("расходы за месяц на транспорт") as FinanceQuery.Statistics).category)
-        assertEquals(Category.FOOD, (FinanceQuery.parse("expenses this month for food") as FinanceQuery.Statistics).category)
+        assertEquals(Category.TRANSPORT, (VoiceFinanceQuery.parse("расходы за месяц на транспорт") as VoiceFinanceQuery.Statistics).category)
+        assertEquals(Category.FOOD, (VoiceFinanceQuery.parse("expenses this month for food") as VoiceFinanceQuery.Statistics).category)
     }
     @Test fun periodsAndIncome() {
-        assertEquals(today.minusDays(6), (FinanceQuery.parse("витрати за тиждень") as FinanceQuery.Statistics).from(today))
-        assertEquals(FinanceWindow.EARLIEST, (FinanceQuery.parse("витрати за весь час") as FinanceQuery.Statistics).from(today))
-        assertEquals(EntryType.INCOME, (FinanceQuery.parse("дохід за місяць") as FinanceQuery.Statistics).type)
-        assertEquals(today.withDayOfYear(1), (FinanceQuery.parse("витрати за рік") as FinanceQuery.Statistics).from(today))
+        assertEquals(today.minusDays(6), (VoiceFinanceQuery.parse("витрати за тиждень") as VoiceFinanceQuery.Statistics).from(today))
+        assertEquals(FinanceWindow.EARLIEST, (VoiceFinanceQuery.parse("витрати за весь час") as VoiceFinanceQuery.Statistics).from(today))
+        assertEquals(EntryType.INCOME, (VoiceFinanceQuery.parse("дохід за місяць") as VoiceFinanceQuery.Statistics).type)
+        assertEquals(today.withDayOfYear(1), (VoiceFinanceQuery.parse("витрати за рік") as VoiceFinanceQuery.Statistics).from(today))
     }
     @Test fun aPurchaseIsNotAStatisticsQuestion() {
-        assertNull(FinanceQuery.parse("я витратив 100 грн сьогодні"))
+        assertNull(VoiceFinanceQuery.parse("я витратив 100 грн сьогодні"))
         assertEquals(10000L, VoiceEntryParser.parse("я витратив 100 грн сьогодні")!!.amountMinor)
     }
     @Test fun missingCurrencyNeverIndexesMissingRegexGroup() {
@@ -6214,13 +7742,13 @@ class FinanceUpgradeTest {
         assertEquals(VoiceSmallTalk.Topic.GREETING, VoiceSmallTalk.classify("привет"))
     }
     @Test fun spokenNegativeHasAnExplicitMinusWord() {
-        assertEquals("мінус 2000 гривень", SpokenMoney.format(-200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
-        assertEquals("minus 2000 hryvnias", SpokenMoney.format(-200000, LedgerCurrency.UAH, AppLanguage.ENGLISH))
-        assertFalse(SpokenMoney.format(200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN).contains("мінус"))
-        assertTrue(SpokenMoney.format(Long.MIN_VALUE, LedgerCurrency.UAH, AppLanguage.ENGLISH).startsWith("minus "))
+        assertEquals("мінус 2000 гривень", SpokenMoneyFormatter.format(-200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
+        assertEquals("minus 2000 hryvnias", SpokenMoneyFormatter.format(-200000, LedgerCurrency.UAH, AppLanguage.ENGLISH))
+        assertFalse(SpokenMoneyFormatter.format(200000, LedgerCurrency.UAH, AppLanguage.UKRAINIAN).contains("мінус"))
+        assertTrue(SpokenMoneyFormatter.format(Long.MIN_VALUE, LedgerCurrency.UAH, AppLanguage.ENGLISH).startsWith("minus "))
     }
     @Test fun zeroIsNotDebt() {
-        assertEquals("0 гривень", SpokenMoney.format(0, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
+        assertEquals("0 гривень", SpokenMoneyFormatter.format(0, LedgerCurrency.UAH, AppLanguage.UKRAINIAN))
     }
 }
 ```
@@ -6253,6 +7781,80 @@ class OptionalVoiceAssistantParserTest {
     }
     @Test fun returnsNullForBlankInput() {
         assertNull(OptionalVoiceAssistant.classify("   "))
+    }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt
+
+```kotlin
+package com.semmyx.ledger.voice
+
+import org.junit.Assert.*
+import org.junit.Test
+
+class VoiceSourceTest {
+    @Test fun sourceIsDetectedOnlyWhenSpoken() {
+        assertEquals("CARD", VoiceEntryParser.detectSource("купив каву за 50 карткою"))
+        assertEquals("CASH", VoiceEntryParser.detectSource("bought coffee for 5 cash"))
+        assertEquals("CASH", VoiceEntryParser.detectSource("витратив 100 готівкою"))
+        assertNull(VoiceEntryParser.detectSource("купив каву за 50"))
+        assertNull(VoiceEntryParser.detectSource("карткою або готівкою 50"))
+    }
+}
+```
+
+## bank-fixture/build.gradle.kts
+
+```kotlin
+plugins { id("com.android.application") }
+android {
+    namespace = "com.semmyx.ledger.bankfixture"
+    compileSdk = 36
+    defaultConfig { applicationId = "com.semmyx.ledger.bankfixture"; minSdk = 26; targetSdk = 36; versionCode = 1; versionName = "1" }
+    buildTypes { release { isMinifyEnabled = false } }
+    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+}
+```
+
+## bank-fixture/src/main/AndroidManifest.xml
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application android:label="QA Bank (test only)" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <receiver android:name=".FixtureReceiver" android:exported="true" />
+    </application>
+</manifest>
+```
+
+## bank-fixture/src/main/java/com/semmyx/ledger/bankfixture/FixtureReceiver.java
+
+```java
+package com.semmyx.ledger.bankfixture;
+import android.app.*;
+import android.content.*;
+
+/** CI-only second app. Never bundled into TG Ledger or included in its release APK. */
+public class FixtureReceiver extends BroadcastReceiver {
+    @Override public void onReceive(Context context, Intent intent) {
+        NotificationManager nm = context.getSystemService(NotificationManager.class);
+        if (intent.getBooleanExtra("cancel", false)) { nm.cancelAll(); return; }
+        nm.createNotificationChannel(new NotificationChannel("qa_bank", "QA Bank payments", NotificationManager.IMPORTANCE_DEFAULT));
+        int id = intent.getIntExtra("id", 1);
+        int cents = intent.getIntExtra("cents", 12550);
+        long at = intent.getLongExtra("at", System.currentTimeMillis());
+        String text = "Ви витратили " + (cents / 100) + "," + String.format(java.util.Locale.ROOT, "%02d", cents % 100) + " грн у Сільпо; Залишок: 10000 грн";
+        Notification.Builder b = new Notification.Builder(context, "qa_bank")
+            .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Сільпо")
+            .setContentText(text).setWhen(at).setShowWhen(true);
+        String style = intent.getStringExtra("style");
+        if ("big".equals(style)) b.setStyle(new Notification.BigTextStyle().bigText(text));
+        if ("inbox".equals(style)) b.setStyle(new Notification.InboxStyle().addLine(text)
+            .addLine("Оплата 11,22 грн у АТБ; Баланс: 9000 грн"));
+        if ("messaging".equals(style)) b.setStyle(new Notification.MessagingStyle("Bank")
+            .addMessage(text, at, "Сільпо"));
+        nm.notify("qa_" + id, id, b.build());
     }
 }
 ```
@@ -6322,12 +7924,670 @@ dependencies {
 }
 ```
 
-## data/consumer-rules.pro
+## data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/2.json
 
-```text
-# Gson reads DTO fields reflectively, including after release shrinking.
--keep class com.semmyx.ledger.data.remote.RateDto { *; }
--keepattributes Signature,RuntimeVisibleAnnotations,AnnotationDefault
+```json
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "26836e1c65598d48f9b1e51268027d2f",
+    "entities": [
+      {
+        "tableName": "entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `category` TEXT NOT NULL, `epochDay` INTEGER NOT NULL, `note` TEXT NOT NULL, `searchText` TEXT NOT NULL, `createdAtMillis` INTEGER NOT NULL, `deletedAtMillis` INTEGER, `sourceType` TEXT NOT NULL DEFAULT 'UNKNOWN', `bankId` TEXT, `cardLast4` TEXT, `eventAtMillis` INTEGER, `customCategoryId` TEXT, `origin` TEXT NOT NULL DEFAULT 'MANUAL', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchText",
+            "columnName": "searchText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMillis",
+            "columnName": "createdAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deletedAtMillis",
+            "columnName": "deletedAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sourceType",
+            "columnName": "sourceType",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'UNKNOWN'"
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "customCategoryId",
+            "columnName": "customCategoryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'MANUAL'"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_entries_currency_deletedAtMillis_epochDay_createdAtMillis",
+            "unique": false,
+            "columnNames": [
+              "currency",
+              "deletedAtMillis",
+              "epochDay",
+              "createdAtMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_entries_currency_deletedAtMillis_epochDay_createdAtMillis` ON `${TABLE_NAME}` (`currency`, `deletedAtMillis`, `epochDay`, `createdAtMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "rates",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`currency` TEXT NOT NULL, `uahPerUnit` REAL NOT NULL, `epochDay` INTEGER NOT NULL, `fetchedAtMillis` INTEGER NOT NULL, PRIMARY KEY(`currency`))",
+        "fields": [
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uahPerUnit",
+            "columnName": "uahPerUnit",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fetchedAtMillis",
+            "columnName": "fetchedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "currency"
+          ]
+        }
+      },
+      {
+        "tableName": "custom_categories",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `colorHex` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorHex",
+            "columnName": "colorHex",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "bank_inbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `eventKey` TEXT NOT NULL, `bankId` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `merchant` TEXT NOT NULL, `cardLast4` TEXT, `eventAtMillis` INTEGER NOT NULL, `receivedAtMillis` INTEGER NOT NULL, `timeFromMessage` INTEGER NOT NULL, `transfer` INTEGER NOT NULL, `category` TEXT NOT NULL, `origin` TEXT NOT NULL, `status` TEXT NOT NULL, `entryId` TEXT, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventKey",
+            "columnName": "eventKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "merchant",
+            "columnName": "merchant",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedAtMillis",
+            "columnName": "receivedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timeFromMessage",
+            "columnName": "timeFromMessage",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transfer",
+            "columnName": "transfer",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryId",
+            "columnName": "entryId",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_bank_inbox_eventKey",
+            "unique": true,
+            "columnNames": [
+              "eventKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_bank_inbox_eventKey` ON `${TABLE_NAME}` (`eventKey`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '26836e1c65598d48f9b1e51268027d2f')"
+    ]
+  }
+}
+```
+
+## data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/3.json
+
+```json
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 3,
+    "identityHash": "d2c7b95ecb8ce12dbbd2f6fb3e5066fd",
+    "entities": [
+      {
+        "tableName": "entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `category` TEXT NOT NULL, `epochDay` INTEGER NOT NULL, `note` TEXT NOT NULL, `searchText` TEXT NOT NULL, `createdAtMillis` INTEGER NOT NULL, `deletedAtMillis` INTEGER, `sourceType` TEXT NOT NULL DEFAULT 'UNKNOWN', `bankId` TEXT, `cardLast4` TEXT, `eventAtMillis` INTEGER, `customCategoryId` TEXT, `origin` TEXT NOT NULL DEFAULT 'MANUAL', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchText",
+            "columnName": "searchText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMillis",
+            "columnName": "createdAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deletedAtMillis",
+            "columnName": "deletedAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sourceType",
+            "columnName": "sourceType",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'UNKNOWN'"
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "customCategoryId",
+            "columnName": "customCategoryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'MANUAL'"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_entries_currency_deletedAtMillis_epochDay_createdAtMillis",
+            "unique": false,
+            "columnNames": [
+              "currency",
+              "deletedAtMillis",
+              "epochDay",
+              "createdAtMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_entries_currency_deletedAtMillis_epochDay_createdAtMillis` ON `${TABLE_NAME}` (`currency`, `deletedAtMillis`, `epochDay`, `createdAtMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "rates",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`currency` TEXT NOT NULL, `uahPerUnit` REAL NOT NULL, `epochDay` INTEGER NOT NULL, `fetchedAtMillis` INTEGER NOT NULL, PRIMARY KEY(`currency`))",
+        "fields": [
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uahPerUnit",
+            "columnName": "uahPerUnit",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fetchedAtMillis",
+            "columnName": "fetchedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "currency"
+          ]
+        }
+      },
+      {
+        "tableName": "custom_categories",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `colorHex` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorHex",
+            "columnName": "colorHex",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "bank_inbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `eventKey` TEXT NOT NULL, `bankId` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `merchant` TEXT NOT NULL, `cardLast4` TEXT, `eventAtMillis` INTEGER NOT NULL, `receivedAtMillis` INTEGER NOT NULL, `timeFromMessage` INTEGER NOT NULL, `transfer` INTEGER NOT NULL, `category` TEXT NOT NULL, `origin` TEXT NOT NULL, `status` TEXT NOT NULL, `entryId` TEXT, `groupKey` TEXT, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventKey",
+            "columnName": "eventKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "merchant",
+            "columnName": "merchant",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedAtMillis",
+            "columnName": "receivedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timeFromMessage",
+            "columnName": "timeFromMessage",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transfer",
+            "columnName": "transfer",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryId",
+            "columnName": "entryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "groupKey",
+            "columnName": "groupKey",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_bank_inbox_eventKey",
+            "unique": true,
+            "columnNames": [
+              "eventKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_bank_inbox_eventKey` ON `${TABLE_NAME}` (`eventKey`)"
+          },
+          {
+            "name": "index_bank_inbox_groupKey",
+            "unique": false,
+            "columnNames": [
+              "groupKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_bank_inbox_groupKey` ON `${TABLE_NAME}` (`groupKey`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'd2c7b95ecb8ce12dbbd2f6fb3e5066fd')"
+    ]
+  }
+}
 ```
 
 ## data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt
@@ -6484,6 +8744,788 @@ internal fun versionedProductParams(details: ProductDetails): BillingFlowParams.
 <manifest />
 ```
 
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import androidx.room.*
+import com.semmyx.ledger.data.local.EntryEntity
+import kotlinx.coroutines.flow.Flow
+
+@Entity(tableName = "custom_categories")
+data class CustomCategoryEntity(@PrimaryKey val id: String, val name: String, val colorHex: String)
+
+/**
+ * [groupKey] — SHA-256(amountMinor + currency + type + 5-minute epoch bucket).
+ * Two rows with the same groupKey represent the same physical card tap arriving
+ * from different source apps (e.g. wallet widget + issuing bank). The second row
+ * is flagged CROSS_DUPLICATE_REVIEW instead of REVIEW.
+ */
+@Entity(
+    tableName = "bank_inbox",
+    indices = [
+        Index(value = ["eventKey"], unique = true),
+        Index(value = ["groupKey"]),
+    ],
+)
+data class BankInboxEntity(
+    @PrimaryKey val id: String,
+    val eventKey: String,
+    val bankId: String,
+    val amountMinor: Long,
+    val currency: String,
+    val type: String,
+    val merchant: String,
+    val cardLast4: String?,
+    val eventAtMillis: Long,
+    val receivedAtMillis: Long,
+    val timeFromMessage: Boolean,
+    val transfer: Boolean,
+    val category: String,
+    val origin: String,
+    val status: String,
+    val entryId: String? = null,
+    /** nullable so existing rows (DB v2) are compatible without migration breakage. */
+    val groupKey: String? = null,
+)
+
+data class SourceSpendRow(val sourceType: String, val bankId: String?, val totalMinor: Long)
+data class DetailedCategoryRow(
+    val category: String,
+    val customCategoryId: String?,
+    val customName: String?,
+    val customColor: String?,
+    val totalMinor: Long,
+)
+
+@Dao
+interface BankDao {
+    @Query("SELECT * FROM custom_categories ORDER BY name")
+    fun categories(): Flow<List<CustomCategoryEntity>>
+
+    @Insert
+    suspend fun addCategory(category: CustomCategoryEntity)
+
+    @Query(
+        "SELECT * FROM bank_inbox WHERE status IN ('REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')" +
+            " ORDER BY receivedAtMillis DESC LIMIT 100",
+    )
+    fun inbox(): Flow<List<BankInboxEntity>>
+
+    @Query("SELECT * FROM bank_inbox WHERE id=:id")
+    suspend fun inboxItem(id: String): BankInboxEntity?
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertInbox(item: BankInboxEntity): Long
+
+    @Query("UPDATE bank_inbox SET status=:status,entryId=:entryId WHERE id=:id")
+    suspend fun status(id: String, status: String, entryId: String?)
+
+    /**
+     * Same-bank duplicate: same card OR same merchant, within ±90 s.
+     * Guards against push re-delivery from the same issuing bank.
+     */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE bankId=:bank AND amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=90000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')
+        AND ((cardLast4 IS NOT NULL AND cardLast4=:card) OR (merchant<>'' AND LOWER(merchant)=LOWER(:merchant)))""",
+    )
+    suspend fun similar(
+        bank: String, amount: Long, currency: String, type: String,
+        time: Long, card: String?, merchant: String,
+    ): Int
+
+    /**
+     * Cross-source duplicate: same amount + currency + type from **any** bank or wallet app
+     * within a ±180 s sliding window.
+     *
+     * Catches the common double-fire pattern:
+     *   1. Google Pay / gаманець fires first.
+     *   2. Issuing bank (PrivatBank, mono…) fires 0–120 s later.
+     * Without this check both events would be recorded as separate ledger entries.
+     */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=180000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')""",
+    )
+    suspend fun similarCrossSource(amount: Long, currency: String, type: String, time: Long): Int
+
+    /** A wallet-app row for the same amount/time exists (wallet + issuing bank announce one tap). */
+    @Query(
+        """SELECT COUNT(*) FROM bank_inbox WHERE bankId='wallet' AND amountMinor=:amount
+        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=180000
+        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW','CROSS_DUPLICATE_REVIEW')""",
+    )
+    suspend fun walletTwin(amount: Long, currency: String, type: String, time: Long): Int
+
+    @Query(
+        """SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
+        WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
+        GROUP BY sourceType,bankId ORDER BY totalMinor DESC""",
+    )
+    fun sources(currency: String, from: Long, through: Long): Flow<List<SourceSpendRow>>
+
+    @Query(
+        """SELECT e.category,e.customCategoryId,c.name AS customName,c.colorHex AS customColor,SUM(e.amountMinor) AS totalMinor
+        FROM entries e LEFT JOIN custom_categories c ON e.customCategoryId=c.id
+        WHERE e.deletedAtMillis IS NULL AND e.type='EXPENSE' AND e.currency=:currency AND e.epochDay BETWEEN :from AND :through
+        AND (:source IS NULL OR e.sourceType=:source) AND (:bank IS NULL OR e.bankId=:bank)
+        GROUP BY e.category,e.customCategoryId,c.name,c.colorHex ORDER BY totalMinor DESC""",
+    )
+    fun detailCategories(
+        currency: String, from: Long, through: Long, source: String?, bank: String?,
+    ): Flow<List<DetailedCategoryRow>>
+
+    @Query(
+        """SELECT * FROM entries WHERE deletedAtMillis IS NULL AND currency=:currency
+        AND epochDay BETWEEN :from AND :through AND (:source IS NULL OR sourceType=:source) AND (:bank IS NULL OR bankId=:bank)
+        ORDER BY COALESCE(eventAtMillis,createdAtMillis) DESC LIMIT 100""",
+    )
+    fun recent(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<EntryEntity>>
+
+    @Query("SELECT * FROM entries WHERE deletedAtMillis IS NULL ORDER BY epochDay DESC,createdAtMillis DESC")
+    suspend fun exportEntries(): List<EntryEntity>
+
+    @Query("DELETE FROM bank_inbox")
+    suspend fun clearInbox()
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.Context
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.room.withTransaction
+import com.semmyx.ledger.data.local.*
+import com.semmyx.ledger.data.repository.toDomain
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.security.MessageDigest
+import java.time.*
+import java.util.UUID
+import java.util.Locale
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+/**
+ * Imports and acknowledgements are atomic with the existing ledger.
+ * Push parsing is offline. API clients only read statements; no raw text or PAN storage.
+ *
+ * ## Cross-source deduplication
+ *
+ * A single physical card payment typically generates **two** push notifications:
+ *   1. The wallet/payment app (Google Pay, Apple Pay) fires almost instantly.
+ *   2. The issuing bank (PrivatBank, mono…) fires 30–120 s later.
+ *
+ * Both carry the same amount / currency / type.  Without cross-source dedup the
+ * ledger would record UAH 100 twice.
+ *
+ * Strategy (two-tier, both run inside the same Room transaction):
+ *   - Tier 1 [same-bank, ±90 s]: prevents re-delivery of the exact same push.
+ *   - Tier 2 [cross-bank, ±180 s]: matches any inbox row with identical
+ *     (amount, currency, type) regardless of which bank sent it.
+ *     If a cross-source match exists the new row status = CROSS_DUPLICATE_REVIEW
+ *     so the user can still inspect and accept/reject it.  If auto-import is on,
+ *     cross-duplicates are silently ignored to avoid double-counting.
+ */
+class BankImportRepository(
+    private val db: LedgerDatabase, context: Context,
+    private val vault: com.semmyx.ledger.data.security.KeystoreVault? = null,
+    private val monobank: MonobankClient = MonobankClient(),
+    private val privat: PrivatBankClient = PrivatBankClient(),
+) : BankRepository {
+
+    private val ctx = context.applicationContext
+    private val config = ctx.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
+    private val diagnosticState = MutableStateFlow(ImportDiagnostics())
+    override val diagnostics = diagnosticState.asStateFlow()
+
+    fun connected(value: Boolean) { diagnosticState.update { it.copy(connected = value) } }
+
+    fun note(code: String, packageName: String = "", notification: Boolean = false, bankMessage: Boolean = false) {
+        diagnosticState.update { old ->
+            old.copy(
+                lastCode = code,
+                lastPackage = packageName.ifBlank { old.lastPackage },
+                lastAtMillis = System.currentTimeMillis(),
+                notificationCount = old.notificationCount + if (notification) 1 else 0,
+                bankMessageCount = old.bankMessageCount + if (bankMessage) 1 else 0,
+            )
+        }
+    }
+
+    override fun configuredPackage(bankId: String): String =
+        config.getString("package_$bankId", null)
+            ?: Banks.all.firstOrNull { it.id == bankId }?.packages?.firstOrNull().orEmpty()
+
+    override fun setPackage(bankId: String, packageName: String) {
+        require(Banks.all.any { it.id == bankId })
+        require(packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")))
+        config.edit().putString("package_$bankId", packageName.trim()).apply()
+    }
+
+    fun bankForPackage(packageName: String): Bank? =
+        Banks.all.firstOrNull { config.getString("package_${it.id}", null) == packageName }
+            ?: Banks.byPackage(packageName)
+
+    override suspend fun importText(bankId: String, text: String): Boolean {
+        val bank = Banks.all.firstOrNull { it.id == bankId } ?: return false
+        if (BankParser.parse(bank, text, System.currentTimeMillis()) == null) { note("UNRECOGNIZED"); return false }
+        receive(bank, text, "MANUAL_TEXT:$bankId:${UUID.randomUUID()}", System.currentTimeMillis(), "MANUAL_TEXT", manual = true)
+        return true
+    }
+
+    private val dao = db.bankDao()
+
+    override fun categories() = dao.categories().map { rows -> rows.map { CustomBankCategory(it.id, it.name, it.colorHex) } }
+
+    override fun reviews() = dao.inbox().map { rows ->
+        rows.map {
+            ImportReview(
+                it.id, it.bankId, it.amountMinor, LedgerCurrency.valueOf(it.currency),
+                EntryType.valueOf(it.type), it.merchant, it.cardLast4, it.eventAtMillis,
+                it.timeFromMessage, it.transfer, it.status,
+            )
+        }
+    }
+
+    override fun sources(currency: LedgerCurrency, from: LocalDate, through: LocalDate) =
+        dao.sources(currency.name, from.toEpochDay(), through.toEpochDay()).map { rows ->
+            rows.map { BankSourceSpend(it.sourceType, it.bankId, it.totalMinor) }
+        }
+
+    override fun categorySpending(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
+        dao.detailCategories(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows ->
+            rows.map { BankCategorySpend(Category.valueOf(it.category), it.customCategoryId, it.customName, it.customColor, it.totalMinor) }
+        }
+
+    override fun recent(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
+        dao.recent(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map { it.toDomain() } }
+
+    override suspend fun exportEntries() = dao.exportEntries().map { it.toDomain() }
+    override suspend fun clearHistory() { dao.clearInbox() }
+    override fun budget(currency: LedgerCurrency): Long = config.getLong("budget_${currency.name}", 0L)
+    override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_${currency.name}", minor).apply() }
+
+    override var enabled: Boolean
+        get() = config.getBoolean("enabled", true)
+        set(value) { config.edit().putBoolean("enabled", value).apply() }
+
+    override var autoImport: Boolean
+        get() = config.getBoolean("auto", true)
+        set(value) { config.edit().putBoolean("auto", value).apply() }
+
+    override var importMode: String
+        get() = config.getString("mode", "NOTIFY") ?: "NOTIFY"
+        set(value) { require(value in listOf("API", "SMS", "NOTIFY")); config.edit().putString("mode", value).apply() }
+
+    // -------------------------------------------------------------------------
+    // monobank personal API (token mode)
+    // -------------------------------------------------------------------------
+
+    private val monoState = MutableStateFlow(MonobankStatus(
+        connected = config.getString("mono_accounts", null) != null,
+        lastSyncMillis = config.getLong("mono_last_sync", 0L),
+    ))
+    override val monobankStatus = monoState.asStateFlow()
+    private val syncLock = kotlinx.coroutines.sync.Mutex()
+
+    private fun savedAccounts(): List<MonobankClient.Account> =
+        config.getString("mono_accounts", null)?.split(';')?.mapNotNull { row ->
+            val f = row.split('|')
+            if (f.size < 4) null else MonobankClient.Account(f[0], runCatching { LedgerCurrency.valueOf(f[1]) }.getOrNull() ?: return@mapNotNull null, f[2], f[3].ifBlank { null })
+        }.orEmpty()
+
+    private fun saveAccounts(accounts: List<MonobankClient.Account>) {
+        config.edit().putString("mono_accounts", accounts.joinToString(";") { "${it.id}|${it.currency.name}|${it.type}|${it.cardLast4.orEmpty()}" }).apply()
+    }
+
+    /** Validates the token with monobank, stores it encrypted (Android Keystore) and remembers the accounts. */
+    override suspend fun connectMonobank(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..200 || !clean.all { it.isLetterOrDigit() || it == '-' || it == '_' }) {
+            monoState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val accounts = monobank.accounts(clean)
+            if (accounts.isEmpty()) { monoState.update { it.copy(error = "NO_ACCOUNTS") }; return@withContext false }
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("monoToken", clean); Unit }
+            saveAccounts(accounts)
+            config.edit().remove("mono_last_sync").putString("mode", "API").apply()
+            monoState.value = MonobankStatus(connected = true, accounts = accounts.size)
+            true
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }; false
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(error = "NETWORK") }; false
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            monoState.update { it.copy(error = "NETWORK") }; false
+        }
+    }
+
+    override suspend fun disconnectMonobank() = withContext(Dispatchers.IO) {
+        runCatching { vault?.update { it.remove("monoToken"); Unit } }
+        config.edit().remove("mono_accounts").remove("mono_last_sync").apply()
+        monoState.value = MonobankStatus()
+    }
+
+    /**
+     * Pulls new operations for every saved account. monobank allows one statement request per account
+     * per 60 s, so accounts are fetched one minute apart. Safe to call repeatedly: operations are keyed by id.
+     */
+    override suspend fun syncMonobank(): Int = withContext(Dispatchers.IO) {
+        if (!syncLock.tryLock()) return@withContext 0
+        try {
+            val token = vault?.read { it.optString("monoToken", "") }.orEmpty()
+            val accounts = savedAccounts()
+            if (token.isBlank() || accounts.isEmpty()) { monoState.update { it.copy(connected = false) }; return@withContext 0 }
+            monoState.update { it.copy(syncing = true, error = null) }
+            val nowSec = System.currentTimeMillis() / 1000
+            val last = config.getLong("mono_last_sync", 0L) / 1000
+            val from = if (last > 0) maxOf(last - 3600, nowSec - 31L * 86400) else nowSec - 30L * 86400
+            var imported = 0
+            accounts.take(4).forEachIndexed { index, account ->
+                if (index > 0) kotlinx.coroutines.delay(61_000)
+                val rows = monobank.statement(token, account.id, from, nowSec)
+                rows.sortedBy { it.timeSeconds }.forEach { row ->
+                    val op = MonobankMapper.map(row, account.currency, account.cardLast4) ?: return@forEach
+                    val result = store(op, "MONO:${row.id}", row.timeSeconds * 1000, "API", authoritative = true)
+                    if (result == "AUTO_IMPORTED") imported++
+                }
+            }
+            val now = System.currentTimeMillis()
+            config.edit().putLong("mono_last_sync", now).apply()
+            monoState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null, accounts = accounts.size) }
+            imported
+        } catch (e: MonobankClient.ApiException) {
+            monoState.update { it.copy(syncing = false, error = if (e.invalidToken) "BAD_TOKEN" else if (e.rateLimited) "RATE_LIMIT" else "NETWORK") }
+            0
+        } catch (e: java.io.IOException) {
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } catch (e: Exception) {
+            if (e is CancellationException) { monoState.update { it.copy(syncing = false) }; throw e }
+            monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
+        } finally { syncLock.unlock() }
+    }
+
+    // -------------------------------------------------------------------------
+    // Core receive path
+    // -------------------------------------------------------------------------
+
+    /** Parses a bank text (push/SMS/pasted) and stores it. Returns the outcome code. */
+    suspend fun receive(
+        bank: Bank, text: String, eventKey: String, at: Long,
+        origin: String, manual: Boolean = false,
+    ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
+        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return "UNRECOGNIZED" }
+        return store(parsed, eventKey, at, origin, manual)
+    }
+
+    /**
+     * Stores an already parsed operation. [authoritative] sources (the bank's own API, unique id per
+     * operation) skip the heuristic duplicate checks: the event key alone guarantees "once".
+     */
+    suspend fun store(
+        parsed: ParsedBankOperation, eventKey: String, at: Long, origin: String,
+        manual: Boolean = false, authoritative: Boolean = false,
+    ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
+        var result = "QUEUED"
+        db.withTransaction {
+            // --- Tier 1: same-bank re-delivery guard ---
+            val sameBankDup = !authoritative && dao.similar(
+                parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
+                parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant,
+            ) > 0
+
+            // --- Tier 2: cross-source dedup (wallet + bank for the same tap) ---
+            // Only applies when the same-bank check didn't already flag it.
+            val crossSourceDup = !authoritative && !sameBankDup && dao.similarCrossSource(
+                parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis,
+            ) > 0
+
+            // With auto-import on, repeats are dropped silently: a bank re-posting the same push, or a wallet
+            // app and the issuing bank announcing the same tap. Otherwise they wait in the review queue.
+            val walletInvolved = Banks.WALLET_ID == parsed.bankId || crossSourceDup && dao.walletTwin(
+                parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis) > 0
+            val silentDrop = !manual && autoImport && crossSourceDup && walletInvolved
+            val status = when {
+                silentDrop -> "DUPLICATE_IGNORED"
+                sameBankDup   -> "DUPLICATE_REVIEW"
+                crossSourceDup -> "CROSS_DUPLICATE_REVIEW"
+                else          -> "REVIEW"
+            }
+
+            // groupKey: SHA-256(amount|currency|type|5-min bucket) — links twin events
+            val bucket = parsed.happenedAtMillis / 300_000L   // 5-minute windows
+            val groupKey = digest("${parsed.amountMinor}|${parsed.currency}|${parsed.type}|$bucket")
+
+            val item = BankInboxEntity(
+                id = UUID.randomUUID().toString(),
+                eventKey = digest(eventKey),
+                bankId = parsed.bankId,
+                amountMinor = parsed.amountMinor,
+                currency = parsed.currency.name,
+                type = parsed.type.name,
+                merchant = parsed.merchant,
+                cardLast4 = parsed.cardLast4,
+                eventAtMillis = parsed.happenedAtMillis,
+                receivedAtMillis = at,
+                timeFromMessage = parsed.timeFromMessage,
+                transfer = parsed.transfer,
+                category = parsed.category.name,
+                origin = origin,
+                status = status,
+                groupKey = groupKey,
+            )
+
+            if (dao.insertInbox(item) == -1L) { result = "REDELIVERED"; return@withTransaction }
+            result = status
+
+            // Auto-import: only for confident single-source entries.
+            // Cross-source duplicates are NEVER auto-imported — the user must review.
+            if (!manual && autoImport && parsed.confident && !parsed.transfer && status == "REVIEW") {
+                acceptInside(item, parsed.type)
+                result = "AUTO_IMPORTED"
+                
+            }
+        }
+        // Notify only AFTER commit. A denied notification permission must never undo the entry.
+        if (result == "AUTO_IMPORTED" && System.currentTimeMillis() - parsed.happenedAtMillis in 0 until 15 * 60_000L) postImportNotification(parsed)
+        note(result)
+        return result
+    }
+
+    private val privatState = MutableStateFlow(MonobankStatus(
+        connected = config.getBoolean("privat_connected", false),
+        lastSyncMillis = config.getLong("privat_last_sync", 0L)))
+    override val privatStatus = privatState.asStateFlow()
+    private val privatLock = kotlinx.coroutines.sync.Mutex()
+
+    override suspend fun connectPrivat(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..2048 || clean.any { it.code !in 33..126 }) {
+            privatState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val today = LocalDate.now(ZoneId.of("Europe/Kyiv"))
+            // Validate access before storing credentials. No payment endpoints are called.
+            privat.statement(clean, today, today)
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("privatToken", clean); Unit }
+            config.edit().putBoolean("privat_connected", true).remove("privat_last_sync").putString("mode", "API").apply()
+            privatState.value = MonobankStatus(connected = true)
+            true
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { privatState.update { it.copy(error = privatError(e)) }; false }
+    }
+
+    override suspend fun disconnectPrivat() = withContext(Dispatchers.IO) {
+        vault?.update { it.remove("privatToken"); Unit }
+        config.edit().remove("privat_connected").remove("privat_last_sync").apply()
+        privatState.value = MonobankStatus()
+    }
+
+    override suspend fun syncPrivat(): Int = withContext(Dispatchers.IO) {
+        if (!privatLock.tryLock()) return@withContext 0
+        try {
+            if (!enabled || !config.getBoolean("privat_connected", false)) return@withContext 0
+            val token = vault?.read { it.optString("privatToken", "") }.orEmpty()
+            if (token.isBlank()) { privatState.update { it.copy(connected = false) }; return@withContext 0 }
+            privatState.update { it.copy(syncing = true, error = null) }
+            val now = System.currentTimeMillis()
+            val zone = ZoneId.of("Europe/Kyiv")
+            val through = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+            val last = config.getLong("privat_last_sync", 0L)
+            val from = if (last > 0) Instant.ofEpochMilli(last).atZone(zone).toLocalDate().minusDays(1).coerceAtLeast(through.minusDays(29)) else through.minusDays(29)
+            var imported = 0
+            // Short bounded windows also accommodate banks with restrictive statement date limits.
+            var begin = from
+            while (!begin.isAfter(through)) {
+                val end = begin.plusDays(6).coerceAtMost(through)
+                privat.statement(token, begin, end).forEach { row ->
+                    val key = "PRIVAT:${row.key}"
+                    if (store(row.parsed, key, row.parsed.happenedAtMillis, "API", authoritative = true) == "AUTO_IMPORTED") imported++
+                }
+                begin = end.plusDays(1)
+            }
+            config.edit().putLong("privat_last_sync", now).apply()
+            privatState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null) }
+            imported
+        } catch (e: CancellationException) { privatState.update { it.copy(syncing = false) }; throw e }
+        catch (e: Exception) { privatState.update { it.copy(syncing = false, error = privatError(e)) }; 0 }
+        finally { privatLock.unlock() }
+    }
+
+    private fun privatError(e: Exception): String = when ((e as? PrivatBankClient.ApiException)?.code) {
+        401, 403 -> "BAD_TOKEN"; 429 -> "RATE_LIMIT"; else -> "NETWORK"
+    }
+
+    // -------------------------------------------------------------------------
+    // Accept / ignore
+    // -------------------------------------------------------------------------
+
+    override suspend fun accept(id: String, type: EntryType) {
+        db.withTransaction {
+            val item = dao.inboxItem(id) ?: return@withTransaction
+            if (item.status !in listOf("REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW")) return@withTransaction
+            acceptInside(item, type)
+        }
+    }
+
+    private suspend fun acceptInside(item: BankInboxEntity, type: EntryType) {
+        val id = "bank-${item.id}"
+        val date = Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).toLocalDate()
+        val title = item.merchant.ifBlank { Banks.name(item.bankId) }.take(60)
+        val entity = EntryEntity(
+            id, title, item.amountMinor, item.currency, type.name, item.category,
+            date.toEpochDay(),
+            "",
+            title.lowercase(Locale.ROOT),
+            item.receivedAtMillis,
+            sourceType = "CARD",
+            bankId = item.bankId,
+            cardLast4 = item.cardLast4,
+            eventAtMillis = item.eventAtMillis,
+            origin = item.origin,
+        )
+        db.ledgerDao().insert(entity)
+        dao.status(item.id, "IMPORTED", id)
+    }
+
+    override suspend fun ignore(id: String) {
+        db.withTransaction {
+            val item = dao.inboxItem(id) ?: return@withTransaction
+            if (item.status in listOf("REVIEW", "DUPLICATE_REVIEW", "CROSS_DUPLICATE_REVIEW"))
+                dao.status(id, "IGNORED", null)
+        }
+    }
+
+    override suspend fun createCategory(name: String, hex: String) {
+        require(name.trim().length in 1..40)
+        val color = ColorPreferences.normalizeHex(hex) ?: error("Invalid color")
+        dao.addCategory(CustomCategoryEntity(UUID.randomUUID().toString(), name.trim(), color))
+    }
+
+    // -------------------------------------------------------------------------
+    // Background notification
+    // -------------------------------------------------------------------------
+
+    /**
+     * Posts a silent notification so the user knows something was auto-imported
+     * while the app was in the background.  The channel is created lazily; on
+     * Android < O the call is a no-op.
+     */
+    private fun postImportNotification(parsed: ParsedBankOperation) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
+        val channelId = "ledger_import_v2"
+        if (nm.getNotificationChannel(channelId) == null) {
+            nm.createNotificationChannel(
+                NotificationChannel(channelId, "Saved bank payments", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                    description = "Background bank import events"
+                    setShowBadge(false)
+                },
+            )
+        }
+        val amountText = Money.editable(parsed.amountMinor)
+        val title = "${Banks.name(parsed.bankId)}: ${parsed.merchant.ifBlank { Banks.name(parsed.bankId) }}"
+        val body = "${if (parsed.type == EntryType.EXPENSE) "−" else "+"} $amountText ${parsed.currency.name}"
+        val notification = NotificationCompat.Builder(ctx, channelId)
+            .setSmallIcon(android.R.drawable.ic_menu_save)
+            .setContentTitle(title)
+            .setContentText(body)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(android.app.PendingIntent.getActivity(ctx, 0,
+                ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: android.content.Intent(),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
+            .setAutoCancel(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        // Use a stable ID derived from the amount+time so rapid arrivals don't stack
+        val notifId = (parsed.amountMinor xor parsed.happenedAtMillis).toInt()
+        try { nm.notify(notifId, notification) } catch (_: Exception) {}
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    companion object {
+        fun digest(value: String): String =
+            MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
+                .joinToString("") { "%02x".format(it.toInt() and 255) }
+    }
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.LedgerCurrency
+import com.semmyx.ledger.domain.bank.MonobankMapper
+import com.semmyx.ledger.domain.bank.MonobankStatementItem
+import java.io.IOException
+import okhttp3.OkHttpClient
+import okhttp3.Request
+
+/**
+ * Minimal client for monobank's personal API (https://api.monobank.ua/docs/). Read-only; the token is
+ * sent only to this host in the `X-Token` header. Blocking calls: run on a background dispatcher.
+ */
+class MonobankClient(
+    private val http: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+        .callTimeout(45, java.util.concurrent.TimeUnit.SECONDS).build(),
+    private val baseUrl: String = "https://api.monobank.ua",
+) {
+    data class Account(val id: String, val currency: LedgerCurrency, val type: String, val cardLast4: String?)
+
+    class ApiException(val httpCode: Int, message: String) : IOException(message) {
+        val invalidToken get() = httpCode == 403 || httpCode == 401
+        val rateLimited get() = httpCode == 429
+    }
+
+    private fun get(path: String, token: String): String {
+        val request = Request.Builder().url(baseUrl.trimEnd('/') + path).header("X-Token", token).get().build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw ApiException(response.code, "monobank HTTP ${response.code}")
+            return response.body?.string().orEmpty()
+        }
+    }
+
+    fun accounts(token: String): List<Account> {
+        val root = JsonParser.parseString(get("/personal/client-info", token)).asJsonObject
+        return root.getAsJsonArray("accounts")?.mapNotNull { element ->
+            val a = element.asJsonObject
+            val currency = MonobankMapper.currency(a.get("currencyCode")?.asInt ?: return@mapNotNull null) ?: return@mapNotNull null
+            val type = a.get("type")?.asString.orEmpty()
+            if (type == "eAid") return@mapNotNull null // state-aid wallets are not spending accounts
+            val mask = a.getAsJsonArray("maskedPan")?.firstOrNull()?.asString
+            Account(a.get("id").asString, currency, type, mask?.takeLast(4)?.takeIf { it.all(Char::isDigit) })
+        }.orEmpty()
+    }
+
+    fun statement(token: String, accountId: String, fromSeconds: Long, toSeconds: Long): List<MonobankStatementItem> {
+        val array = JsonParser.parseString(get("/personal/statement/$accountId/$fromSeconds/$toSeconds", token)).asJsonArray
+        return array.mapNotNull { element ->
+            val o = element.asJsonObject
+            val id = o.get("id")?.asString ?: return@mapNotNull null
+            MonobankStatementItem(
+                id = id,
+                timeSeconds = o.get("time")?.asLong ?: return@mapNotNull null,
+                description = o.get("description")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
+                mcc = o.get("mcc")?.takeIf { !it.isJsonNull }?.asInt ?: 0,
+                amount = o.get("amount")?.asLong ?: return@mapNotNull null,
+                comment = o.get("comment")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
+            )
+        }
+    }
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.io.IOException
+import java.math.BigDecimal
+import java.time.*
+import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
+import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
+
+/** Privat24 Business AutoClient. GET statements only; not the API for retail Privat24 cards. */
+class PrivatBankClient(
+    private val http: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+        .callTimeout(45, TimeUnit.SECONDS).build(),
+    private val baseUrl: String = "https://acp.privatbank.ua",
+) {
+    data class Operation(val key: String, val parsed: ParsedBankOperation)
+    class ApiException(val code: Int) : IOException("PrivatBank request failed ($code)")
+
+    fun statement(token: String, from: LocalDate, through: LocalDate): List<Operation> {
+        require(!through.isBefore(from))
+        val result = mutableListOf<Operation>()
+        var cursor: String? = null
+        val cursors = mutableSetOf<String>()
+        // Pagination is bounded; a broken/repeated cursor cannot loop forever or silently truncate.
+        repeat(100) {
+            val url = (baseUrl.trimEnd('/') + "/api/statements/transactions").toHttpUrl().newBuilder()
+                .addQueryParameter("startDate", from.format(DateTimeFormatter.ofPattern("dd-MM-uuuu")))
+                .addQueryParameter("endDate", through.format(DateTimeFormatter.ofPattern("dd-MM-uuuu")))
+                .addQueryParameter("limit", "100")
+            cursor?.let { url.addQueryParameter("followId", it) }
+            val request = Request.Builder().url(url.build()).get().header("token", token)
+                .header("User-Agent", "TG-Ledger/4.3.3")
+                .header("Content-Type", "application/json;charset=utf8").header("Accept", "application/json").build()
+            val root = http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw ApiException(response.code)
+                JsonParser.parseString(response.body?.string().orEmpty()).asJsonObject
+            }
+            if (root.string("status") != "SUCCESS") throw ApiException(422)
+            root.getAsJsonArray("transactions")?.forEach { row -> map(row.asJsonObject)?.let(result::add) }
+            val more = root.string("exist_next_page").equals("true", ignoreCase = true)
+            if (!more) return result.distinctBy { it.key }
+            cursor = root.string("next_page_id").takeIf { it.isNotBlank() } ?: throw ApiException(422)
+            if (!cursors.add(cursor!!)) throw ApiException(422)
+        }
+        throw ApiException(422)
+    }
+
+    companion object {
+        private fun JsonObject.string(key: String) = get(key)?.takeUnless { it.isJsonNull }?.asString.orEmpty()
+        fun map(row: JsonObject): Operation? {
+            if (row.string("PR_PR") != "r" || row.string("FL_REAL") != "r") return null
+            val type = when (row.string("TRANTYPE")) { "D" -> EntryType.EXPENSE; "C" -> EntryType.INCOME; else -> return null }
+            val currency = runCatching { LedgerCurrency.valueOf(row.string("CCY")) }.getOrNull() ?: return null
+            val minor = runCatching { BigDecimal(row.string("SUM")).abs().movePointRight(2).longValueExact() }.getOrNull() ?: return null
+            if (minor <= 0 || minor > Money.MAX_ENTRY_MINOR) return null
+            val ref = row.string("REF"); val refn = row.string("REFN"); val account = row.string("AUT_MY_ACC")
+            if (ref.isBlank() || refn.isBlank() || account.isBlank()) return null
+            val timestamp = runCatching {
+                LocalDateTime.parse(row.string("DATE_TIME_DAT_OD_TIM_P"),
+                    DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss").withResolverStyle(ResolverStyle.STRICT))
+                    .atZone(ZoneId.of("Europe/Kyiv")).toInstant().toEpochMilli()
+            }.getOrNull() ?: return null
+            val merchant = row.string("AUT_CNTR_NAM").take(60).ifBlank { "ПриватБанк" }
+            val purpose = row.string("OSND")
+            val transfer = Regex("між власними|власн.*рахунк|между своими|own accounts", RegexOption.IGNORE_CASE).containsMatchIn(purpose)
+            val category = if (transfer) Category.TRANSFER else BankParser.categorize(merchant)
+            return Operation("$account|$ref|$refn", ParsedBankOperation("privat", minor, currency, type,
+                merchant, null, timestamp, true, transfer, !transfer, category))
+        }
+    }
+}
+```
+
 ## data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt
 
 ```kotlin
@@ -6622,7 +9664,11 @@ class PlayPremiumRepository(
     private val cacheTtlMillis = 7L * 24 * 60 * 60 * 1000
 
     init {
-        scope.launch { refreshLocalEntitlements() }
+        scope.launch {
+            refreshLocalEntitlements()
+            // The single 14-day free trial starts by itself on first launch: no button, no card, no renewal.
+            if (trial.value.available) startTrial(TrialPolicy.DAYS)
+        }
         scope.launch {
             // One timer at the actual next entitlement deadline, not one AES/RSA read per minute.
             combine(developerActivation, trial, playExpiry) { dev, test, play ->
@@ -6919,99 +9965,6 @@ class PurchaseSignatureVerifier(base64PublicKey: String) {
 }
 ```
 
-## data/src/main/kotlin/com/semmyx/ledger/data/local/BankEntities.kt
-
-```kotlin
-package com.semmyx.ledger.data.local
-
-import androidx.room.*
-import kotlinx.coroutines.flow.Flow
-
-@Entity(tableName = "custom_categories")
-data class CustomCategoryEntity(@PrimaryKey val id: String, val name: String, val colorHex: String)
-@Entity(tableName = "bank_inbox", indices = [Index(value = ["eventKey"], unique = true)])
-data class BankInboxEntity(@PrimaryKey val id: String, val eventKey: String, val bankId: String,
-    val amountMinor: Long, val currency: String, val type: String, val merchant: String, val cardLast4: String?,
-    val eventAtMillis: Long, val receivedAtMillis: Long, val timeFromMessage: Boolean,
-    val transfer: Boolean, val category: String, val origin: String, val status: String,
-    val entryId: String? = null)
-data class SourceSpendRow(val sourceType: String, val bankId: String?, val totalMinor: Long)
-data class DetailedCategoryRow(val category: String, val customCategoryId: String?, val customName: String?, val customColor: String?, val totalMinor: Long)
-@Dao
-interface BankDao {
-    @Query("SELECT * FROM custom_categories ORDER BY name") fun categories(): Flow<List<CustomCategoryEntity>>
-    @Insert suspend fun addCategory(category: CustomCategoryEntity)
-    @Query("SELECT * FROM bank_inbox WHERE status IN ('REVIEW','DUPLICATE_REVIEW') ORDER BY receivedAtMillis DESC LIMIT 100") fun inbox(): Flow<List<BankInboxEntity>>
-    @Query("SELECT * FROM bank_inbox WHERE id=:id") suspend fun inboxItem(id: String): BankInboxEntity?
-    @Insert(onConflict = OnConflictStrategy.IGNORE) suspend fun insertInbox(item: BankInboxEntity): Long
-    @Query("UPDATE bank_inbox SET status=:status,entryId=:entryId WHERE id=:id") suspend fun status(id: String, status: String, entryId: String?)
-    @Query("""SELECT COUNT(*) FROM bank_inbox WHERE bankId=:bank AND amountMinor=:amount
-        AND currency=:currency AND type=:type AND ABS(eventAtMillis-:time)<=90000
-        AND status IN ('IMPORTED','REVIEW','DUPLICATE_REVIEW')
-        AND ((cardLast4 IS NOT NULL AND cardLast4=:card) OR (merchant<>'' AND LOWER(merchant)=LOWER(:merchant)))""")
-    suspend fun similar(bank: String, amount: Long, currency: String, type: String, time: Long, card: String?, merchant: String): Int
-    @Query("""SELECT sourceType,bankId,COALESCE(SUM(amountMinor),0) AS totalMinor FROM entries
-        WHERE deletedAtMillis IS NULL AND type='EXPENSE' AND currency=:currency AND epochDay BETWEEN :from AND :through
-        GROUP BY sourceType,bankId ORDER BY totalMinor DESC""")
-    fun sources(currency: String, from: Long, through: Long): Flow<List<SourceSpendRow>>
-    @Query("""SELECT e.category,e.customCategoryId,c.name AS customName,c.colorHex AS customColor,SUM(e.amountMinor) AS totalMinor
-        FROM entries e LEFT JOIN custom_categories c ON e.customCategoryId=c.id
-        WHERE e.deletedAtMillis IS NULL AND e.type='EXPENSE' AND e.currency=:currency AND e.epochDay BETWEEN :from AND :through
-        AND (:source IS NULL OR e.sourceType=:source) AND (:bank IS NULL OR e.bankId=:bank)
-        GROUP BY e.category,e.customCategoryId,c.name,c.colorHex ORDER BY totalMinor DESC""")
-    fun detailCategories(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<DetailedCategoryRow>>
-    @Query("""SELECT * FROM entries WHERE deletedAtMillis IS NULL AND currency=:currency
-        AND epochDay BETWEEN :from AND :through AND (:source IS NULL OR sourceType=:source) AND (:bank IS NULL OR bankId=:bank)
-        ORDER BY COALESCE(eventAtMillis,createdAtMillis) DESC LIMIT 100""")
-    fun recent(currency: String, from: Long, through: Long, source: String?, bank: String?): Flow<List<EntryEntity>>
-    @Query("SELECT * FROM entries WHERE deletedAtMillis IS NULL ORDER BY epochDay DESC,createdAtMillis DESC") suspend fun exportEntries(): List<EntryEntity>
-    @Query("DELETE FROM bank_inbox") suspend fun clearInbox()
-}
-```
-
-## data/src/main/kotlin/com/semmyx/ledger/data/local/Entities.kt
-
-```kotlin
-package com.semmyx.ledger.data.local
-
-import androidx.room.Entity
-import androidx.room.Index
-import androidx.room.PrimaryKey
-
-@Entity(tableName = "entries", indices = [Index(value = ["currency", "deletedAtMillis", "epochDay", "createdAtMillis"])])
-data class EntryEntity(
-    @PrimaryKey val id: String,
-    val title: String,
-    val amountMinor: Long,
-    val currency: String,
-    val type: String,
-    val category: String,
-    val epochDay: Long,
-    val note: String,
-    val searchText: String,
-    val createdAtMillis: Long,
-    val deletedAtMillis: Long? = null,
-    @androidx.room.ColumnInfo(defaultValue = "'UNKNOWN'") val sourceType: String = "UNKNOWN",
-    val bankId: String? = null,
-    val cardLast4: String? = null,
-    val eventAtMillis: Long? = null,
-    val customCategoryId: String? = null,
-    @androidx.room.ColumnInfo(defaultValue = "'MANUAL'") val origin: String = "MANUAL",
-)
-
-data class BalanceRow(val incomeMinor: Long, val expenseMinor: Long, val entryCount: Int)
-data class CategoryTotalRow(val category: String, val incomeMinor: Long, val expenseMinor: Long, val count: Int, val incomeCount: Int, val expenseCount: Int)
-data class ActivityRow(val epochDay: Long, val incomeMinor: Long, val expenseMinor: Long)
-
-@Entity(tableName = "rates")
-data class RateEntity(
-    @PrimaryKey val currency: String,
-    val uahPerUnit: Double,
-    val epochDay: Long,
-    val fetchedAtMillis: Long,
-)
-```
-
 ## data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt
 
 ```kotlin
@@ -7101,8 +10054,15 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.semmyx.ledger.data.bank.BankDao
+import com.semmyx.ledger.data.bank.BankInboxEntity
+import com.semmyx.ledger.data.bank.CustomCategoryEntity
 
-@Database(entities = [EntryEntity::class, RateEntity::class, CustomCategoryEntity::class, BankInboxEntity::class], version = 2, exportSchema = true)
+@Database(
+    entities = [EntryEntity::class, RateEntity::class, CustomCategoryEntity::class, BankInboxEntity::class],
+    version = 3,
+    exportSchema = true,
+)
 abstract class LedgerDatabase : RoomDatabase() {
     abstract fun ledgerDao(): LedgerDao
     abstract fun rateDao(): RateDao
@@ -7122,13 +10082,71 @@ abstract class LedgerDatabase : RoomDatabase() {
                 db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_bank_inbox_eventKey ON bank_inbox(eventKey)")
             }
         }
+
+        /**
+         * v2 → v3: adds [groupKey] column and its index to bank_inbox.
+         * groupKey links wallet-app + issuing-bank notifications for the same card tap
+         * to support cross-source deduplication. NULL for existing rows is safe.
+         */
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE bank_inbox ADD COLUMN groupKey TEXT")
+                db.execSQL("CREATE INDEX IF NOT EXISTS index_bank_inbox_groupKey ON bank_inbox(groupKey)")
+            }
+        }
+
         fun create(context: Context): LedgerDatabase = Room.databaseBuilder(
-            context.applicationContext, LedgerDatabase::class.java, "ledger.db"
-        ).addMigrations(MIGRATION_1_2).setJournalMode(JournalMode.WRITE_AHEAD_LOGGING).build()
-        // v1 -> v2 preserves all ledger rows. Every future schema must register explicit migrations;
-        // deliberately no fallbackToDestructiveMigration that could erase financial records.
+            context.applicationContext, LedgerDatabase::class.java, "ledger.db",
+        )
+            .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+            .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
+            .build()
+        // No fallbackToDestructiveMigration — financial records must never be erased automatically.
     }
 }
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt
+
+```kotlin
+package com.semmyx.ledger.data.local
+
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "entries", indices = [Index(value = ["currency", "deletedAtMillis", "epochDay", "createdAtMillis"])])
+data class EntryEntity(
+    @PrimaryKey val id: String,
+    val title: String,
+    val amountMinor: Long,
+    val currency: String,
+    val type: String,
+    val category: String,
+    val epochDay: Long,
+    val note: String,
+    val searchText: String,
+    val createdAtMillis: Long,
+    val deletedAtMillis: Long? = null,
+    @androidx.room.ColumnInfo(defaultValue = "'UNKNOWN'") val sourceType: String = "UNKNOWN",
+    val bankId: String? = null,
+    val cardLast4: String? = null,
+    val eventAtMillis: Long? = null,
+    val customCategoryId: String? = null,
+    @androidx.room.ColumnInfo(defaultValue = "'MANUAL'") val origin: String = "MANUAL",
+)
+
+data class BalanceRow(val incomeMinor: Long, val expenseMinor: Long, val entryCount: Int)
+data class CategoryTotalRow(val category: String, val incomeMinor: Long, val expenseMinor: Long, val count: Int, val incomeCount: Int, val expenseCount: Int)
+data class ActivityRow(val epochDay: Long, val incomeMinor: Long, val expenseMinor: Long)
+
+@Entity(tableName = "rates")
+data class RateEntity(
+    @PrimaryKey val currency: String,
+    val uahPerUnit: Double,
+    val epochDay: Long,
+    val fetchedAtMillis: Long,
+)
 ```
 
 ## data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt
@@ -7165,121 +10183,6 @@ data class RateDto(
     @SerializedName("rate") val rate: Double?,
     @SerializedName("exchangedate") val exchangeDate: String?,
 )
-```
-
-## data/src/main/kotlin/com/semmyx/ledger/data/repository/BankImportRepository.kt
-
-```kotlin
-package com.semmyx.ledger.data.repository
-
-import android.content.Context
-import androidx.room.withTransaction
-import com.semmyx.ledger.data.local.*
-import com.semmyx.ledger.domain.*
-import com.semmyx.ledger.domain.bank.*
-import java.security.MessageDigest
-import java.time.*
-import java.util.UUID
-import java.util.Locale
-import kotlinx.coroutines.flow.map
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
-
-/** Imports and acknowledgements are atomic with the existing ledger. No HTTP, raw text or PAN storage. */
-class BankImportRepository(private val db: LedgerDatabase, context: Context) : BankRepository {
-    private val config = context.applicationContext.getSharedPreferences("bank_import", Context.MODE_PRIVATE)
-    private val diagnosticState = MutableStateFlow(ImportDiagnostics())
-    override val diagnostics = diagnosticState.asStateFlow()
-    fun connected(value: Boolean) { diagnosticState.update { it.copy(connected = value) } }
-    fun note(code: String, packageName: String = "", notification: Boolean = false, bankMessage: Boolean = false) {
-        diagnosticState.update { old -> old.copy(lastCode = code, lastPackage = packageName.ifBlank { old.lastPackage },
-            lastAtMillis = System.currentTimeMillis(), notificationCount = old.notificationCount + if (notification) 1 else 0,
-            bankMessageCount = old.bankMessageCount + if (bankMessage) 1 else 0) }
-    }
-    override fun configuredPackage(bankId: String): String = config.getString("package_" + bankId, null)
-        ?: Banks.all.firstOrNull { it.id == bankId }?.packages?.firstOrNull().orEmpty()
-    override fun setPackage(bankId: String, packageName: String) {
-        require(Banks.all.any { it.id == bankId })
-        require(packageName.matches(Regex("[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z0-9_]+)+")))
-        config.edit().putString("package_" + bankId, packageName.trim()).apply()
-    }
-    fun bankForPackage(packageName: String): Bank? = Banks.all.firstOrNull { config.getString("package_" + it.id, null) == packageName }
-        ?: Banks.byPackage(packageName)
-    override suspend fun importText(bankId: String, text: String): Boolean {
-        val bank = Banks.all.firstOrNull { it.id == bankId } ?: return false
-        if (BankParser.parse(bank, text, System.currentTimeMillis()) == null) { note("UNRECOGNIZED"); return false }
-        receive(bank, text, "MANUAL_TEXT:" + bankId + ":" + UUID.randomUUID(), System.currentTimeMillis(), "MANUAL_TEXT", manual = true)
-        return true
-    }
-    private val dao = db.bankDao()
-    override fun categories() = dao.categories().map { rows -> rows.map { CustomBankCategory(it.id, it.name, it.colorHex) } }
-    override fun reviews() = dao.inbox().map { rows -> rows.map { ImportReview(it.id, it.bankId, it.amountMinor,
-        LedgerCurrency.valueOf(it.currency), EntryType.valueOf(it.type), it.merchant, it.cardLast4, it.eventAtMillis,
-        it.timeFromMessage, it.transfer, it.status) } }
-    override fun sources(currency: LedgerCurrency, from: LocalDate, through: LocalDate) =
-        dao.sources(currency.name, from.toEpochDay(), through.toEpochDay()).map { rows -> rows.map { BankSourceSpend(it.sourceType, it.bankId, it.totalMinor) } }
-    override fun categorySpending(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
-        dao.detailCategories(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map {
-            BankCategorySpend(Category.valueOf(it.category), it.customCategoryId, it.customName, it.customColor, it.totalMinor) } }
-    override fun recent(currency: LedgerCurrency, from: LocalDate, through: LocalDate, source: String?, bank: String?) =
-        dao.recent(currency.name, from.toEpochDay(), through.toEpochDay(), source, bank).map { rows -> rows.map { it.toDomain() } }
-    override suspend fun exportEntries() = dao.exportEntries().map { it.toDomain() }
-    override suspend fun clearHistory() { dao.clearInbox() }
-    override fun budget(currency: LedgerCurrency): Long = config.getLong("budget_" + currency.name, 0L)
-    override fun setBudget(currency: LedgerCurrency, minor: Long) { require(minor >= 0); config.edit().putLong("budget_" + currency.name, minor).apply() }
-    override var enabled: Boolean
-        get() = config.getBoolean("enabled", false)
-        set(value) { config.edit().putBoolean("enabled", value).apply() }
-    override var autoImport: Boolean
-        get() = config.getBoolean("auto", false)
-        set(value) { config.edit().putBoolean("auto", value).apply() }
-    suspend fun receive(bank: Bank, text: String, eventKey: String, at: Long, origin: String, manual: Boolean = false) {
-        if (!enabled && !manual) { note("DISABLED"); return }
-        val parsed = BankParser.parse(bank, text, at) ?: run { note("UNRECOGNIZED"); return }
-        var result = "QUEUED"
-        db.withTransaction {
-            val duplicate = dao.similar(parsed.bankId, parsed.amountMinor, parsed.currency.name, parsed.type.name,
-                parsed.happenedAtMillis, parsed.cardLast4, parsed.merchant) > 0
-            val status = if (duplicate) "DUPLICATE_REVIEW" else "REVIEW"
-            val item = BankInboxEntity(UUID.randomUUID().toString(), digest(eventKey), parsed.bankId, parsed.amountMinor,
-                parsed.currency.name, parsed.type.name, parsed.merchant, parsed.cardLast4, parsed.happenedAtMillis, at,
-                parsed.timeFromMessage, parsed.transfer, parsed.category.name, origin, status)
-            if (dao.insertInbox(item) == -1L) { result = "REDELIVERED"; return@withTransaction }
-            if (duplicate) result = "DUPLICATE_REVIEW"
-            if (!manual && autoImport && parsed.confident && !duplicate) { acceptInside(item, parsed.type); result = "AUTO_IMPORTED" }
-        }
-        note(result)
-    }
-    override suspend fun accept(id: String, type: EntryType) { db.withTransaction {
-        val item = dao.inboxItem(id) ?: return@withTransaction
-        if (item.status !in listOf("REVIEW", "DUPLICATE_REVIEW")) return@withTransaction
-        acceptInside(item, type)
-    } }
-    private suspend fun acceptInside(item: BankInboxEntity, type: EntryType) {
-        val id = "bank-" + item.id
-        val date = Instant.ofEpochMilli(item.eventAtMillis).atZone(ZoneId.systemDefault()).toLocalDate()
-        val title = item.merchant.ifBlank { Banks.name(item.bankId) }.take(60)
-        val entity = EntryEntity(id, title, item.amountMinor, item.currency, type.name, item.category, date.toEpochDay(),
-            if (item.transfer) "Confirmed external transfer" else "", title.lowercase(Locale.ROOT), item.receivedAtMillis,
-            sourceType = "CARD", bankId = item.bankId, cardLast4 = item.cardLast4, eventAtMillis = item.eventAtMillis, origin = item.origin)
-        db.ledgerDao().insert(entity)
-        dao.status(item.id, "IMPORTED", id)
-    }
-    override suspend fun ignore(id: String) { db.withTransaction {
-        val item = dao.inboxItem(id) ?: return@withTransaction
-        if (item.status in listOf("REVIEW", "DUPLICATE_REVIEW")) dao.status(id, "IGNORED", null)
-    } }
-    override suspend fun createCategory(name: String, hex: String) {
-        require(name.trim().length in 1..40)
-        val color = ColorPreferences.normalizeHex(hex) ?: error("Invalid color")
-        dao.addCategory(CustomCategoryEntity(UUID.randomUUID().toString(), name.trim(), color))
-    }
-    companion object {
-        fun digest(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
-            .joinToString("") { "%02x".format(it.toInt() and 255) }
-    }
-}
 ```
 
 ## data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt
@@ -7351,7 +10254,7 @@ class DataStorePreferences(context: Context, scope: CoroutineScope) : Preference
             language = enumOrDefault(p[Keys.language], defaultLanguage),
             onboardingComplete = p[Keys.onboarded] ?: false,
             biometricsEnabled = p[Keys.biometrics] ?: false,
-            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: false,
+            premiumAssistantEnabled = p[Keys.premiumAssistant] ?: true,
             mascotSkin = p[Keys.skin] ?: "gray",
             mascotAnimations = p[Keys.animations] ?: true,
             refreshRateHz = p[Keys.refreshRate] ?: 0,
@@ -7772,7 +10675,7 @@ internal fun BillingClient.queryVersionedProducts(params: QueryProductDetailsPar
 internal fun versionedPrice(details: ProductDetails): String? = details.oneTimePurchaseOfferDetailsList?.firstOrNull()?.formattedPrice
 internal fun versionedProductParams(details: ProductDetails): BillingFlowParams.ProductDetailsParams {
     val offer = requireNotNull(details.oneTimePurchaseOfferDetailsList?.firstOrNull())
-    return BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(details).setOfferToken(offer.offerToken).build()
+    return BillingFlowParams.ProductDetailsParams.newBuilder().setProductDetails(details).setOfferToken(requireNotNull(offer.offerToken)).build()
 }
 ```
 
@@ -7822,6 +10725,111 @@ class SearchPatternTest {
     @Test fun wildcardsAreLiteralsAndUkrainianIsCaseFolded() {
         assertEquals("%кава%", RoomEntryRepository.likePattern(" КАВА "))
         assertEquals("%50\\%\\_off%", RoomEntryRepository.likePattern("50%_off"))
+    }
+}
+```
+
+## data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.semmyx.ledger.domain.LedgerCurrency
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+
+class MonobankClientTest {
+    private lateinit var server: MockWebServer
+    private lateinit var client: MonobankClient
+    @Before fun setUp() { server = MockWebServer().also { it.start() }; client = MonobankClient(baseUrl = server.url("/").toString()) }
+    @After fun tearDown() { server.shutdown() }
+
+    @Test fun accountsAreParsedAndTokenIsSentAsHeader() {
+        server.enqueue(MockResponse().setBody("""{"clientId":"c","name":"N","accounts":[
+            {"id":"acc1","currencyCode":980,"type":"black","maskedPan":["537541******1234"],"balance":1000},
+            {"id":"acc2","currencyCode":840,"type":"white","maskedPan":[],"balance":5},
+            {"id":"acc3","currencyCode":980,"type":"eAid","maskedPan":[]},
+            {"id":"acc4","currencyCode":392,"type":"black","maskedPan":[]}]}"""))
+        val accounts = client.accounts("secret-token")
+        assertEquals(listOf("acc1", "acc2"), accounts.map { it.id })
+        assertEquals("1234", accounts[0].cardLast4); assertNull(accounts[1].cardLast4)
+        assertEquals(LedgerCurrency.USD, accounts[1].currency)
+        val request = server.takeRequest()
+        assertEquals("/personal/client-info", request.path); assertEquals("secret-token", request.getHeader("X-Token"))
+    }
+
+    @Test fun statementRowsAreParsed() {
+        server.enqueue(MockResponse().setBody("""[{"id":"s1","time":1700000000,"description":"Сільпо","mcc":5411,"amount":-12550,"balance":1,"currencyCode":980},
+            {"id":"s2","time":1700000100,"description":null,"mcc":4829,"amount":50000}]"""))
+        val rows = client.statement("t", "acc1", 1699000000, 1700000200)
+        assertEquals(2, rows.size)
+        assertEquals(-12550L, rows[0].amount); assertEquals("Сільпо", rows[0].description); assertEquals(5411, rows[0].mcc)
+        assertEquals("", rows[1].description)
+        assertEquals("/personal/statement/acc1/1699000000/1700000200", server.takeRequest().path)
+    }
+
+    @Test fun errorsCarryTheHttpCode() {
+        server.enqueue(MockResponse().setResponseCode(403))
+        val bad = try { client.accounts("x"); null } catch (e: MonobankClient.ApiException) { e }
+        assertTrue(bad!!.invalidToken)
+        server.enqueue(MockResponse().setResponseCode(429))
+        val slow = try { client.statement("x", "a", 1, 2); null } catch (e: MonobankClient.ApiException) { e }
+        assertTrue(slow!!.rateLimited)
+    }
+}
+```
+
+## data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.*
+import okhttp3.mockwebserver.*
+import java.time.LocalDate
+import org.junit.*
+import org.junit.Assert.*
+
+class PrivatBankClientTest {
+    private lateinit var server: MockWebServer
+    private lateinit var client: PrivatBankClient
+    private val row = """{"AUT_MY_ACC":"UA111111111111111111111111111","AUT_CNTR_NAM":"Сільпо","CCY":"UAH","FL_REAL":"r","PR_PR":"r","SUM":"125.50","REF":"ref1","REFN":"1","TRANTYPE":"D","DATE_TIME_DAT_OD_TIM_P":"14.10.2026 12:01:02","OSND":"Оплата"}"""
+    @Before fun before() { server = MockWebServer().also { it.start() }; client = PrivatBankClient(baseUrl = server.url("/").toString()) }
+    @After fun after() { server.shutdown() }
+    @Test fun readOnlyRequestPaginationAndExactMoney() {
+        server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":true,"next_page_id":"cursor1","transactions":[$row]}"""))
+        server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":false,"transactions":[$row]}"""))
+        val rows = client.statement("test-token", LocalDate.of(2026,10,1), LocalDate.of(2026,10,7))
+        assertEquals(1, rows.size); assertEquals(12550L, rows[0].parsed.amountMinor)
+        assertEquals(EntryType.EXPENSE, rows[0].parsed.type)
+        assertEquals(Category.FOOD, rows[0].parsed.category)
+        val first = server.takeRequest()
+        assertEquals("GET", first.method); assertEquals("test-token", first.getHeader("token"))
+        assertEquals("01-10-2026", first.requestUrl!!.queryParameter("startDate"))
+        assertEquals("cursor1", server.takeRequest().requestUrl!!.queryParameter("followId"))
+    }
+    @Test fun onlyBookedRowsAndSupportedCurrenciesAreImported() {
+        fun map(text: String) = PrivatBankClient.map(JsonParser.parseString(text).asJsonObject)
+        assertNull(map(row.replace("\"PR_PR\":\"r\"", "\"PR_PR\":\"p\"")))
+        assertNull(map(row.replace("\"FL_REAL\":\"r\"", "\"FL_REAL\":\"i\"")))
+        assertNull(map(row.replace("\"UAH\"", "\"JPY\"")))
+        assertNull(map(row.replace("125.50", "0")))
+        assertEquals(EntryType.INCOME, map(row.replace("\"D\"", "\"C\""))!!.parsed.type)
+        assertNull(map(row.replace("14.10.2026", "31.02.2026")))
+    }
+    @Test fun repeatedOrMissingCursorFailsRatherThanSilentlyLosingHistory() {
+        repeat(2) { server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":true,"next_page_id":"same","transactions":[]}""")) }
+        try { client.statement("test", LocalDate.now(), LocalDate.now()); fail() }
+        catch (e: PrivatBankClient.ApiException) { assertEquals(422, e.code) }
+    }
+    @Test fun badCredentialsAreReported() {
+        server.enqueue(MockResponse().setResponseCode(403))
+        try { client.statement("test", LocalDate.now(), LocalDate.now()); fail() }
+        catch (e: PrivatBankClient.ApiException) { assertEquals(403, e.code) }
     }
 }
 ```
@@ -7957,7 +10965,9 @@ object FinanceWindow {
 }
 
 object TrialPolicy {
-    fun validDays(days: Int) = days == 7 || days == 14
+    /** One trial only: 14 days. */
+    const val DAYS = 14
+    fun validDays(days: Int) = days == DAYS
     fun active(start: Long, end: Long, now: Long, lastSeen: Long): Boolean =
         start > 0 && end > start && now >= start && now >= lastSeen && now < end
 }
@@ -8064,7 +11074,7 @@ data class UserPreferences(
     val onboardingComplete: Boolean = false,
     val biometricsEnabled: Boolean = false,
     // Gated separately from entitlement: a premium user can still hide the mascot.
-    val premiumAssistantEnabled: Boolean = false,
+    val premiumAssistantEnabled: Boolean = true,
     val mascotSkin: String = "gray",
     val mascotAnimations: Boolean = true,
     val refreshRateHz: Int = 0,
@@ -8293,92 +11303,274 @@ import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.*
 import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
 import java.util.Locale
 
 enum class PaymentSource { UNKNOWN, CASH, CARD }
-data class Bank(val id: String, val name: String, val packages: Set<String>, val senders: Set<String>)
+
+/**
+ * [packages] are exact Android package names; [packageHints] are fragments that identify the same app
+ * when the vendor ships it under a different id (regional builds, beta channels).
+ */
+data class Bank(
+    val id: String, val name: String, val packages: Set<String>, val senders: Set<String>,
+    val packageHints: Set<String> = emptySet(),
+)
+
 object Banks {
+    const val WALLET_ID = "wallet"
     val all = listOf(
-        Bank("privat", "ПриватБанк", setOf("com.pb", "com.privatbank.ap24"), setOf("privatbank", "privat", "privat24", "3700")),
-        Bank("mono", "monobank", setOf("com.ftband.mono"), setOf("monobank", "mono")),
-        Bank("sense", "Sense Bank", setOf("ua.alfabank.mobile.android", "ua.sensebank.mobile.android"), setOf("sensebank", "sense", "alfabank")),
-        Bank("abank", "А-Банк", setOf("ua.com.abank", "ua.com.abank.android"), setOf("abank", "a-bank", "а-банк")),
-        Bank("oschad", "Ощадбанк", setOf("ua.oschadbank.online"), setOf("oschadbank", "oschad", "ощадбанк")),
-        Bank("pumb", "ПУМБ", setOf("com.fuib.android.spot.online"), setOf("pumb", "fuib", "пумб")),
-        Bank("revolut", "Revolut", setOf("com.revolut.revolut"), setOf("revolut")),
-        Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise")),
-        Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"))
+        Bank("privat", "ПриватБанк", setOf("ua.privatbank.ap24", "com.privatbank.ap24", "com.pb"), setOf("privatbank", "privat", "privat24", "3700"), setOf("privatbank", "ap24")),
+        Bank("mono", "monobank", setOf("com.ftband.mono"), setOf("monobank", "mono"), setOf("ftband", "monobank")),
+        Bank("sense", "Sense Bank", setOf("ua.alfabank.mobile.android", "ua.sensebank.mobile.android"), setOf("sensebank", "sense", "alfabank"), setOf("alfabank", "sensebank")),
+        Bank("abank", "А-Банк", setOf("ua.com.abank", "ua.com.abank.android"), setOf("abank", "a-bank", "а-банк"), setOf("abank")),
+        Bank("oschad", "Ощадбанк", setOf("ua.oschadbank.online"), setOf("oschadbank", "oschad", "ощадбанк"), setOf("oschad")),
+        Bank("pumb", "ПУМБ", setOf("com.fuib.android.spot.online"), setOf("pumb", "fuib", "пумб"), setOf("fuib", "pumb")),
+        Bank("revolut", "Revolut", setOf("com.revolut.revolut"), setOf("revolut"), setOf("revolut")),
+        Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise"), setOf("transferwise")),
+        Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"), setOf("number26")),
+        // Wallet apps announce the same tap as the issuing bank; the pair is collapsed by cross-source deduplication.
+        Bank("other", "Інший банк / Other bank", emptySet(), emptySet()),
+        Bank(WALLET_ID, "Google Wallet", setOf("com.google.android.apps.walletnfcrel", "com.samsung.android.spay"), emptySet(), setOf("walletnfcrel")),
     )
-    fun byPackage(value: String) = all.firstOrNull { value in it.packages }
-    fun bySender(value: String) = all.firstOrNull { value.trim().lowercase(Locale.ROOT) in it.senders }
+    fun byPackage(value: String): Bank? =
+        all.firstOrNull { value in it.packages } ?: all.firstOrNull { bank -> bank.packageHints.any { value.contains(it, ignoreCase = true) } }
+    /** SMS sender ids vary ("PRIVATBANK", "Privat24", "monobank", "SENSE BANK"): exact match, else a name fragment (4+ chars). */
+    fun bySender(value: String): Bank? {
+        val sender = value.trim().lowercase(Locale.ROOT)
+        if (sender.isEmpty()) return null
+        return all.firstOrNull { sender in it.senders }
+            ?: all.firstOrNull { bank -> bank.senders.any { it.length >= 4 && sender.contains(it) } }
+    }
     fun name(id: String?) = all.firstOrNull { it.id == id }?.name ?: id.orEmpty()
 }
+
 data class ParsedBankOperation(val bankId: String, val amountMinor: Long, val currency: LedgerCurrency,
     val type: EntryType, val merchant: String, val cardLast4: String?, val happenedAtMillis: Long,
     val timeFromMessage: Boolean, val transfer: Boolean, val confident: Boolean, val category: Category)
 
-/** Pure offline parser. OTP/ads/refusals are ignored; ambiguous texts never become automatic expenses. */
+/**
+ * Pure offline parser for bank push / SMS texts (Ukrainian, Russian, English and transliterated).
+ *
+ * A message becomes an operation only when it carries an amount **and** a clear direction (sign or
+ * keyword). OTP codes, declines, ads, balance-only texts and conversion amounts are ignored.
+ * `confident` means: single amount, known direction -> safe to save without asking.
+ */
 object BankParser {
-    private val amount = Regex("([+-]?[0-9]{1,3}(?:[ \\u00A0\\u202F][0-9]{3})+(?:[.,][0-9]{1,2})?|[+-]?[0-9]+(?:[.,][0-9]{1,2})?)\\s*(UAH|USD|EUR|грн\\.?|гривень|гривні|₴|\\$|€)", RegexOption.IGNORE_CASE)
-    private val amountPrefix = Regex("(UAH|USD|EUR|\\$|€|₴)\\s*([+-]?[0-9]+(?:[.,][0-9]{1,2})?)", RegexOption.IGNORE_CASE)
-    private val expense = Regex("(?:списан[оі]?|витрат[аи]|оплат[аи]|покупк[аи]|купівл[яі]|purchase|paid|payment|spent|debit(?:ed)?)", RegexOption.IGNORE_CASE)
-    private val income = Regex("(?:зарахован[оі]?|поповнення|пополнение|надходження|зачислен[оа]?|received|credited|top[ -]?up|refund|повернення)", RegexOption.IGNORE_CASE)
-    private val transfer = Regex("(?:переказ|перевод|transfer|p2p)", RegexOption.IGNORE_CASE)
-    private val otp = Regex("(?:одноразов|one[ -]?time|verification code|код\\s+(?:входу|підтвердження|подтверждения)|otp|пароль|password)", RegexOption.IGNORE_CASE)
-    private val declined = Regex("(?:відхилен|отклонен|declined|failed|невдал|недостатньо|insufficient)", RegexOption.IGNORE_CASE)
-    private val card = Regex("(?:карт[аикоуі]*|card|[＊*•]{2,})\\s*[:№#*•-]*\\s*([0-9]{4})(?![0-9])", RegexOption.IGNORE_CASE)
-    private val merchant = Regex("(?:merchant|магазин|мерчант|торговець|at|у|в)\\s*[:=-]?\\s+([^;\\n]+)", RegexOption.IGNORE_CASE)
-    private val time = Regex("([0-9]{2}[./][0-9]{2}[./][0-9]{4})[ ,T]+([0-9]{2}:[0-9]{2}(?::[0-9]{2})?)")
-    fun parse(bank: Bank, text: String, receivedAt: Long, zone: ZoneId = ZoneId.systemDefault()): ParsedBankOperation? {
-        if (text.length > 8000 || otp.containsMatchIn(text) || declined.containsMatchIn(text)) return null
-        val matches = amount.findAll(text).filter { found ->
-            val prefix = text.substring(maxOf(0, found.range.first - 35), found.range.first)
-            !Regex("(?:баланс|залишок|остаток|balance|available|ліміт|limit)\\s*[:=-]?\\s*$", RegexOption.IGNORE_CASE).containsMatchIn(prefix)
-        }.toList()
-        val prefixes = amountPrefix.findAll(text).filter { found ->
-            val prefix = text.substring(maxOf(0, found.range.first - 35), found.range.first)
-            !Regex("(?:баланс|залишок|остаток|balance|available|ліміт|limit)\\s*[:=-]?\\s*$", RegexOption.IGNORE_CASE).containsMatchIn(prefix)
-        }.toList()
-        if (matches.isEmpty() && prefixes.isEmpty()) return null
-        val debit = expense.containsMatchIn(text); val credit = income.containsMatchIn(text); val moving = transfer.containsMatchIn(text)
-        if (!debit && !credit && !moving && !text.contains(Regex("[+-]\\s*[0-9]"))) return null
-        val selected = matches.firstOrNull()
-        val rawAmount = (selected?.groupValues?.get(1) ?: prefixes.first().groupValues[2]).replace(Regex("[ \\u00A0\\u202F]"), "").replace(',', '.')
-        val money = try { BigDecimal(rawAmount).abs().setScale(2, RoundingMode.UNNECESSARY).movePointRight(2).longValueExact() } catch (_: Exception) { return null }
-        if (money <= 0 || money > Money.MAX_ENTRY_MINOR) return null
-        val cur = (selected?.groupValues?.get(2) ?: prefixes.first().groupValues[1]).uppercase(Locale.ROOT)
-        val currency = when (cur) { "USD", "$" -> LedgerCurrency.USD; "EUR", "€" -> LedgerCurrency.EUR; else -> LedgerCurrency.UAH }
-        val type = if (credit && !debit || rawAmount.startsWith("+")) EntryType.INCOME else EntryType.EXPENSE
-        var shop = merchant.find(text)?.groupValues?.getOrNull(1)?.let {
-            it.replace(Regex("(?:баланс|залишок|balance|карт[аикоуі]*|card|[0-9]{2}[./][0-9]{2}[./][0-9]{4}).*$", RegexOption.IGNORE_CASE), "").trim().take(60)
-        }.orEmpty()
-        if (shop.isBlank()) {
-            val excluded = Regex("(?:баланс|залишок|остаток|balance|available|карт[аикоуі]*|card|[0-9]{2}:[0-9]{2})", RegexOption.IGNORE_CASE)
-            shop = text.lines().map { line -> amount.replace(amountPrefix.replace(line, ""), "").trim(' ', ':', '-', '+') }
-                .firstOrNull { line -> line.length in 2..60 && !line.equals(bank.name, ignoreCase = true) && !excluded.containsMatchIn(line) &&
-                    !expense.matches(line) && !income.matches(line) && !transfer.matches(line) && !line.all { it.isDigit() || it.isWhitespace() } }.orEmpty()
-        }
-        val timestamp = time.find(text)?.let { match ->
-            try {
-                val date = LocalDate.parse(match.groupValues[1].replace('/', '.'), DateTimeFormatter.ofPattern("dd.MM.uuuu").withResolverStyle(java.time.format.ResolverStyle.STRICT))
-                val clock = LocalTime.parse(match.groupValues[2])
-                date.atTime(clock).atZone(zone).toInstant().toEpochMilli().takeIf { it <= receivedAt + 300_000L && it >= receivedAt - 366L * 86400000L }
-            } catch (_: Exception) { null }
-        }
-        return ParsedBankOperation(bank.id, money, currency, type, shop, card.find(text)?.groupValues?.getOrNull(1),
-            timestamp ?: receivedAt, timestamp != null, moving, matches.size + prefixes.size == 1 && debit != credit && !moving && shop.isNotBlank() && (merchant.containsMatchIn(text) || categorize(shop) != Category.OTHER), categorize(shop))
+    private const val NUM = "(?:[0-9]{1,3}(?:[ .,][0-9]{3})+(?:[.,][0-9]{1,2})?|[0-9]+(?:[.,][0-9]{1,2})?)"
+    private const val WORD_CUR = "(?:UAH|USD|EUR|GBP|PLN|грн\\.?|гривень|гривні|гривня|zł|zl)(?![\\p{L}])"
+    private const val SYMBOL_CUR = "[₴$€£]"
+    private val suffixAmount = Regex("([+-])?\\s*($NUM)\\s*($SYMBOL_CUR|$WORD_CUR)", RegexOption.IGNORE_CASE)
+    private val prefixAmount = Regex("(?<![\\p{L}])($SYMBOL_CUR|UAH|USD|EUR|GBP|PLN)\\s*([+-])?\\s*($NUM)", RegexOption.IGNORE_CASE)
+
+    private val nonTransactionAmount = Regex(
+        "(?:баланс|бал\\.?|залишок|остаток|доступн\\w*|available|balance|bal\\.?|ліміт|лимит|limit|кредитн\\w*|кешбек\\w*|кэшбэк\\w*|cashback|комісі\\w*|комиссия|fee|commission|до сплати|мін\\w*\\s+платіж|минимальный платеж)\\s*[:=-]?\\s*$",
+        RegexOption.IGNORE_CASE)
+    private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
+    private val expense = Regex(
+        "(?:списан|потрат|потрач|сплачен|розрахува|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
+        RegexOption.IGNORE_CASE)
+    private val income = Regex(
+        "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",
+        RegexOption.IGNORE_CASE)
+    private val transfer = Regex("(?:переказ|перевод|transfer|p2p|perekaz|perevod)", RegexOption.IGNORE_CASE)
+    private val transferIn = Regex("(?:від\\s|от\\s|from\\s|отримано|получен|received|зарахован|зачислен)", RegexOption.IGNORE_CASE)
+    private val transferOut = Regex("(?:\\sна\\s|\\sto\\s|відправлен|отправлен|sent|списан|знят)", RegexOption.IGNORE_CASE)
+    private val otp = Regex("(?:одноразов|one[ -]?time|verification code|код\\s+(?:входу|підтвердження|подтверждения|безпеки)|otp|пароль|password|cvv)", RegexOption.IGNORE_CASE)
+    private val declined = Regex("(?:відхилен|отклонен|declined|failed|невдал|недостатньо|insufficient|не вдалос|заблоковано)", RegexOption.IGNORE_CASE)
+    private val promo = Regex("(?:кредит до|кредит на|до \\d[\\d ]*\\s*(?:грн|₴)\\s+(?:на|під|без)|акці[яї]|знижк|пропозиці|промо|promo|розіграш|виграй|вигра|реклам|оформи|отримай)", RegexOption.IGNORE_CASE)
+    private val card = Regex("(?:карт[аикоуі]*|card|[＊*•·]{1,})\\s*[:№#*•·.-]*\\s*([0-9]{4})(?![0-9])", RegexOption.IGNORE_CASE)
+    private val label = Regex("(?:merchant|магазин|мерчант|торговець|торгова точка|місце|место|place|details|description|опис|описание|призначення|назначение)\\s*[:=]\\s*([^;\\n]+)", RegexOption.IGNORE_CASE)
+    private val preposition = Regex("(?<![\\p{L}\\p{N}])(?:at|у|в|in)\\s+([^;\\n,]+)", RegexOption.IGNORE_CASE)
+    private val dateTime = Regex("([0-9]{2}[./][0-9]{2}[./][0-9]{4})[ ,T]+([0-9]{2}:[0-9]{2}(?::[0-9]{2})?)")
+    private val clockOnly = Regex("(?<![0-9:.])([0-9]{1,2}:[0-9]{2})(?![0-9:])")
+    private val trailer = Regex(
+        "\\s*(?:[;|•·]|(?:баланс|залишок|остаток|бал\\.|balance|bal\\.|карт[аикоуі]*|card|рахунок|доступно)(?![\\p{L}\\p{N}])|[0-9]{2}[./][0-9]{2}[./][0-9]{2,4}|[0-9]{1,2}:[0-9]{2}|[＊*•]{1,}\\s*[0-9]{4}).*$",
+        setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+    private val genericTitle = Regex(
+        "(?:оплата|покупка|купівля|списання|списано|зарахування|зараховано|поповнення|переказ|платіж|транзакці\\w*|нова транзакція|операці\\w*|витрата|надходження|payment|purchase|transaction|new transaction|transfer|debit|credit|card payment|оплата карткою|apple pay|google pay|google wallet|samsung pay|карт[аиок]*|card|\\p{P}|\\s)+",
+        RegexOption.IGNORE_CASE)
+    private val emoji = Regex("[\\p{So}\\p{Cs}\\u200d\\uFE0F]+")
+
+    private data class Hit(val range: IntRange, val minor: Long, val currency: LedgerCurrency, val sign: Char?)
+
+    private fun normalize(text: String) = text
+        .replace(Regex("[\\u2212\\u2012\\u2013\\u2014\\u2796\\uFE63\\uFF0D]"), "-")
+        .replace(Regex("[\\u00A0\\u202F\\u2009\\u2007\\u200B]"), " ")
+        .replace("\r", "")
+
+    private fun currencyOf(token: String): LedgerCurrency? = when (token.trim().trimEnd('.').uppercase(Locale.ROOT)) {
+        "USD", "$" -> LedgerCurrency.USD
+        "EUR", "€" -> LedgerCurrency.EUR
+        "GBP", "£" -> LedgerCurrency.GBP
+        "PLN", "ZŁ", "ZL" -> LedgerCurrency.PLN
+        "UAH", "₴", "ГРН", "ГРИВЕНЬ", "ГРИВНІ", "ГРИВНЯ" -> LedgerCurrency.UAH
+        else -> null
     }
+
+    /** "1 200,50" "1,200.50" "1200.5" "1.200,50" -> minor units, or null. */
+    internal fun minorOf(raw: String): Long? {
+        var value = raw.replace(" ", "")
+        val lastComma = value.lastIndexOf(','); val lastDot = value.lastIndexOf('.')
+        value = when {
+            lastComma >= 0 && lastDot >= 0 -> if (lastComma > lastDot) value.replace(".", "").replace(',', '.') else value.replace(",", "")
+            lastComma >= 0 || lastDot >= 0 -> {
+                val sep = if (lastComma >= 0) ',' else '.'
+                val parts = value.split(sep)
+                if (parts.size > 2) value.replace(sep.toString(), "")
+                else if (parts[1].length == 3 && parts[0].length in 1..3 && parts[0] != "0") parts[0] + parts[1]
+                else parts[0] + "." + parts[1]
+            }
+            else -> value
+        }
+        return try { BigDecimal(value).abs().setScale(2, RoundingMode.UNNECESSARY).movePointRight(2).longValueExact() } catch (_: Exception) {
+            try { BigDecimal(value).abs().setScale(2, RoundingMode.HALF_UP).movePointRight(2).longValueExact() } catch (_: Exception) { null }
+        }
+    }
+
+    private fun hits(text: String): List<Hit> {
+        val found = mutableListOf<Hit>()
+        suffixAmount.findAll(text).forEach { m ->
+            val minor = minorOf(m.groupValues[2]) ?: return@forEach
+            val currency = currencyOf(m.groupValues[3]) ?: return@forEach
+            found += Hit(m.range, minor, currency, m.groupValues[1].firstOrNull())
+        }
+        prefixAmount.findAll(text).forEach { m ->
+            if (found.any { it.range.first <= m.range.last && m.range.first <= it.range.last }) return@forEach
+            val minor = minorOf(m.groupValues[3]) ?: return@forEach
+            val currency = currencyOf(m.groupValues[1]) ?: return@forEach
+            found += Hit(m.range, minor, currency, m.groupValues[2].firstOrNull())
+        }
+        return found.sortedBy { it.range.first }.map { hit ->
+            // The sign may sit just before the currency token ("$-12.50") or before a gap ("- 100").
+            if (hit.sign != null) hit else {
+                val before = text.substring(maxOf(0, hit.range.first - 2), hit.range.first).trimEnd()
+                hit.copy(sign = before.lastOrNull()?.takeIf { it == '-' || it == '+' })
+            }
+        }
+    }
+
+    fun parse(bank: Bank, rawText: String, receivedAt: Long, zone: ZoneId = ZoneId.systemDefault()): ParsedBankOperation? {
+        if (rawText.length > 8000) return null
+        val text = normalize(rawText)
+        if (otp.containsMatchIn(text) || declined.containsMatchIn(text)) return null
+
+        val primary = hits(text).filter { hit ->
+            val prefix = text.substring(maxOf(0, hit.range.first - 28), hit.range.first)
+            !nonTransactionAmount.containsMatchIn(prefix)
+        }
+        val first = primary.firstOrNull() ?: return null
+        // Other amounts in the same currency are ambiguous; other currencies are conversions of the same payment.
+        val ambiguous = primary.drop(1).any { it.currency == first.currency && it.minor != first.minor }
+        if (first.minor <= 0 || first.minor > Money.MAX_ENTRY_MINOR) return null
+
+        val isRefund = refund.containsMatchIn(text)
+        val debit = expense.containsMatchIn(text) && !isRefund
+        val credit = income.containsMatchIn(text) || isRefund
+        val moving = transfer.containsMatchIn(text)
+        val signed = first.sign
+        if (!debit && !credit && !moving && signed == null) return null
+        if (promo.containsMatchIn(text) && signed == null && !debit && !credit) return null
+
+        var directionKnown = true
+        val type: EntryType = when {
+            signed == '+' -> EntryType.INCOME
+            signed == '-' -> EntryType.EXPENSE
+            isRefund -> EntryType.INCOME
+            credit && !debit -> EntryType.INCOME
+            debit && !credit -> EntryType.EXPENSE
+            debit && credit -> { directionKnown = false; if ((income.find(text)?.range?.first ?: Int.MAX_VALUE) < (expense.find(text)?.range?.first ?: Int.MAX_VALUE)) EntryType.INCOME else EntryType.EXPENSE }
+            moving && transferIn.containsMatchIn(text) && !transferOut.containsMatchIn(text) -> EntryType.INCOME
+            moving && transferOut.containsMatchIn(text) && !transferIn.containsMatchIn(text) -> EntryType.EXPENSE
+            else -> { directionKnown = false; EntryType.EXPENSE }
+        }
+
+        val shop = merchant(bank, text, first)
+        val timestamp = timestamp(text, receivedAt, zone)
+        val category = when {
+            moving -> Category.TRANSFER
+            type == EntryType.INCOME && Regex("зарплат|salary", RegexOption.IGNORE_CASE).containsMatchIn(text) -> Category.SALARY
+            else -> categorize(shop)
+        }
+        return ParsedBankOperation(
+            bank.id, first.minor, first.currency, type, shop, card.find(text)?.groupValues?.getOrNull(1),
+            timestamp ?: receivedAt, timestamp != null, moving, directionKnown && !ambiguous, category,
+        )
+    }
+
+    private fun timestamp(text: String, receivedAt: Long, zone: ZoneId): Long? {
+        dateTime.find(text)?.let { match ->
+            try {
+                val date = LocalDate.parse(match.groupValues[1].replace('/', '.'), DateTimeFormatter.ofPattern("dd.MM.uuuu").withResolverStyle(ResolverStyle.STRICT))
+                val clock = LocalTime.parse(match.groupValues[2])
+                return date.atTime(clock).atZone(zone).toInstant().toEpochMilli().takeIf { it <= receivedAt + 300_000L && it >= receivedAt - 366L * 86400000L }
+            } catch (_: Exception) { return null }
+        }
+        // "HH:mm" alone: take today's date if that moment is not in the future (otherwise yesterday).
+        clockOnly.find(text)?.let { match ->
+            try {
+                val clock = LocalTime.parse(match.groupValues[1].padStart(5, '0'))
+                val today = Instant.ofEpochMilli(receivedAt).atZone(zone).toLocalDate()
+                var moment = today.atTime(clock).atZone(zone).toInstant().toEpochMilli()
+                if (moment > receivedAt + 300_000L) moment -= 86_400_000L
+                return moment.takeIf { receivedAt - moment <= 6 * 3_600_000L }
+            } catch (_: Exception) { return null }
+        }
+        return null
+    }
+
+    private fun clean(value: String): String {
+        var out = value.replace(emoji, " ")
+        out = out.replace(trailer, "")
+        out = out.trim(' ', ':', '-', '+', '.', ',', '"', '\'', '«', '»', '(', ')', '|')
+        return out.replace(Regex("\\s{2,}"), " ").take(60)
+    }
+
+    private fun merchant(bank: Bank, text: String, first: Hit): String {
+        label.find(text)?.groupValues?.getOrNull(1)?.let(::clean)?.takeIf { it.length >= 2 }?.let { return it }
+        val badStart = Regex("^(?:карт|card|рахунок|счет|account|[0-9]|[＊*•])", RegexOption.IGNORE_CASE)
+        val after = text.substring(minOf(text.length, first.range.last + 1))
+        preposition.findAll(after).map { clean(it.groupValues[1]) }
+            .firstOrNull { it.length >= 2 && !badStart.containsMatchIn(it) && !genericTitle.matches(it) }?.let { return it }
+        preposition.findAll(text).map { clean(it.groupValues[1]) }
+            .firstOrNull { it.length >= 2 && !badStart.containsMatchIn(it) && !genericTitle.matches(it) }?.let { return it }
+        // Many apps put the shop into the notification title (first line) and the amount into the body.
+        val noAmounts = suffixAmount.replace(prefixAmount.replace(text, ""), "")
+        val keywords = Regex("\\p{L}*(?:${expense.pattern}|${income.pattern}|${transfer.pattern})\\p{L}*", RegexOption.IGNORE_CASE)
+        return noAmounts.lines().asSequence()
+            .map { line -> clean(line.replace(card, " ").replace(keywords, " ")) }
+            .firstOrNull { line ->
+                line.length in 2..60 && !line.equals(bank.name, ignoreCase = true) && !genericTitle.matches(line) &&
+                    !nonTransactionAmount.containsMatchIn(line) && !line.all { it.isDigit() || it.isWhitespace() || it in ".,:*-" } &&
+                    !Regex("^(?:баланс|залишок|остаток|balance|bal)", RegexOption.IGNORE_CASE).containsMatchIn(line)
+            }.orEmpty()
+    }
+
     fun categorize(merchant: String): Category {
         val value = merchant.lowercase(Locale.ROOT)
         return when {
-            listOf("атб", "atb", "сільпо", "silpo", "ашан", "auchan", "novus", "metro").any(value::contains) -> Category.FOOD
-            listOf("wog", "okko", "ugo", "uber", "bolt", "uklon").any(value::contains) -> Category.TRANSPORT
-            listOf("steam", "megogo", "netflix", "spotify", "cinema").any(value::contains) -> Category.LEISURE
-            listOf("аптек", "pharmacy", "clinic").any(value::contains) -> Category.HEALTH
-            listOf("restaurant", "кафе", "cafe", "mcdonald", "kfc").any(value::contains) -> Category.DINING
+            listOf("атб", "atb", "сільпо", "silpo", "ашан", "auchan", "novus", "метро", "metro", "varus", "варус", "фора", "fora", "lidl", "biedronka", "продукт", "супермаркет", "grocery", "market", "маркет", "ева ", "eva ").any(value::contains) -> Category.FOOD
+            listOf("wog", "okko", "ugo", "uber", "bolt", "uklon", "укрзалізниц", "ukrzaliznytsia", "азс", "shell", "socar", "паливо", "taxi", "таксі").any(value::contains) -> Category.TRANSPORT
+            listOf("steam", "megogo", "netflix", "spotify", "cinema", "кіно", "youtube", "playstation", "xbox", "multiplex").any(value::contains) -> Category.LEISURE
+            listOf("аптек", "pharmacy", "clinic", "клінік", "подорожник", "анц", "лікарн").any(value::contains) -> Category.HEALTH
+            listOf("restaurant", "ресторан", "кафе", "cafe", "mcdonald", "kfc", "pizza", "піц", "sushi", "суші", "coffee", "кав", "starbucks", "burger", "бургер").any(value::contains) -> Category.DINING
+            listOf("епіцентр", "epicentr", "jysk", "ikea", "комунал", "жкг", "kyivstar", "київстар", "vodafone", "lifecell", "інтернет").any(value::contains) -> Category.HOME
             else -> Category.OTHER
         }
     }
+}
+```
+
+## domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+/** Enforced before any bank statistics query, including after entitlement expires. */
+object BankPeriodAccess {
+    val periods = setOf("DAY", "WEEK", "MONTH", "ALL")
+    fun effective(requested: String, premium: Boolean): String =
+        if (requested in periods && (requested == "DAY" || premium)) requested else "DAY"
 }
 ```
 
@@ -8399,7 +11591,20 @@ data class ImportReview(val id: String, val bankId: String, val amountMinor: Lon
     val transfer: Boolean, val status: String)
 data class ImportDiagnostics(val connected: Boolean = false, val notificationCount: Int = 0, val bankMessageCount: Int = 0,
     val lastCode: String = "WAITING", val lastPackage: String = "", val lastAtMillis: Long = 0)
+/** [error] is a code: BAD_TOKEN, RATE_LIMIT, NETWORK, NO_ACCOUNTS (or null). */
+data class MonobankStatus(val connected: Boolean = false, val syncing: Boolean = false, val lastSyncMillis: Long = 0,
+    val lastImported: Int = 0, val accounts: Int = 0, val error: String? = null)
 interface BankRepository {
+    /** "API" (monobank token), "SMS" or "NOTIFY" (bank app notifications). */
+    var importMode: String
+    val privatStatus: Flow<MonobankStatus>
+    suspend fun connectPrivat(token: String): Boolean
+    suspend fun disconnectPrivat()
+    suspend fun syncPrivat(): Int
+    val monobankStatus: Flow<MonobankStatus>
+    suspend fun connectMonobank(token: String): Boolean
+    suspend fun disconnectMonobank()
+    suspend fun syncMonobank(): Int
     val diagnostics: Flow<ImportDiagnostics>
     fun configuredPackage(bankId: String): String
     fun setPackage(bankId: String, packageName: String)
@@ -8421,46 +11626,54 @@ interface BankRepository {
 }
 ```
 
-## domain/src/test/kotlin/com/semmyx/ledger/domain/BankParserTest.kt
+## domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt
 
 ```kotlin
-package com.semmyx.ledger.domain
+package com.semmyx.ledger.domain.bank
 
-import com.semmyx.ledger.domain.bank.*
-import java.time.Instant
-import java.time.ZoneId
-import org.junit.Assert.*
-import org.junit.Test
+import com.semmyx.ledger.domain.*
 
-class BankParserTest {
-    private val bank = Banks.all.first { it.id == "mono" }
-    private val at = Instant.parse("2026-10-07T20:00:00Z").toEpochMilli()
-    @Test fun debitExtractsAmountShopCardAndDate() {
-        val parsed = BankParser.parse(bank, "Оплата 1 200,50 грн у АТБ; картка *1234; 07.10.2026 22:59", at, ZoneId.of("Europe/Kyiv"))!!
-        assertEquals(120050L, parsed.amountMinor)
-        assertEquals(EntryType.EXPENSE, parsed.type)
-        assertEquals("1234", parsed.cardLast4)
-        assertEquals(Category.FOOD, parsed.category)
-        assertTrue(parsed.confident)
-        assertTrue(parsed.timeFromMessage)
+/** One row of monobank's personal `statement` API ([amount] is signed minor units of the account currency). */
+data class MonobankStatementItem(
+    val id: String, val timeSeconds: Long, val description: String, val mcc: Int,
+    val amount: Long, val comment: String = "",
+)
+
+/** Pure mapping of monobank API rows to ledger operations. No network, no Android. */
+object MonobankMapper {
+    fun currency(code: Int): LedgerCurrency? = when (code) {
+        980 -> LedgerCurrency.UAH; 840 -> LedgerCurrency.USD; 978 -> LedgerCurrency.EUR
+        826 -> LedgerCurrency.GBP; 985 -> LedgerCurrency.PLN; else -> null
     }
-    @Test fun ignoresBalanceOtpAndDeclined() {
-        assertNull(BankParser.parse(bank, "Баланс 1200 грн", at))
-        assertNull(BankParser.parse(bank, "Код підтвердження оплати 100 грн 123456", at))
-        assertNull(BankParser.parse(bank, "Payment declined 10 EUR at Steam", at))
+
+    fun map(item: MonobankStatementItem, accountCurrency: LedgerCurrency, cardLast4: String?): ParsedBankOperation? {
+        if (item.id.isBlank() || item.amount == 0L) return null
+        val minor = Math.abs(item.amount)
+        if (minor > Money.MAX_ENTRY_MINOR) return null
+        val description = item.description.replace(Regex("\\s+"), " ").trim().take(60)
+        val transfer = item.mcc == 4829 || description.startsWith("Від:", true) || description.startsWith("До:", true) ||
+            description.startsWith("From:", true) || description.startsWith("To:", true)
+        val type = if (item.amount > 0) EntryType.INCOME else EntryType.EXPENSE
+        val category = when {
+            transfer -> Category.TRANSFER
+            else -> byMcc(item.mcc) ?: BankParser.categorize(description)
+        }
+        return ParsedBankOperation(
+            bankId = "mono", amountMinor = minor, currency = accountCurrency, type = type, merchant = description,
+            cardLast4 = cardLast4, happenedAtMillis = item.timeSeconds * 1000L, timeFromMessage = true,
+            transfer = transfer, confident = true, category = category,
+        )
     }
-    @Test fun doesNotChooseBalanceAsPurchase() {
-        assertEquals(10000L, BankParser.parse(bank, "Оплата 100 грн у АТБ; баланс 900 грн", at)!!.amountMinor)
-    }
-    @Test fun transfersRequireReview() { assertFalse(BankParser.parse(bank, "Переказ 100 грн", at)!!.confident) }
-    @Test fun currencyPrefixAndIncome() {
-        assertEquals(1250L, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.amountMinor)
-        assertEquals(LedgerCurrency.USD, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.currency)
-        assertEquals(EntryType.INCOME, BankParser.parse(bank, "Зараховано 2000 грн", at)!!.type)
-    }
-    @Test fun receiptTimeIsNotInventedBankTime() {
-        val value = BankParser.parse(bank, "Оплата 100 грн у АТБ", at)!!
-        assertEquals(at, value.happenedAtMillis); assertFalse(value.timeFromMessage)
+
+    /** Merchant category codes (ISO 18245) -> app categories; unknown codes fall back to name matching. */
+    fun byMcc(mcc: Int): Category? = when (mcc) {
+        5411, 5422, 5441, 5451, 5462, 5499, 5300, 5311 -> Category.FOOD
+        5811, 5812, 5813, 5814 -> Category.DINING
+        4111, 4112, 4121, 4131, 4784, 5541, 5542, 7523, 7512 -> Category.TRANSPORT
+        5912, 5122, 8011, 8021, 8031, 8041, 8042, 8043, 8049, 8050, 8062, 8071, 8099 -> Category.HEALTH
+        7832, 7841, 7922, 7929, 7932, 7933, 7941, 7991, 7992, 7993, 7994, 7995, 7996, 7997, 7998, 7999, 5815, 5816, 5817, 5818, 5735 -> Category.LEISURE
+        4900, 4814, 4899, 5200, 5211, 5251, 5712, 5713, 5719, 7349 -> Category.HOME
+        else -> null
     }
 }
 ```
@@ -8716,8 +11929,8 @@ import org.junit.Test
 
 class UpgradePolicyTest {
     @Test fun trialDurationsAndBoundary() {
-        assertTrue(TrialPolicy.validDays(7)); assertTrue(TrialPolicy.validDays(14))
-        assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
+        assertTrue(TrialPolicy.validDays(14)); assertEquals(14, TrialPolicy.DAYS)
+        assertFalse(TrialPolicy.validDays(7)); assertFalse(TrialPolicy.validDays(30)); assertFalse(TrialPolicy.validDays(0))
         assertTrue(TrialPolicy.active(100, 200, 199, 150))
         assertFalse(TrialPolicy.active(100, 200, 200, 150))
         assertFalse(TrialPolicy.active(100, 200, 149, 150))
@@ -8735,6 +11948,186 @@ class UpgradePolicyTest {
         assertEquals(125, repository.observeEntries(filter.copy(limit = 150)).first().size)
         assertEquals(12500L, repository.statistics(LedgerCurrency.UAH, day.withDayOfMonth(1), day, EntryType.EXPENSE, Category.FOOD))
         assertEquals(19500L, repository.statistics(LedgerCurrency.UAH, FinanceWindow.EARLIEST, day, EntryType.EXPENSE, Category.FOOD))
+    }
+}
+```
+
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+import com.semmyx.ledger.domain.Category
+import com.semmyx.ledger.domain.EntryType
+import com.semmyx.ledger.domain.LedgerCurrency
+import com.semmyx.ledger.domain.bank.*
+import java.time.Instant
+import java.time.ZoneId
+import org.junit.Assert.*
+import org.junit.Test
+
+class BankParserTest {
+    private val bank = Banks.all.first { it.id == "mono" }
+    private val at = Instant.parse("2026-10-07T20:00:00Z").toEpochMilli()
+    @Test fun debitExtractsAmountShopCardAndDate() {
+        val parsed = BankParser.parse(bank, "Оплата 1 200,50 грн у АТБ; картка *1234; 07.10.2026 22:59", at, ZoneId.of("Europe/Kyiv"))!!
+        assertEquals(120050L, parsed.amountMinor)
+        assertEquals(EntryType.EXPENSE, parsed.type)
+        assertEquals("1234", parsed.cardLast4)
+        assertEquals(Category.FOOD, parsed.category)
+        assertTrue(parsed.confident)
+        assertTrue(parsed.timeFromMessage)
+    }
+    @Test fun ignoresBalanceOtpAndDeclined() {
+        assertNull(BankParser.parse(bank, "Баланс 1200 грн", at))
+        assertNull(BankParser.parse(bank, "Код підтвердження оплати 100 грн 123456", at))
+        assertNull(BankParser.parse(bank, "Payment declined 10 EUR at Steam", at))
+    }
+    @Test fun doesNotChooseBalanceAsPurchase() {
+        assertEquals(10000L, BankParser.parse(bank, "Оплата 100 грн у АТБ; баланс 900 грн", at)!!.amountMinor)
+    }
+    @Test fun transfersRequireReview() { assertFalse(BankParser.parse(bank, "Переказ 100 грн", at)!!.confident) }
+    @Test fun currencyPrefixAndIncome() {
+        assertEquals(1250L, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.amountMinor)
+        assertEquals(LedgerCurrency.USD, BankParser.parse(bank, "Payment \$12.50 at Steam", at)!!.currency)
+        assertEquals(EntryType.INCOME, BankParser.parse(bank, "Зараховано 2000 грн", at)!!.type)
+    }
+    @Test fun receiptTimeIsNotInventedBankTime() {
+        val value = BankParser.parse(bank, "Оплата 100 грн у АТБ", at)!!
+        assertEquals(at, value.happenedAtMillis); assertFalse(value.timeFromMessage)
+    }
+
+    private fun parse(text: String, bankId: String = "mono") = BankParser.parse(Banks.all.first { it.id == bankId }, text, at, ZoneId.of("Europe/Kyiv"))
+
+    // ---- Realistic push formats: title on the first line, body below (as the listener builds them) ----
+    @Test fun monoUnicodeMinusWithMerchantInTitle() {
+        val p = parse("Сільпо\n−1 234,56 ₴ · Залишок 10 000,00 ₴")!!
+        assertEquals(123456L, p.amountMinor); assertEquals(EntryType.EXPENSE, p.type)
+        assertEquals("Сільпо", p.merchant); assertEquals(Category.FOOD, p.category); assertTrue(p.confident)
+    }
+    @Test fun monoIncomePlusSign() {
+        val p = parse("Іван П.\n+500,00 ₴ Баланс 1 500,00 ₴")!!
+        assertEquals(50000L, p.amountMinor); assertEquals(EntryType.INCOME, p.type); assertTrue(p.confident)
+    }
+    @Test fun privatPurchaseWithGluedCurrencyAndBalance() {
+        val p = parse("Оплата 150.50UAH Картка *4455 WOG Баланс 2000.00UAH", "privat")!!
+        assertEquals(15050L, p.amountMinor); assertEquals("4455", p.cardLast4); assertEquals(EntryType.EXPENSE, p.type)
+        assertEquals(Category.TRANSPORT, p.category); assertTrue(p.confident)
+    }
+    @Test fun transliteratedPrivatSms() {
+        val p = parse("Spysannya 99.00UAH. Karta *1111 Netflix. Bal. 500.00UAH", "privat")!!
+        assertEquals(9900L, p.amountMinor); assertEquals(EntryType.EXPENSE, p.type)
+    }
+    @Test fun incomeKeywordTransliterated() {
+        assertEquals(EntryType.INCOME, parse("Zarakhuvannya 2000.00UAH na kartku *1234", "privat")!!.type)
+    }
+    @Test fun titleIsGenericSoMerchantComesFromBody() {
+        val p = parse("Оплата\n320 грн, магазин: Аптека Доброго Дня")!!
+        assertEquals(32000L, p.amountMinor); assertEquals(Category.HEALTH, p.category)
+    }
+    @Test fun merchantMissingStillImportsWithBlankMerchant() {
+        val p = parse("Списано 77,00 грн")!!
+        assertEquals(7700L, p.amountMinor); assertTrue(p.confident); assertEquals("", p.merchant)
+    }
+    @Test fun conversionAmountIsNotSecondPurchase() {
+        val p = parse("Оплата 10.00 USD (412,50 грн) у Steam")!!
+        assertEquals(1000L, p.amountMinor); assertEquals(LedgerCurrency.USD, p.currency); assertTrue(p.confident)
+    }
+    @Test fun twoDifferentAmountsAreNotConfident() {
+        assertFalse(parse("Оплата 100 грн та 250 грн у АТБ")!!.confident)
+    }
+    @Test fun refundIsIncome() { assertEquals(EntryType.INCOME, parse("Повернення оплати 250 грн АТБ")!!.type) }
+    @Test fun transferDirections() {
+        assertEquals(EntryType.INCOME, parse("Переказ від Олена К. 300 грн")!!.type)
+        assertEquals(EntryType.EXPENSE, parse("Переказ на картку 300 грн")!!.type)
+        assertTrue(parse("Переказ на картку 300 грн")!!.transfer)
+    }
+    @Test fun adsAndCashbackOnlyAreIgnored() {
+        assertNull(parse("Кредит до 50 000 грн за акцією!"))
+        assertNull(parse("Кешбек 15 грн нараховано"))
+        assertNull(parse("Ваш ліміт 20 000 грн"))
+        assertNull(parse("Hello! Your card is ready"))
+    }
+    @Test fun thousandSeparators() {
+        assertEquals(120050L, parse("Оплата 1,200.50 грн")!!.amountMinor)
+        assertEquals(120050L, parse("Оплата 1.200,50 грн")!!.amountMinor)
+        assertEquals(1200000L, parse("Оплата 12 000 грн")!!.amountMinor)
+    }
+    @Test fun clockOnlyUsesTodayNotFuture() {
+        val p = parse("Оплата 10 грн Кава 22:50")!!
+        assertTrue(p.timeFromMessage)
+        assertTrue(p.happenedAtMillis <= at + 300_000L)
+    }
+    @Test fun walletAndBankPackagesAreRecognised() {
+        assertEquals("privat", Banks.byPackage("ua.privatbank.ap24")?.id)
+        assertEquals("mono", Banks.byPackage("com.ftband.mono")?.id)
+        assertEquals("wallet", Banks.byPackage("com.google.android.apps.walletnfcrel")?.id)
+        assertEquals("sense", Banks.byPackage("ua.alfabank.mobile.android.beta")?.id)
+        assertNull(Banks.byPackage("org.telegram.messenger"))
+        assertNull(Banks.byPackage("com.whatsapp"))
+    }
+
+    @Test fun senderMatchingIsLenient() {
+        assertEquals("privat", Banks.bySender("PRIVATBANK")?.id)
+        assertEquals("privat", Banks.bySender("Privat24")?.id)
+        assertEquals("mono", Banks.bySender("monobank")?.id)
+        assertEquals("sense", Banks.bySender("SENSE BANK")?.id)
+        assertNull(Banks.bySender("+380501234567"))
+        assertNull(Banks.bySender("Mom"))
+    }
+}
+```
+
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+import org.junit.Assert.*
+import org.junit.Test
+class BankPeriodAccessTest {
+    @Test fun freeOnlyTodayAndNoAllTimeBypass() {
+        BankPeriodAccess.periods.forEach { assertEquals("DAY", BankPeriodAccess.effective(it, false)) }
+    }
+    @Test fun premiumAndTrialCanUseEveryPeriod() {
+        BankPeriodAccess.periods.forEach { assertEquals(it, BankPeriodAccess.effective(it, true)) }
+    }
+    @Test fun expiredAccessFallsBackAndInvalidPeriodIsRejected() {
+        assertEquals("DAY", BankPeriodAccess.effective("MONTH", false))
+        assertEquals("DAY", BankPeriodAccess.effective("INVALID", true))
+    }
+}
+```
+
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+import com.semmyx.ledger.domain.*
+import org.junit.Assert.*
+import org.junit.Test
+
+class MonobankMapperTest {
+    @Test fun expenseUsesMccAndSignedAmount() {
+        val op = MonobankMapper.map(MonobankStatementItem("a1", 1_700_000_000, "Сільпо", 5411, -12550), LedgerCurrency.UAH, "1234")!!
+        assertEquals(12550L, op.amountMinor); assertEquals(EntryType.EXPENSE, op.type)
+        assertEquals(Category.FOOD, op.category); assertEquals("1234", op.cardLast4)
+        assertEquals(1_700_000_000_000L, op.happenedAtMillis); assertTrue(op.confident)
+    }
+    @Test fun incomeAndTransfer() {
+        val op = MonobankMapper.map(MonobankStatementItem("a2", 1, "Від: Іван П.", 4829, 50000), LedgerCurrency.UAH, null)!!
+        assertEquals(EntryType.INCOME, op.type); assertTrue(op.transfer); assertEquals(Category.TRANSFER, op.category)
+    }
+    @Test fun unknownMccFallsBackToName() {
+        assertEquals(Category.TRANSPORT, MonobankMapper.map(MonobankStatementItem("a3", 1, "WOG", 0, -100), LedgerCurrency.UAH, null)!!.category)
+    }
+    @Test fun zeroAndBlankAreSkipped() {
+        assertNull(MonobankMapper.map(MonobankStatementItem("a4", 1, "x", 0, 0), LedgerCurrency.UAH, null))
+        assertNull(MonobankMapper.map(MonobankStatementItem("", 1, "x", 0, -5), LedgerCurrency.UAH, null))
+    }
+    @Test fun currencyCodes() {
+        assertEquals(LedgerCurrency.UAH, MonobankMapper.currency(980)); assertEquals(LedgerCurrency.USD, MonobankMapper.currency(840))
+        assertNull(MonobankMapper.currency(392))
     }
 }
 ```
@@ -8758,6 +12151,9 @@ android.overridePathCheck=true
 # tools/developer_private_key.pem, is git-ignored, and must never be shared with anyone;
 # only you (the developer) use it, with tools/issue_activation_code.py, to mint codes.
 DEVELOPER_SUBSCRIPTION_PUBLIC_KEY=MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsOk68sCOTVl/4WCNZuvCidKZy4b3zz+ZjB4TsJOs07fRk/IolFxIOC1vrL55ncwzLeQlRpmWWKLkRIwEV0tbOu56+3NHuHF8Jcfq07VOyXplWT7kxzd+bTjmcZsXhO3J7z4kJtbYY3X3Fo465/8RuXHSQLyFkrHjS0FepclHDgnaZB/7qz6diLtLbOk7so4rScuIl7W362Vz71bDp/OD6UkDW6W+niGlQQKhKNJI7XnBA2AVl1W/4ZFY4v+7kNyztRcIzazJlbnrVjX9kLZiC9Sbk7+R+ZXssWXNvu7JytHTb+A8rWjkqu7GWvspJmvieWoj1dGB5PL/k+17s8BtyvDm7CNiG7lhKn0Lq7x/oMRDW5hu2HnYtmd8DqJjks2peUTsewkUGL3UrnDPgDnIXud1YJuyI0SWZN/P2RqTo40sMHPjGYd4esUk6R5/ATgKfSf01kPN2oabZzeC7rYpecP0QLCM0lDVMVGpxVaiegDxsKajGLyy67XVx29V72ShAgMBAAE=
+
+# Enabled parallel sync for Gradle 9.4+
+org.gradle.tooling.parallel=true
 ```
 
 ## gradle/bootstrap.ps1
@@ -8780,13 +12176,53 @@ if (!(Test-Path $jar)) {
 if ((Get-FileHash $jar -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Untrusted Gradle wrapper. Refusing to run.' }
 ```
 
+## gradle/gradle-daemon-jvm.properties
+
+```properties
+#This file is generated by updateDaemonJvm
+toolchainUrl.FREE_BSD.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.FREE_BSD.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.LINUX.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.LINUX.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.MAC_OS.AARCH64=https\://api.foojay.io/disco/v3.0/ids/c2dd35c9d0aaf0ba6ad0791320f99dfc/redirect
+toolchainUrl.MAC_OS.X86_64=https\://api.foojay.io/disco/v3.0/ids/e5810bd7fd1f8a586644409d395a7e55/redirect
+toolchainUrl.UNIX.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.UNIX.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.WINDOWS.AARCH64=https\://api.foojay.io/disco/v3.0/ids/7b3c4877c0749019e6805bb61e421497/redirect
+toolchainUrl.WINDOWS.X86_64=https\://api.foojay.io/disco/v3.0/ids/d76df094a9cbbabd3b08251f9e61444a/redirect
+toolchainVersion=25
+```
+
+## gradle/libs.versions.toml
+
+```toml
+[versions]
+coreKtx = "1.10.1"
+junit = "4.13.2"
+junitVersion = "1.1.5"
+espressoCore = "3.5.1"
+appcompat = "1.6.1"
+material = "1.10.0"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+
+[plugins]
+```
+
 ## gradle/wrapper/gradle-wrapper.properties
 
 ```properties
+#Fri Oct 09 23:39:28 EEST 2026
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
-distributionUrl=https\://services.gradle.org/distributions/gradle-8.11.1-bin.zip
-distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6
+distributionSha256Sum=bbaeb2fef8710818cf0e261201dab964c572f92b942812df0c3620d62a529a01
+distributionUrl=https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip
 networkTimeout=10000
 validateDistributionUrl=true
 zipStoreBase=GRADLE_USER_HOME
@@ -8850,6 +12286,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TGLedger"
 include(":app", ":domain", ":data")
+include(":bank-fixture")
 ```
 
 ## tools/audit_project.py
@@ -8923,7 +12360,7 @@ for file in kotlin:
             check(name in en, f'Resolved app string: {name}')
     if path.startswith('domain/src/main/'):
         check(not re.search(r'import (android\.|androidx\.|com\.semmyx\.ledger\.(data|presentation))', source), f'Pure domain boundary: {path}')
-    if '/presentation/' in path and path.endswith('ViewModel.kt'):
+    if path.startswith('app/src/main/') and path.endswith('ViewModel.kt'):
         check('com.semmyx.ledger.data.' not in source, f'Domain-only ViewModel dependencies: {path}')
     stack = []
     valid = True
@@ -8943,7 +12380,7 @@ for match in re.finditer(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:sus
     quoted, name = match.groups()
     query_map[name] = quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 
-entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/Entities.kt').read_text()
+entities = (ROOT/'data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt').read_text()
 body = re.search(r'data class EntryEntity\(([\s\S]*?)\n\)', entities).group(1)
 columns = re.findall(r'val (\w+): (\w+)(\?)?', body)
 types = {'String':'TEXT','Long':'INTEGER','Int':'INTEGER','Double':'REAL'}
@@ -9012,6 +12449,43 @@ output.parent.mkdir(exist_ok=True)
 output.write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n')
 print(json.dumps({key:value for key,value in result.items() if key!='checks'}, ensure_ascii=False, indent=2))
 sys.exit(1 if failures else 0)
+```
+
+## tools/export_sources.py
+
+```python
+#!/usr/bin/env python3
+"""Regenerate the source book, project tree and SHA-256 manifest from tracked files.
+Never includes .git, ignored local credentials, build outputs or developer private keys.
+Run after staging new files; repeat after changing the release verification report.
+"""
+from pathlib import Path
+import hashlib
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+tracked = sorted(set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines()))
+version = re.search(r'versionName = "([^"]+)"', (ROOT / 'app/build.gradle.kts').read_text())[1]
+langs = {'.kt':'kotlin', '.kts':'kotlin', '.java':'java', '.py':'python', '.xml':'xml',
+         '.yml':'yaml', '.yaml':'yaml', '.properties':'properties', '.ps1':'powershell',
+         '.bat':'batch', '.toml':'toml', '.json':'json'}
+source = [p for p in tracked if Path(p).suffix in langs or p == 'gradlew']
+book = [f'# TG Ledger {version} — complete file-by-file source', '',
+        f'{len(source)} implementation, configuration and test files, without truncation.', '',
+        'Generated from tracked files. Local keys and build outputs are excluded.', '']
+for name in source:
+    text = (ROOT / name).read_text().rstrip('\n')
+    # Fences must be longer than any backtick run inside the original file.
+    fence = '`' * max(3, max((len(m[0]) + 1 for m in re.finditer(r'`+', text)), default=3))
+    book.extend([f'## {name}', '', fence + langs.get(Path(name).suffix, 'bash'), text, fence, ''])
+(ROOT / 'SOURCE_CODE.md').write_text('\n'.join(book))
+files = sorted(set(tracked) | {'SOURCE_CODE.md', 'PROJECT_TREE.txt', 'MANIFEST.sha256'})
+(ROOT / 'PROJECT_TREE.txt').write_text(f'TG_Ledger-{version}/\n' + '\n'.join('  '+p for p in files)+'\n')
+(ROOT / 'MANIFEST.sha256').write_text(''.join(
+    f'{hashlib.sha256((ROOT/name).read_bytes()).hexdigest()}  {name}\n'
+    for name in files if name != 'MANIFEST.sha256'))
+print(f'Source book: {len(source)} files; manifest: {len(files)-1} files')
 ```
 
 ## tools/issue_activation_code.py
@@ -9227,7 +12701,7 @@ def check(test,label):
 old=c.execute("SELECT * FROM entries WHERE id='old'").fetchone()
 check(old['sourceType']=='UNKNOWN' and old['amountMinor']==100,'Migration preserves entries and does not invent cash/card attribution')
 check(len(c.execute('PRAGMA table_info(entries)').fetchall())==17,'All six metadata columns migrated')
-s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/local/BankEntities.kt').read_text()
+s=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt').read_text()
 queries={}
 for quoted,name in re.findall(r'@Query\(("""[\s\S]*?"""|"(?:\\.|[^"\\])*")\)\s*(?:suspend\s+)?fun\s+(\w+)',s):queries[name]=quoted[3:-3] if quoted.startswith('"""') else json.loads(quoted)
 def insert(id,amount,source,bank,currency='UAH',kind='EXPENSE',category='FOOD',custom=None,deleted=None):
@@ -9265,10 +12739,10 @@ from pathlib import Path
 import json
 R=Path(__file__).resolve().parents[1]
 A=R/'app/src/main/kotlin/com/semmyx/ledger'
-root=(A/'presentation/AppRoot.kt').read_text()
-analytics=(A/'presentation/analytics/AnalyticsScreen.kt').read_text()
-bank=(A/'presentation/bank/BankScreen.kt').read_text()
-repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/repository/BankImportRepository.kt').read_text()
+root=(A/'navigation/AppRoot.kt').read_text()
+analytics=(A/'analytics/AnalyticsScreen.kt').read_text()
+bank=(A/'bank/BankScreen.kt').read_text()
+repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt').read_text()
 checks=[]
 def check(condition,label):
  assert condition,label
@@ -9397,3 +12871,2792 @@ with tempfile.TemporaryDirectory() as folder:
     (R/'verification/voice-regex-jvm.json').write_text(json.dumps({'kind':'exact-source-regex-on-JVM','passed':7,'compiled_kotlin':False,'compiled_android':False,'output':result.stdout.strip()},indent=2)+'\n')
 ```
 
+## verification/bank-regex-jvm.json
+
+```json
+{
+  "kind": "actual-source-regex-on-JVM",
+  "passed_fixtures": 12,
+  "compiled_kotlin": false,
+  "executed_android": false
+}
+```
+
+## verification/bank-sql.json
+
+```json
+{
+  "kind": "exact-migration-and-Room-bank-SQL-in-SQLite",
+  "passed": 10,
+  "checks": [
+    "Migration preserves entries and does not invent cash/card attribution",
+    "All six metadata columns migrated",
+    "Source totals exclude income, deleted and other currencies",
+    "Mono is isolated from Privat and cash",
+    "Source category filter uses chosen bank",
+    "Custom categories retain their own identity",
+    "Unique fingerprint prevents repeated delivery imports",
+    "Near duplicates are detected for review",
+    "Different banks do not deduplicate each other",
+    "Clearing review history preserves ledger entries"
+  ],
+  "compiled_android": false
+}
+```
+
+## verification/cat-skin-assets.json
+
+```json
+{
+  "dimensions": [
+    1024,
+    1024
+  ],
+  "changed_pixels": 440799,
+  "eye_nose_pixels_preserved": true,
+  "dark_background_preserved": true,
+  "android_render_verified": false
+}
+```
+
+## verification/history/3.3.3/release-3.3.3.json
+
+```json
+{
+  "version": "3.3.3",
+  "version_code": 17,
+  "tested_code_commit": "56f60e981437e389e992d2901b3cf7adbd63cb36",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38578995362",
+  "jobs": [
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:24:14Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:23:49Z"
+    },
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:25:18Z"
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 25,
+    "data_play": 18,
+    "data_legacy_v7": 18
+  },
+  "instrumented": {
+    "api26": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "packaging_changes_after_tests": "Documentation, generated source book, manifest and test artifacts only; application code unchanged."
+}
+```
+
+## verification/navigation-recovery.json
+
+```json
+{
+  "kind": "source-regression-guards",
+  "passed": 10,
+  "checks": [
+    "Explicit real Activity owners are provided above localized content",
+    "Registry owner is installed before the localized Context replacement",
+    "History button no longer invokes dashboard back action",
+    "History has an independent navigation destination",
+    "Analytics selected month is passed to history",
+    "System settings launched safely from localized non-Activity Context",
+    "Local text recovery has a preview and explicit submit action",
+    "Manual recovery works without automation and never bypasses confirmation",
+    "Live import diagnostics are visible in the banking screen",
+    "Reconnect and bank package configuration are provided"
+  ],
+  "compiled_android": false,
+  "device_crash_fixed_verified": false
+}
+```
+
+## verification/release-4.3.3.json
+
+```json
+{
+  "version": "4.3.3",
+  "version_code": 18,
+  "tested_code_commit": "dee52eb4586e3a93fd6e84839515efd214a12aa7",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38592360999",
+  "jobs": [
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:56:22Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:53:48Z"
+    },
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T15:47:05Z",
+      "completed_at": "2026-10-14T15:54:34Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 11907774913,
+      "name": "device-reports-api-26",
+      "size_in_bytes": 152972
+    },
+    {
+      "id": 11909080258,
+      "name": "device-reports-api-36",
+      "size_in_bytes": 156886
+    },
+    {
+      "id": 11908427625,
+      "name": "validation-reports",
+      "size_in_bytes": 222501
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 25,
+    "data_play": 18,
+    "data_legacy_v7": 18
+  },
+  "instrumented": {
+    "api26": {
+      "app": 15,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 15,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "packaging_changes_after_tests": "Documentation, generated source book, manifest and test artifacts only; application code unchanged."
+}
+```
+
+## verification/source-audit.json
+
+```json
+{
+  "kind": "offline-structural-resource-and-sql-audit",
+  "passed_assertions": 2519,
+  "failures": [],
+  "kotlin_source_files": 111,
+  "localized_string_pairs": 399,
+  "compiled_android": false,
+  "executed_android_or_junit_tests": false,
+  "checks": [
+    "Well-formed XML: app/src/main/AndroidManifest.xml",
+    "Well-formed XML: app/src/main/res/values-night/themes.xml",
+    "Well-formed XML: app/src/main/res/drawable/mascot_gray.xml",
+    "Well-formed XML: app/src/main/res/drawable/mascot_sky.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_splash.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_launcher_background.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_launcher_foreground.xml",
+    "Well-formed XML: app/src/main/res/drawable/brand_sky.xml",
+    "Well-formed XML: app/src/main/res/xml/data_extraction_rules.xml",
+    "Well-formed XML: app/src/main/res/xml/network_security_config.xml",
+    "Well-formed XML: app/src/main/res/xml/backup_rules.xml",
+    "Well-formed XML: app/src/main/res/values/themes.xml",
+    "Well-formed XML: app/src/main/res/values/colors.xml",
+    "Well-formed XML: app/src/main/res/values/branding.xml",
+    "Well-formed XML: app/src/main/res/values/strings.xml",
+    "Well-formed XML: app/src/main/res/values-uk/strings.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml",
+    "Well-formed XML: data/src/main/AndroidManifest.xml",
+    "Well-formed XML: bank-fixture/src/main/AndroidManifest.xml",
+    "No duplicate string: values/brand_author_signature",
+    "No duplicate string: values/brand_copyright",
+    "No duplicate string: values/app_name",
+    "No duplicate string: values/overview",
+    "No duplicate string: values/settings",
+    "No duplicate string: values/help",
+    "No duplicate string: values/back",
+    "No duplicate string: values/close",
+    "No duplicate string: values/retry",
+    "No duplicate string: values/next",
+    "No duplicate string: values/skip",
+    "No duplicate string: values/get_started",
+    "No duplicate string: values/page_of",
+    "No duplicate string: values/onboard_title_one",
+    "No duplicate string: values/onboard_body_one",
+    "No duplicate string: values/onboard_title_two",
+    "No duplicate string: values/onboard_body_two",
+    "No duplicate string: values/onboard_title_three",
+    "No duplicate string: values/onboard_body_three",
+    "No duplicate string: values/unlock_title",
+    "No duplicate string: values/confirm_pin",
+    "No duplicate string: values/create_pin",
+    "No duplicate string: values/pin_setup_subtitle",
+    "No duplicate string: values/pin_unlock_subtitle",
+    "No duplicate string: values/pin_digit_count",
+    "No duplicate string: values/pin_locked",
+    "No duplicate string: values/pin_incorrect",
+    "No duplicate string: values/pin_mismatch",
+    "No duplicate string: values/pin_recovery_notice",
+    "No duplicate string: values/erase_digit",
+    "No duplicate string: values/start_over",
+    "No duplicate string: values/need_help",
+    "No duplicate string: values/security_error",
+    "No duplicate string: values/biometric_failed",
+    "No duplicate string: values/unlock_biometric",
+    "No duplicate string: values/biometric_title",
+    "No duplicate string: values/biometric_subtitle",
+    "No duplicate string: values/use_pin",
+    "No duplicate string: values/load_error_title",
+    "No duplicate string: values/storage_error",
+    "No duplicate string: values/saved",
+    "No duplicate string: values/entry_deleted",
+    "No duplicate string: values/undo",
+    "No duplicate string: values/undo_expired",
+    "No duplicate string: values/dashboard_heading",
+    "No duplicate string: values/greeting",
+    "No duplicate string: values/dashboard_subtitle",
+    "No duplicate string: values/total_balance",
+    "No duplicate string: values/currency_scope",
+    "No duplicate string: values/income",
+    "No duplicate string: values/expenses",
+    "No duplicate string: values/expense",
+    "No duplicate string: values/cash_flow",
+    "No duplicate string: values/last_7_days",
+    "No duplicate string: values/last_30_days",
+    "No duplicate string: values/last_30_days_plus",
+    "No duplicate string: values/chart_description",
+    "No duplicate string: values/chart_empty",
+    "No duplicate string: values/legend_income",
+    "No duplicate string: values/legend_expense",
+    "No duplicate string: values/activity",
+    "No duplicate string: values/search_entries",
+    "No duplicate string: values/clear_search",
+    "No duplicate string: values/all",
+    "No duplicate string: values/search_scope",
+    "No duplicate string: values/no_matches",
+    "No duplicate string: values/no_matches_body",
+    "No duplicate string: values/clear_filters",
+    "No duplicate string: values/empty_ledger_title",
+    "No duplicate string: values/empty_ledger_body",
+    "No duplicate string: values/add_first_entry",
+    "No duplicate string: values/add_entry",
+    "No duplicate string: values/edit_entry",
+    "No duplicate string: values/delete_entry",
+    "No duplicate string: values/delete_named_entry",
+    "No duplicate string: values/load_more",
+    "No duplicate string: values/positive_amount",
+    "No duplicate string: values/negative_amount",
+    "No duplicate string: values/category_food",
+    "No duplicate string: values/category_transport",
+    "No duplicate string: values/category_home",
+    "No duplicate string: values/category_health",
+    "No duplicate string: values/category_leisure",
+    "No duplicate string: values/category_salary",
+    "No duplicate string: values/category_other",
+    "No duplicate string: values/entry_currency_notice",
+    "No duplicate string: values/amount",
+    "No duplicate string: values/amount_invalid",
+    "No duplicate string: values/title_optional_hint",
+    "No duplicate string: values/entry_title",
+    "No duplicate string: values/title_invalid",
+    "No duplicate string: values/title_hint",
+    "No duplicate string: values/category",
+    "No duplicate string: values/date_invalid",
+    "No duplicate string: values/note_optional",
+    "No duplicate string: values/character_count",
+    "No duplicate string: values/save_entry",
+    "No duplicate string: values/entry_not_found",
+    "No duplicate string: values/done",
+    "No duplicate string: values/cancel",
+    "No duplicate string: values/discard_title",
+    "No duplicate string: values/discard_body",
+    "No duplicate string: values/discard",
+    "No duplicate string: values/keep_editing",
+    "No duplicate string: values/profile",
+    "No duplicate string: values/local_profile",
+    "No duplicate string: values/display_name",
+    "No duplicate string: values/save_profile",
+    "No duplicate string: values/name_invalid",
+    "No duplicate string: values/language",
+    "No duplicate string: values/language_instant",
+    "No duplicate string: values/language_en",
+    "No duplicate string: values/language_uk",
+    "No duplicate string: values/appearance",
+    "No duplicate string: values/theme_system",
+    "No duplicate string: values/theme_light",
+    "No duplicate string: values/theme_dark",
+    "No duplicate string: values/default_currency",
+    "No duplicate string: values/currency_explanation",
+    "No duplicate string: values/security",
+    "No duplicate string: values/biometric_unlock",
+    "No duplicate string: values/biometric_explanation",
+    "No duplicate string: values/biometric_unavailable",
+    "No duplicate string: values/auto_lock_explanation",
+    "No duplicate string: values/lock_now",
+    "No duplicate string: values/premium_name",
+    "No duplicate string: values/premium_body",
+    "No duplicate string: values/premium_active",
+    "No duplicate string: values/premium_offline_notice",
+    "No duplicate string: values/premium_unlock",
+    "No duplicate string: values/premium_buy",
+    "No duplicate string: values/restore_purchases",
+    "No duplicate string: values/billing_configuration",
+    "No duplicate string: values/billing_unavailable",
+    "No duplicate string: values/billing_network",
+    "No duplicate string: values/billing_pending",
+    "No duplicate string: values/billing_verification",
+    "No duplicate string: values/billing_acknowledgement",
+    "No duplicate string: values/reference_rates",
+    "No duplicate string: values/rates_disclaimer",
+    "No duplicate string: values/rates_empty",
+    "No duplicate string: values/rate_value",
+    "No duplicate string: values/rates_as_of",
+    "No duplicate string: values/refresh_rates",
+    "No duplicate string: values/refreshing",
+    "No duplicate string: values/rate_offline",
+    "No duplicate string: values/support",
+    "No duplicate string: values/support_intro",
+    "No duplicate string: values/contact_telegram",
+    "No duplicate string: values/diagnostics_show_button",
+    "No duplicate string: values/diagnostics_none",
+    "No duplicate string: values/diagnostics_title",
+    "No duplicate string: values/diagnostics_hint",
+    "No duplicate string: values/diagnostics_copy",
+    "No duplicate string: values/diagnostics_copied",
+    "No duplicate string: values/diagnostics_clear",
+    "No duplicate string: values/diagnostics_close",
+    "No duplicate string: values/here_to_help",
+    "No duplicate string: values/lead_developer",
+    "No duplicate string: values/support_handle",
+    "No duplicate string: values/copy_handle",
+    "No duplicate string: values/handle_copied",
+    "No duplicate string: values/support_privacy",
+    "No duplicate string: values/telegram_support",
+    "No duplicate string: values/support_network_error",
+    "No duplicate string: values/help_heading",
+    "No duplicate string: values/help_intro",
+    "No duplicate string: values/help_entries_title",
+    "No duplicate string: values/help_entries_body",
+    "No duplicate string: values/help_privacy_title",
+    "No duplicate string: values/help_privacy_body",
+    "No duplicate string: values/help_security_title",
+    "No duplicate string: values/help_security_body",
+    "No duplicate string: values/help_premium_title",
+    "No duplicate string: values/help_premium_body",
+    "No duplicate string: values/app_version",
+    "No duplicate string: values/premium_feature_trends",
+    "No duplicate string: values/premium_feature_mascot",
+    "No duplicate string: values/premium_feature_support",
+    "No duplicate string: values/premium_source_play",
+    "No duplicate string: values/premium_source_developer",
+    "No duplicate string: values/premium_expires",
+    "No duplicate string: values/premium_assistant_toggle",
+    "No duplicate string: values/premium_assistant_toggle_hint",
+    "No duplicate string: values/developer_purchase_title",
+    "No duplicate string: values/developer_purchase_body",
+    "No duplicate string: values/developer_purchase_banner",
+    "No duplicate string: values/developer_purchase_note",
+    "No duplicate string: values/developer_purchase_button",
+    "No duplicate string: values/installation_id_label",
+    "No duplicate string: values/installation_id_copy",
+    "No duplicate string: values/installation_id_copied",
+    "No duplicate string: values/activation_code_label",
+    "No duplicate string: values/activation_code_hint",
+    "No duplicate string: values/activation_code_button",
+    "No duplicate string: values/billing_activation_code",
+    "No duplicate string: values/premium_activated",
+    "No duplicate string: values/activation_invalid",
+    "No duplicate string: values/mascot_card_title",
+    "No duplicate string: values/mascot_hear_again",
+    "No duplicate string: values/mascot_premium_note",
+    "No duplicate string: values/voice_assistant_button",
+    "No duplicate string: values/voice_assistant_hint",
+    "No duplicate string: values/voice_assistant_listening",
+    "No duplicate string: values/voice_entry_added",
+    "No duplicate string: values/voice_reply_balance",
+    "No duplicate string: values/voice_reply_spent_today",
+    "No duplicate string: values/voice_reply_opening_entry",
+    "No duplicate string: values/voice_reply_not_understood",
+    "No duplicate string: values/voice_smalltalk_greeting",
+    "No duplicate string: values/voice_smalltalk_how_are_you",
+    "No duplicate string: values/voice_smalltalk_thanks",
+    "No duplicate string: values/voice_smalltalk_who_are_you",
+    "No duplicate string: values/voice_smalltalk_bye",
+    "No duplicate string: values/voice_smalltalk_compliment",
+    "No duplicate string: values/voice_smalltalk_joke",
+    "No duplicate string: values/voice_permission_denied",
+    "No duplicate string: values/voice_recognizer_unavailable",
+    "No duplicate string: values/all_time",
+    "No duplicate string: values/categories",
+    "No duplicate string: values/all_categories",
+    "No duplicate string: values/category_transaction_count",
+    "No duplicate string: values/category_empty",
+    "No duplicate string: values/period_today",
+    "No duplicate string: values/period_month",
+    "No duplicate string: values/period_year",
+    "No duplicate string: values/voice_statistics",
+    "No duplicate string: values/assistant_text_hint",
+    "No duplicate string: values/assistant_send",
+    "No duplicate string: values/premium_source_trial",
+    "No duplicate string: values/premium_local_notice",
+    "No duplicate string: values/trial_explanation",
+    "No duplicate string: values/trial_14",
+    "No duplicate string: values/mascot_style",
+    "No duplicate string: values/mascot_gray",
+    "No duplicate string: values/mascot_sky",
+    "No duplicate string: values/mascot_animations",
+    "No duplicate string: values/brand_intro_title",
+    "No duplicate string: values/brand_intro_body",
+    "No duplicate string: values/brand_design_label",
+    "No duplicate string: values/analytics_title",
+    "No duplicate string: values/cinematic_history",
+    "No duplicate string: values/cinematic_period",
+    "No duplicate string: values/cinematic_apply",
+    "No duplicate string: values/cinematic_more",
+    "No duplicate string: values/cinematic_expenses_period",
+    "No duplicate string: values/cinematic_comparison",
+    "No duplicate string: values/cinematic_more_than_previous",
+    "No duplicate string: values/cinematic_less_than_previous",
+    "No duplicate string: values/cinematic_week_average",
+    "No duplicate string: values/cinematic_month_average",
+    "No duplicate string: values/cinematic_expense_categories",
+    "No duplicate string: values/cinematic_income_categories",
+    "No duplicate string: values/cinematic_transactions",
+    "No duplicate string: values/cinematic_tooltip",
+    "No duplicate string: values/cinematic_chart_accessibility",
+    "No duplicate string: values/cinematic_more_buckets",
+    "No duplicate string: values/cat_asset_status",
+    "No duplicate string: values/fps_title",
+    "No duplicate string: values/fps_explanation",
+    "No duplicate string: values/fps_auto",
+    "No duplicate string: values/fps_value",
+    "No duplicate string: values/fps_supported",
+    "No duplicate string: values/fps_fallback",
+    "No duplicate string: values/cat_tap_hint",
+    "No duplicate string: values/category_transfer",
+    "No duplicate string: values/category_dining",
+    "No duplicate string: values/category_cashback",
+    "No duplicate string: values/reference_total_for",
+    "No duplicate string: values/total_all_time",
+    "No duplicate string: values/total_thirty_days",
+    "No duplicate string: values/total_seven_days",
+    "No duplicate string: values/colors_title",
+    "No duplicate string: values/colors_explanation",
+    "No duplicate string: values/colors_edit",
+    "No duplicate string: values/colors_collapse",
+    "No duplicate string: values/colors_categories",
+    "No duplicate string: values/colors_reset_all",
+    "No duplicate string: values/color_accent",
+    "No duplicate string: values/color_background",
+    "No duplicate string: values/color_surface",
+    "No duplicate string: values/color_text",
+    "No duplicate string: values/color_muted",
+    "No duplicate string: values/color_chart_top",
+    "No duplicate string: values/color_chart_bottom",
+    "No duplicate string: values/color_grid",
+    "No duplicate string: values/color_icons",
+    "No duplicate string: values/color_hue",
+    "No duplicate string: values/color_saturation",
+    "No duplicate string: values/color_brightness",
+    "No duplicate string: values/color_apply",
+    "No duplicate string: values/color_reset",
+    "No duplicate string: values/color_invalid",
+    "No duplicate string: values/color_contrast_warning",
+    "No duplicate string: values/color_error",
+    "No duplicate string: values/bank_dashboard",
+    "No duplicate string: values/bank_import_title",
+    "No duplicate string: values/bank_consent",
+    "No duplicate string: values/bank_enabled",
+    "No duplicate string: values/bank_auto",
+    "No duplicate string: values/bank_access_yes",
+    "No duplicate string: values/bank_access_no",
+    "No duplicate string: values/bank_notification_permission",
+    "No duplicate string: values/bank_sms_yes",
+    "No duplicate string: values/bank_sms_no",
+    "No duplicate string: values/bank_sms_permission",
+    "No duplicate string: values/bank_play_sms",
+    "No duplicate string: values/bank_privacy",
+    "No duplicate string: values/bank_privacy_body",
+    "No duplicate string: values/bank_day",
+    "No duplicate string: values/bank_week",
+    "No duplicate string: values/bank_month",
+    "No duplicate string: values/bank_cash",
+    "No duplicate string: values/bank_card",
+    "No duplicate string: values/bank_unknown",
+    "No duplicate string: values/bank_source",
+    "No duplicate string: values/bank_category_stats",
+    "No duplicate string: values/bank_new_category",
+    "No duplicate string: values/bank_review_count",
+    "No duplicate string: values/bank_time_received",
+    "No duplicate string: values/bank_duplicate",
+    "No duplicate string: values/bank_transfer_review",
+    "No duplicate string: values/bank_ignore",
+    "No duplicate string: values/bank_recent",
+    "No duplicate string: values/bank_limit_recent",
+    "No duplicate string: values/bank_budget",
+    "No duplicate string: values/bank_budget_progress",
+    "No duplicate string: values/bank_export",
+    "No duplicate string: values/bank_clear_history",
+    "No duplicate string: values/bank_clear_warning",
+    "No duplicate string: values/bank_app_permissions",
+    "No duplicate string: values/bank_battery",
+    "No duplicate string: values/bank_budget_disable",
+    "No duplicate string: values/history_search",
+    "No duplicate string: values/import_diagnostics",
+    "No duplicate string: values/import_connected",
+    "No duplicate string: values/import_disconnected",
+    "No duplicate string: values/import_counts",
+    "No duplicate string: values/import_reconnect",
+    "No duplicate string: values/import_package_settings",
+    "No duplicate string: values/import_package_warning",
+    "No duplicate string: values/import_paste",
+    "No duplicate string: values/import_text",
+    "No duplicate string: values/import_manual_privacy",
+    "No duplicate string: values/import_to_queue",
+    "No duplicate string: values/import_queue_note",
+    "No duplicate string: values/import_disabled",
+    "No duplicate string: values/import_unsupported",
+    "No duplicate string: values/import_empty",
+    "No duplicate string: values/import_group",
+    "No duplicate string: values/import_unrecognized",
+    "No duplicate string: values/import_auto_done",
+    "No duplicate string: values/import_queued",
+    "No duplicate string: values/import_repeated",
+    "No duplicate string: values/import_waiting",
+    "No duplicate string: values/import_mode_title",
+    "No duplicate string: values/import_mode_api",
+    "No duplicate string: values/import_mode_sms",
+    "No duplicate string: values/import_mode_notify",
+    "No duplicate string: values/api_howto",
+    "No duplicate string: values/api_open_site",
+    "No duplicate string: values/api_token_label",
+    "No duplicate string: values/api_connect",
+    "No duplicate string: values/api_connecting",
+    "No duplicate string: values/api_connected",
+    "No duplicate string: values/api_last_sync",
+    "No duplicate string: values/api_imported_last",
+    "No duplicate string: values/api_syncing",
+    "No duplicate string: values/api_sync_now",
+    "No duplicate string: values/api_disconnect",
+    "No duplicate string: values/api_error_bad_token",
+    "No duplicate string: values/api_error_rate",
+    "No duplicate string: values/api_error_network",
+    "No duplicate string: values/api_error_no_accounts",
+    "No duplicate string: values/sms_howto",
+    "No duplicate string: values/sms_scan",
+    "No duplicate string: values/sms_scanning",
+    "No duplicate string: values/sms_scan_result",
+    "No duplicate string: values/sms_restricted_tip",
+    "No duplicate string: values/pay_source_title",
+    "No duplicate string: values/pay_source_required",
+    "No duplicate string: values/voice_ask_source",
+    "No duplicate string: values/cat_locked_hint",
+    "No duplicate string: values/bank_setup",
+    "No duplicate string: values/push_howto",
+    "No duplicate string: values/privat_api_title",
+    "No duplicate string: values/privat_api_howto",
+    "No duplicate string: values/privat_api_site",
+    "No duplicate string: values/privat_api_token",
+    "No duplicate string: values/privat_api_connected",
+    "No duplicate string: values/privat_api_error",
+    "No duplicate string: values/other_api_note",
+    "No duplicate string: values/help_banks_title",
+    "No duplicate string: values/help_banks_body",
+    "No duplicate string: values/import_confirm_permission",
+    "No duplicate string: values/import_confirm_enabled",
+    "No duplicate string: values/assistant_write_short",
+    "No duplicate string: values/major_release_title",
+    "No duplicate string: values/major_release_body",
+    "No duplicate string: values-uk/app_name",
+    "No duplicate string: values-uk/overview",
+    "No duplicate string: values-uk/settings",
+    "No duplicate string: values-uk/help",
+    "No duplicate string: values-uk/back",
+    "No duplicate string: values-uk/close",
+    "No duplicate string: values-uk/retry",
+    "No duplicate string: values-uk/next",
+    "No duplicate string: values-uk/skip",
+    "No duplicate string: values-uk/get_started",
+    "No duplicate string: values-uk/page_of",
+    "No duplicate string: values-uk/onboard_title_one",
+    "No duplicate string: values-uk/onboard_body_one",
+    "No duplicate string: values-uk/onboard_title_two",
+    "No duplicate string: values-uk/onboard_body_two",
+    "No duplicate string: values-uk/onboard_title_three",
+    "No duplicate string: values-uk/onboard_body_three",
+    "No duplicate string: values-uk/unlock_title",
+    "No duplicate string: values-uk/confirm_pin",
+    "No duplicate string: values-uk/create_pin",
+    "No duplicate string: values-uk/pin_setup_subtitle",
+    "No duplicate string: values-uk/pin_unlock_subtitle",
+    "No duplicate string: values-uk/pin_digit_count",
+    "No duplicate string: values-uk/pin_locked",
+    "No duplicate string: values-uk/pin_incorrect",
+    "No duplicate string: values-uk/pin_mismatch",
+    "No duplicate string: values-uk/pin_recovery_notice",
+    "No duplicate string: values-uk/erase_digit",
+    "No duplicate string: values-uk/start_over",
+    "No duplicate string: values-uk/need_help",
+    "No duplicate string: values-uk/security_error",
+    "No duplicate string: values-uk/biometric_failed",
+    "No duplicate string: values-uk/unlock_biometric",
+    "No duplicate string: values-uk/biometric_title",
+    "No duplicate string: values-uk/biometric_subtitle",
+    "No duplicate string: values-uk/use_pin",
+    "No duplicate string: values-uk/load_error_title",
+    "No duplicate string: values-uk/storage_error",
+    "No duplicate string: values-uk/saved",
+    "No duplicate string: values-uk/entry_deleted",
+    "No duplicate string: values-uk/undo",
+    "No duplicate string: values-uk/undo_expired",
+    "No duplicate string: values-uk/dashboard_heading",
+    "No duplicate string: values-uk/greeting",
+    "No duplicate string: values-uk/dashboard_subtitle",
+    "No duplicate string: values-uk/total_balance",
+    "No duplicate string: values-uk/currency_scope",
+    "No duplicate string: values-uk/income",
+    "No duplicate string: values-uk/expenses",
+    "No duplicate string: values-uk/expense",
+    "No duplicate string: values-uk/cash_flow",
+    "No duplicate string: values-uk/last_7_days",
+    "No duplicate string: values-uk/last_30_days",
+    "No duplicate string: values-uk/last_30_days_plus",
+    "No duplicate string: values-uk/chart_description",
+    "No duplicate string: values-uk/chart_empty",
+    "No duplicate string: values-uk/legend_income",
+    "No duplicate string: values-uk/legend_expense",
+    "No duplicate string: values-uk/activity",
+    "No duplicate string: values-uk/search_entries",
+    "No duplicate string: values-uk/clear_search",
+    "No duplicate string: values-uk/all",
+    "No duplicate string: values-uk/search_scope",
+    "No duplicate string: values-uk/no_matches",
+    "No duplicate string: values-uk/no_matches_body",
+    "No duplicate string: values-uk/clear_filters",
+    "No duplicate string: values-uk/empty_ledger_title",
+    "No duplicate string: values-uk/empty_ledger_body",
+    "No duplicate string: values-uk/add_first_entry",
+    "No duplicate string: values-uk/add_entry",
+    "No duplicate string: values-uk/edit_entry",
+    "No duplicate string: values-uk/delete_entry",
+    "No duplicate string: values-uk/delete_named_entry",
+    "No duplicate string: values-uk/load_more",
+    "No duplicate string: values-uk/positive_amount",
+    "No duplicate string: values-uk/negative_amount",
+    "No duplicate string: values-uk/category_food",
+    "No duplicate string: values-uk/category_transport",
+    "No duplicate string: values-uk/category_home",
+    "No duplicate string: values-uk/category_health",
+    "No duplicate string: values-uk/category_leisure",
+    "No duplicate string: values-uk/category_salary",
+    "No duplicate string: values-uk/category_other",
+    "No duplicate string: values-uk/entry_currency_notice",
+    "No duplicate string: values-uk/amount",
+    "No duplicate string: values-uk/amount_invalid",
+    "No duplicate string: values-uk/title_optional_hint",
+    "No duplicate string: values-uk/entry_title",
+    "No duplicate string: values-uk/title_invalid",
+    "No duplicate string: values-uk/title_hint",
+    "No duplicate string: values-uk/category",
+    "No duplicate string: values-uk/date_invalid",
+    "No duplicate string: values-uk/note_optional",
+    "No duplicate string: values-uk/character_count",
+    "No duplicate string: values-uk/save_entry",
+    "No duplicate string: values-uk/entry_not_found",
+    "No duplicate string: values-uk/done",
+    "No duplicate string: values-uk/cancel",
+    "No duplicate string: values-uk/discard_title",
+    "No duplicate string: values-uk/discard_body",
+    "No duplicate string: values-uk/discard",
+    "No duplicate string: values-uk/keep_editing",
+    "No duplicate string: values-uk/profile",
+    "No duplicate string: values-uk/local_profile",
+    "No duplicate string: values-uk/display_name",
+    "No duplicate string: values-uk/save_profile",
+    "No duplicate string: values-uk/name_invalid",
+    "No duplicate string: values-uk/language",
+    "No duplicate string: values-uk/language_instant",
+    "No duplicate string: values-uk/language_en",
+    "No duplicate string: values-uk/language_uk",
+    "No duplicate string: values-uk/appearance",
+    "No duplicate string: values-uk/theme_system",
+    "No duplicate string: values-uk/theme_light",
+    "No duplicate string: values-uk/theme_dark",
+    "No duplicate string: values-uk/default_currency",
+    "No duplicate string: values-uk/currency_explanation",
+    "No duplicate string: values-uk/security",
+    "No duplicate string: values-uk/biometric_unlock",
+    "No duplicate string: values-uk/biometric_explanation",
+    "No duplicate string: values-uk/biometric_unavailable",
+    "No duplicate string: values-uk/auto_lock_explanation",
+    "No duplicate string: values-uk/lock_now",
+    "No duplicate string: values-uk/premium_name",
+    "No duplicate string: values-uk/premium_body",
+    "No duplicate string: values-uk/premium_active",
+    "No duplicate string: values-uk/premium_offline_notice",
+    "No duplicate string: values-uk/premium_unlock",
+    "No duplicate string: values-uk/premium_buy",
+    "No duplicate string: values-uk/restore_purchases",
+    "No duplicate string: values-uk/billing_configuration",
+    "No duplicate string: values-uk/billing_unavailable",
+    "No duplicate string: values-uk/billing_network",
+    "No duplicate string: values-uk/billing_pending",
+    "No duplicate string: values-uk/billing_verification",
+    "No duplicate string: values-uk/billing_acknowledgement",
+    "No duplicate string: values-uk/reference_rates",
+    "No duplicate string: values-uk/rates_disclaimer",
+    "No duplicate string: values-uk/rates_empty",
+    "No duplicate string: values-uk/rate_value",
+    "No duplicate string: values-uk/rates_as_of",
+    "No duplicate string: values-uk/refresh_rates",
+    "No duplicate string: values-uk/refreshing",
+    "No duplicate string: values-uk/rate_offline",
+    "No duplicate string: values-uk/support",
+    "No duplicate string: values-uk/support_intro",
+    "No duplicate string: values-uk/contact_telegram",
+    "No duplicate string: values-uk/diagnostics_show_button",
+    "No duplicate string: values-uk/diagnostics_none",
+    "No duplicate string: values-uk/diagnostics_title",
+    "No duplicate string: values-uk/diagnostics_hint",
+    "No duplicate string: values-uk/diagnostics_copy",
+    "No duplicate string: values-uk/diagnostics_copied",
+    "No duplicate string: values-uk/diagnostics_clear",
+    "No duplicate string: values-uk/diagnostics_close",
+    "No duplicate string: values-uk/here_to_help",
+    "No duplicate string: values-uk/lead_developer",
+    "No duplicate string: values-uk/support_handle",
+    "No duplicate string: values-uk/copy_handle",
+    "No duplicate string: values-uk/handle_copied",
+    "No duplicate string: values-uk/support_privacy",
+    "No duplicate string: values-uk/telegram_support",
+    "No duplicate string: values-uk/support_network_error",
+    "No duplicate string: values-uk/help_heading",
+    "No duplicate string: values-uk/help_intro",
+    "No duplicate string: values-uk/help_entries_title",
+    "No duplicate string: values-uk/help_entries_body",
+    "No duplicate string: values-uk/help_privacy_title",
+    "No duplicate string: values-uk/help_privacy_body",
+    "No duplicate string: values-uk/help_security_title",
+    "No duplicate string: values-uk/help_security_body",
+    "No duplicate string: values-uk/help_premium_title",
+    "No duplicate string: values-uk/help_premium_body",
+    "No duplicate string: values-uk/app_version",
+    "No duplicate string: values-uk/premium_feature_trends",
+    "No duplicate string: values-uk/premium_feature_mascot",
+    "No duplicate string: values-uk/premium_feature_support",
+    "No duplicate string: values-uk/premium_source_play",
+    "No duplicate string: values-uk/premium_source_developer",
+    "No duplicate string: values-uk/premium_expires",
+    "No duplicate string: values-uk/premium_assistant_toggle",
+    "No duplicate string: values-uk/premium_assistant_toggle_hint",
+    "No duplicate string: values-uk/developer_purchase_title",
+    "No duplicate string: values-uk/developer_purchase_body",
+    "No duplicate string: values-uk/developer_purchase_banner",
+    "No duplicate string: values-uk/developer_purchase_note",
+    "No duplicate string: values-uk/developer_purchase_button",
+    "No duplicate string: values-uk/installation_id_label",
+    "No duplicate string: values-uk/installation_id_copy",
+    "No duplicate string: values-uk/installation_id_copied",
+    "No duplicate string: values-uk/activation_code_label",
+    "No duplicate string: values-uk/activation_code_hint",
+    "No duplicate string: values-uk/activation_code_button",
+    "No duplicate string: values-uk/billing_activation_code",
+    "No duplicate string: values-uk/premium_activated",
+    "No duplicate string: values-uk/activation_invalid",
+    "No duplicate string: values-uk/mascot_card_title",
+    "No duplicate string: values-uk/mascot_hear_again",
+    "No duplicate string: values-uk/mascot_premium_note",
+    "No duplicate string: values-uk/voice_assistant_button",
+    "No duplicate string: values-uk/voice_assistant_hint",
+    "No duplicate string: values-uk/voice_assistant_listening",
+    "No duplicate string: values-uk/voice_entry_added",
+    "No duplicate string: values-uk/voice_reply_balance",
+    "No duplicate string: values-uk/voice_reply_spent_today",
+    "No duplicate string: values-uk/voice_reply_opening_entry",
+    "No duplicate string: values-uk/voice_reply_not_understood",
+    "No duplicate string: values-uk/voice_smalltalk_greeting",
+    "No duplicate string: values-uk/voice_smalltalk_how_are_you",
+    "No duplicate string: values-uk/voice_smalltalk_thanks",
+    "No duplicate string: values-uk/voice_smalltalk_who_are_you",
+    "No duplicate string: values-uk/voice_smalltalk_bye",
+    "No duplicate string: values-uk/voice_smalltalk_compliment",
+    "No duplicate string: values-uk/voice_smalltalk_joke",
+    "No duplicate string: values-uk/voice_permission_denied",
+    "No duplicate string: values-uk/voice_recognizer_unavailable",
+    "No duplicate string: values-uk/all_time",
+    "No duplicate string: values-uk/categories",
+    "No duplicate string: values-uk/all_categories",
+    "No duplicate string: values-uk/category_transaction_count",
+    "No duplicate string: values-uk/category_empty",
+    "No duplicate string: values-uk/period_today",
+    "No duplicate string: values-uk/period_month",
+    "No duplicate string: values-uk/period_year",
+    "No duplicate string: values-uk/voice_statistics",
+    "No duplicate string: values-uk/assistant_text_hint",
+    "No duplicate string: values-uk/assistant_send",
+    "No duplicate string: values-uk/premium_source_trial",
+    "No duplicate string: values-uk/premium_local_notice",
+    "No duplicate string: values-uk/trial_explanation",
+    "No duplicate string: values-uk/trial_14",
+    "No duplicate string: values-uk/mascot_style",
+    "No duplicate string: values-uk/mascot_gray",
+    "No duplicate string: values-uk/mascot_sky",
+    "No duplicate string: values-uk/mascot_animations",
+    "No duplicate string: values-uk/brand_intro_title",
+    "No duplicate string: values-uk/brand_intro_body",
+    "No duplicate string: values-uk/brand_design_label",
+    "No duplicate string: values-uk/analytics_title",
+    "No duplicate string: values-uk/cinematic_history",
+    "No duplicate string: values-uk/cinematic_period",
+    "No duplicate string: values-uk/cinematic_apply",
+    "No duplicate string: values-uk/cinematic_more",
+    "No duplicate string: values-uk/cinematic_expenses_period",
+    "No duplicate string: values-uk/cinematic_comparison",
+    "No duplicate string: values-uk/cinematic_more_than_previous",
+    "No duplicate string: values-uk/cinematic_less_than_previous",
+    "No duplicate string: values-uk/cinematic_week_average",
+    "No duplicate string: values-uk/cinematic_month_average",
+    "No duplicate string: values-uk/cinematic_expense_categories",
+    "No duplicate string: values-uk/cinematic_income_categories",
+    "No duplicate string: values-uk/cinematic_transactions",
+    "No duplicate string: values-uk/cinematic_tooltip",
+    "No duplicate string: values-uk/cinematic_chart_accessibility",
+    "No duplicate string: values-uk/cinematic_more_buckets",
+    "No duplicate string: values-uk/cat_asset_status",
+    "No duplicate string: values-uk/fps_title",
+    "No duplicate string: values-uk/fps_explanation",
+    "No duplicate string: values-uk/fps_auto",
+    "No duplicate string: values-uk/fps_value",
+    "No duplicate string: values-uk/fps_supported",
+    "No duplicate string: values-uk/fps_fallback",
+    "No duplicate string: values-uk/cat_tap_hint",
+    "No duplicate string: values-uk/category_transfer",
+    "No duplicate string: values-uk/category_dining",
+    "No duplicate string: values-uk/category_cashback",
+    "No duplicate string: values-uk/reference_total_for",
+    "No duplicate string: values-uk/total_all_time",
+    "No duplicate string: values-uk/total_thirty_days",
+    "No duplicate string: values-uk/total_seven_days",
+    "No duplicate string: values-uk/colors_title",
+    "No duplicate string: values-uk/colors_explanation",
+    "No duplicate string: values-uk/colors_edit",
+    "No duplicate string: values-uk/colors_collapse",
+    "No duplicate string: values-uk/colors_categories",
+    "No duplicate string: values-uk/colors_reset_all",
+    "No duplicate string: values-uk/color_accent",
+    "No duplicate string: values-uk/color_background",
+    "No duplicate string: values-uk/color_surface",
+    "No duplicate string: values-uk/color_text",
+    "No duplicate string: values-uk/color_muted",
+    "No duplicate string: values-uk/color_chart_top",
+    "No duplicate string: values-uk/color_chart_bottom",
+    "No duplicate string: values-uk/color_grid",
+    "No duplicate string: values-uk/color_icons",
+    "No duplicate string: values-uk/color_hue",
+    "No duplicate string: values-uk/color_saturation",
+    "No duplicate string: values-uk/color_brightness",
+    "No duplicate string: values-uk/color_apply",
+    "No duplicate string: values-uk/color_reset",
+    "No duplicate string: values-uk/color_invalid",
+    "No duplicate string: values-uk/color_contrast_warning",
+    "No duplicate string: values-uk/color_error",
+    "No duplicate string: values-uk/bank_dashboard",
+    "No duplicate string: values-uk/bank_import_title",
+    "No duplicate string: values-uk/bank_consent",
+    "No duplicate string: values-uk/bank_enabled",
+    "No duplicate string: values-uk/bank_auto",
+    "No duplicate string: values-uk/bank_access_yes",
+    "No duplicate string: values-uk/bank_access_no",
+    "No duplicate string: values-uk/bank_notification_permission",
+    "No duplicate string: values-uk/bank_sms_yes",
+    "No duplicate string: values-uk/bank_sms_no",
+    "No duplicate string: values-uk/bank_sms_permission",
+    "No duplicate string: values-uk/bank_play_sms",
+    "No duplicate string: values-uk/bank_privacy",
+    "No duplicate string: values-uk/bank_privacy_body",
+    "No duplicate string: values-uk/bank_day",
+    "No duplicate string: values-uk/bank_week",
+    "No duplicate string: values-uk/bank_month",
+    "No duplicate string: values-uk/bank_cash",
+    "No duplicate string: values-uk/bank_card",
+    "No duplicate string: values-uk/bank_unknown",
+    "No duplicate string: values-uk/bank_source",
+    "No duplicate string: values-uk/bank_category_stats",
+    "No duplicate string: values-uk/bank_new_category",
+    "No duplicate string: values-uk/bank_review_count",
+    "No duplicate string: values-uk/bank_time_received",
+    "No duplicate string: values-uk/bank_duplicate",
+    "No duplicate string: values-uk/bank_transfer_review",
+    "No duplicate string: values-uk/bank_ignore",
+    "No duplicate string: values-uk/bank_recent",
+    "No duplicate string: values-uk/bank_limit_recent",
+    "No duplicate string: values-uk/bank_budget",
+    "No duplicate string: values-uk/bank_budget_progress",
+    "No duplicate string: values-uk/bank_export",
+    "No duplicate string: values-uk/bank_clear_history",
+    "No duplicate string: values-uk/bank_clear_warning",
+    "No duplicate string: values-uk/bank_app_permissions",
+    "No duplicate string: values-uk/bank_battery",
+    "No duplicate string: values-uk/bank_budget_disable",
+    "No duplicate string: values-uk/history_search",
+    "No duplicate string: values-uk/import_diagnostics",
+    "No duplicate string: values-uk/import_connected",
+    "No duplicate string: values-uk/import_disconnected",
+    "No duplicate string: values-uk/import_counts",
+    "No duplicate string: values-uk/import_reconnect",
+    "No duplicate string: values-uk/import_package_settings",
+    "No duplicate string: values-uk/import_package_warning",
+    "No duplicate string: values-uk/import_paste",
+    "No duplicate string: values-uk/import_text",
+    "No duplicate string: values-uk/import_manual_privacy",
+    "No duplicate string: values-uk/import_to_queue",
+    "No duplicate string: values-uk/import_queue_note",
+    "No duplicate string: values-uk/import_disabled",
+    "No duplicate string: values-uk/import_unsupported",
+    "No duplicate string: values-uk/import_empty",
+    "No duplicate string: values-uk/import_group",
+    "No duplicate string: values-uk/import_unrecognized",
+    "No duplicate string: values-uk/import_auto_done",
+    "No duplicate string: values-uk/import_queued",
+    "No duplicate string: values-uk/import_repeated",
+    "No duplicate string: values-uk/import_waiting",
+    "No duplicate string: values-uk/import_mode_title",
+    "No duplicate string: values-uk/import_mode_api",
+    "No duplicate string: values-uk/import_mode_sms",
+    "No duplicate string: values-uk/import_mode_notify",
+    "No duplicate string: values-uk/api_howto",
+    "No duplicate string: values-uk/api_open_site",
+    "No duplicate string: values-uk/api_token_label",
+    "No duplicate string: values-uk/api_connect",
+    "No duplicate string: values-uk/api_connecting",
+    "No duplicate string: values-uk/api_connected",
+    "No duplicate string: values-uk/api_last_sync",
+    "No duplicate string: values-uk/api_imported_last",
+    "No duplicate string: values-uk/api_syncing",
+    "No duplicate string: values-uk/api_sync_now",
+    "No duplicate string: values-uk/api_disconnect",
+    "No duplicate string: values-uk/api_error_bad_token",
+    "No duplicate string: values-uk/api_error_rate",
+    "No duplicate string: values-uk/api_error_network",
+    "No duplicate string: values-uk/api_error_no_accounts",
+    "No duplicate string: values-uk/sms_howto",
+    "No duplicate string: values-uk/sms_scan",
+    "No duplicate string: values-uk/sms_scanning",
+    "No duplicate string: values-uk/sms_scan_result",
+    "No duplicate string: values-uk/sms_restricted_tip",
+    "No duplicate string: values-uk/pay_source_title",
+    "No duplicate string: values-uk/pay_source_required",
+    "No duplicate string: values-uk/voice_ask_source",
+    "No duplicate string: values-uk/cat_locked_hint",
+    "No duplicate string: values-uk/bank_setup",
+    "No duplicate string: values-uk/push_howto",
+    "No duplicate string: values-uk/privat_api_title",
+    "No duplicate string: values-uk/privat_api_howto",
+    "No duplicate string: values-uk/privat_api_site",
+    "No duplicate string: values-uk/privat_api_token",
+    "No duplicate string: values-uk/privat_api_connected",
+    "No duplicate string: values-uk/privat_api_error",
+    "No duplicate string: values-uk/other_api_note",
+    "No duplicate string: values-uk/help_banks_title",
+    "No duplicate string: values-uk/help_banks_body",
+    "No duplicate string: values-uk/import_confirm_permission",
+    "No duplicate string: values-uk/import_confirm_enabled",
+    "No duplicate string: values-uk/assistant_write_short",
+    "No duplicate string: values-uk/major_release_title",
+    "No duplicate string: values-uk/major_release_body",
+    "English/Ukrainian key parity",
+    "Format-argument parity: save_profile",
+    "Nonempty translations: save_profile",
+    "Format-argument parity: import_text",
+    "Nonempty translations: import_text",
+    "Format-argument parity: help_privacy_body",
+    "Nonempty translations: help_privacy_body",
+    "Format-argument parity: privat_api_error",
+    "Nonempty translations: privat_api_error",
+    "Format-argument parity: voice_reply_balance",
+    "Nonempty translations: voice_reply_balance",
+    "Format-argument parity: help",
+    "Nonempty translations: help",
+    "Format-argument parity: api_howto",
+    "Nonempty translations: api_howto",
+    "Format-argument parity: billing_configuration",
+    "Nonempty translations: billing_configuration",
+    "Format-argument parity: voice_smalltalk_joke",
+    "Nonempty translations: voice_smalltalk_joke",
+    "Format-argument parity: all_time",
+    "Nonempty translations: all_time",
+    "Format-argument parity: diagnostics_copied",
+    "Nonempty translations: diagnostics_copied",
+    "Format-argument parity: voice_smalltalk_compliment",
+    "Nonempty translations: voice_smalltalk_compliment",
+    "Format-argument parity: bank_category_stats",
+    "Nonempty translations: bank_category_stats",
+    "Format-argument parity: bank_review_count",
+    "Nonempty translations: bank_review_count",
+    "Format-argument parity: pin_incorrect",
+    "Nonempty translations: pin_incorrect",
+    "Format-argument parity: back",
+    "Nonempty translations: back",
+    "Format-argument parity: confirm_pin",
+    "Nonempty translations: confirm_pin",
+    "Format-argument parity: cancel",
+    "Nonempty translations: cancel",
+    "Format-argument parity: greeting",
+    "Nonempty translations: greeting",
+    "Format-argument parity: date_invalid",
+    "Nonempty translations: date_invalid",
+    "Format-argument parity: skip",
+    "Nonempty translations: skip",
+    "Format-argument parity: cinematic_more_than_previous",
+    "Nonempty translations: cinematic_more_than_previous",
+    "Format-argument parity: language_uk",
+    "Nonempty translations: language_uk",
+    "Format-argument parity: sms_scan",
+    "Nonempty translations: sms_scan",
+    "Format-argument parity: api_error_rate",
+    "Nonempty translations: api_error_rate",
+    "Format-argument parity: color_accent",
+    "Nonempty translations: color_accent",
+    "Format-argument parity: bank_auto",
+    "Nonempty translations: bank_auto",
+    "Format-argument parity: handle_copied",
+    "Nonempty translations: handle_copied",
+    "Format-argument parity: brand_design_label",
+    "Nonempty translations: brand_design_label",
+    "Format-argument parity: help_heading",
+    "Nonempty translations: help_heading",
+    "Format-argument parity: close",
+    "Nonempty translations: close",
+    "Format-argument parity: import_group",
+    "Nonempty translations: import_group",
+    "Format-argument parity: import_queued",
+    "Nonempty translations: import_queued",
+    "Format-argument parity: character_count",
+    "Nonempty translations: character_count",
+    "Format-argument parity: api_last_sync",
+    "Nonempty translations: api_last_sync",
+    "Format-argument parity: cinematic_comparison",
+    "Nonempty translations: cinematic_comparison",
+    "Format-argument parity: developer_purchase_body",
+    "Nonempty translations: developer_purchase_body",
+    "Format-argument parity: import_queue_note",
+    "Nonempty translations: import_queue_note",
+    "Format-argument parity: load_error_title",
+    "Nonempty translations: load_error_title",
+    "Format-argument parity: bank_play_sms",
+    "Nonempty translations: bank_play_sms",
+    "Format-argument parity: income",
+    "Nonempty translations: income",
+    "Format-argument parity: import_unrecognized",
+    "Nonempty translations: import_unrecognized",
+    "Format-argument parity: local_profile",
+    "Nonempty translations: local_profile",
+    "Format-argument parity: biometric_explanation",
+    "Nonempty translations: biometric_explanation",
+    "Format-argument parity: entry_title",
+    "Nonempty translations: entry_title",
+    "Format-argument parity: billing_network",
+    "Nonempty translations: billing_network",
+    "Format-argument parity: premium_body",
+    "Nonempty translations: premium_body",
+    "Format-argument parity: brand_author_signature",
+    "Nonempty translations: brand_author_signature",
+    "Format-argument parity: import_paste",
+    "Nonempty translations: import_paste",
+    "Format-argument parity: api_syncing",
+    "Nonempty translations: api_syncing",
+    "Format-argument parity: category_empty",
+    "Nonempty translations: category_empty",
+    "Format-argument parity: developer_purchase_banner",
+    "Nonempty translations: developer_purchase_banner",
+    "Format-argument parity: cinematic_chart_accessibility",
+    "Nonempty translations: cinematic_chart_accessibility",
+    "Format-argument parity: api_connecting",
+    "Nonempty translations: api_connecting",
+    "Format-argument parity: pin_unlock_subtitle",
+    "Nonempty translations: pin_unlock_subtitle",
+    "Format-argument parity: bank_card",
+    "Nonempty translations: bank_card",
+    "Format-argument parity: theme_light",
+    "Nonempty translations: theme_light",
+    "Format-argument parity: activation_code_button",
+    "Nonempty translations: activation_code_button",
+    "Format-argument parity: import_diagnostics",
+    "Nonempty translations: import_diagnostics",
+    "Format-argument parity: voice_smalltalk_how_are_you",
+    "Nonempty translations: voice_smalltalk_how_are_you",
+    "Format-argument parity: use_pin",
+    "Nonempty translations: use_pin",
+    "Format-argument parity: saved",
+    "Nonempty translations: saved",
+    "Format-argument parity: voice_smalltalk_who_are_you",
+    "Nonempty translations: voice_smalltalk_who_are_you",
+    "Format-argument parity: category_dining",
+    "Nonempty translations: category_dining",
+    "Format-argument parity: help_premium_body",
+    "Nonempty translations: help_premium_body",
+    "Format-argument parity: import_counts",
+    "Nonempty translations: import_counts",
+    "Format-argument parity: developer_purchase_note",
+    "Nonempty translations: developer_purchase_note",
+    "Format-argument parity: mascot_gray",
+    "Nonempty translations: mascot_gray",
+    "Format-argument parity: empty_ledger_body",
+    "Nonempty translations: empty_ledger_body",
+    "Format-argument parity: import_disabled",
+    "Nonempty translations: import_disabled",
+    "Format-argument parity: onboard_body_two",
+    "Nonempty translations: onboard_body_two",
+    "Format-argument parity: bank_access_yes",
+    "Nonempty translations: bank_access_yes",
+    "Format-argument parity: language_instant",
+    "Nonempty translations: language_instant",
+    "Format-argument parity: help_banks_title",
+    "Nonempty translations: help_banks_title",
+    "Format-argument parity: voice_smalltalk_thanks",
+    "Nonempty translations: voice_smalltalk_thanks",
+    "Format-argument parity: color_chart_bottom",
+    "Nonempty translations: color_chart_bottom",
+    "Format-argument parity: sms_scanning",
+    "Nonempty translations: sms_scanning",
+    "Format-argument parity: installation_id_copy",
+    "Nonempty translations: installation_id_copy",
+    "Format-argument parity: premium_local_notice",
+    "Nonempty translations: premium_local_notice",
+    "Format-argument parity: api_imported_last",
+    "Nonempty translations: api_imported_last",
+    "Format-argument parity: pin_digit_count",
+    "Nonempty translations: pin_digit_count",
+    "Format-argument parity: edit_entry",
+    "Nonempty translations: edit_entry",
+    "Format-argument parity: diagnostics_clear",
+    "Nonempty translations: diagnostics_clear",
+    "Format-argument parity: category_cashback",
+    "Nonempty translations: category_cashback",
+    "Format-argument parity: voice_reply_not_understood",
+    "Nonempty translations: voice_reply_not_understood",
+    "Format-argument parity: onboard_body_one",
+    "Nonempty translations: onboard_body_one",
+    "Format-argument parity: next",
+    "Nonempty translations: next",
+    "Format-argument parity: push_howto",
+    "Nonempty translations: push_howto",
+    "Format-argument parity: currency_scope",
+    "Nonempty translations: currency_scope",
+    "Format-argument parity: title_optional_hint",
+    "Nonempty translations: title_optional_hint",
+    "Format-argument parity: add_first_entry",
+    "Nonempty translations: add_first_entry",
+    "Format-argument parity: reference_total_for",
+    "Nonempty translations: reference_total_for",
+    "Format-argument parity: bank_sms_permission",
+    "Nonempty translations: bank_sms_permission",
+    "Format-argument parity: bank_sms_yes",
+    "Nonempty translations: bank_sms_yes",
+    "Format-argument parity: all",
+    "Nonempty translations: all",
+    "Format-argument parity: here_to_help",
+    "Nonempty translations: here_to_help",
+    "Format-argument parity: colors_title",
+    "Nonempty translations: colors_title",
+    "Format-argument parity: category_other",
+    "Nonempty translations: category_other",
+    "Format-argument parity: last_7_days",
+    "Nonempty translations: last_7_days",
+    "Format-argument parity: trial_14",
+    "Nonempty translations: trial_14",
+    "Format-argument parity: clear_search",
+    "Nonempty translations: clear_search",
+    "Format-argument parity: api_open_site",
+    "Nonempty translations: api_open_site",
+    "Format-argument parity: billing_verification",
+    "Nonempty translations: billing_verification",
+    "Format-argument parity: amount",
+    "Nonempty translations: amount",
+    "Format-argument parity: color_grid",
+    "Nonempty translations: color_grid",
+    "Format-argument parity: brand_intro_title",
+    "Nonempty translations: brand_intro_title",
+    "Format-argument parity: overview",
+    "Nonempty translations: overview",
+    "Format-argument parity: major_release_body",
+    "Nonempty translations: major_release_body",
+    "Format-argument parity: title_invalid",
+    "Nonempty translations: title_invalid",
+    "Format-argument parity: biometric_failed",
+    "Nonempty translations: biometric_failed",
+    "Format-argument parity: lead_developer",
+    "Nonempty translations: lead_developer",
+    "Format-argument parity: display_name",
+    "Nonempty translations: display_name",
+    "Format-argument parity: clear_filters",
+    "Nonempty translations: clear_filters",
+    "Format-argument parity: unlock_title",
+    "Nonempty translations: unlock_title",
+    "Format-argument parity: color_surface",
+    "Nonempty translations: color_surface",
+    "Format-argument parity: rate_offline",
+    "Nonempty translations: rate_offline",
+    "Format-argument parity: help_intro",
+    "Nonempty translations: help_intro",
+    "Format-argument parity: bank_time_received",
+    "Nonempty translations: bank_time_received",
+    "Format-argument parity: bank_budget_progress",
+    "Nonempty translations: bank_budget_progress",
+    "Format-argument parity: privat_api_howto",
+    "Nonempty translations: privat_api_howto",
+    "Format-argument parity: help_privacy_title",
+    "Nonempty translations: help_privacy_title",
+    "Format-argument parity: history_search",
+    "Nonempty translations: history_search",
+    "Format-argument parity: api_disconnect",
+    "Nonempty translations: api_disconnect",
+    "Format-argument parity: discard_body",
+    "Nonempty translations: discard_body",
+    "Format-argument parity: color_reset",
+    "Nonempty translations: color_reset",
+    "Format-argument parity: import_unsupported",
+    "Nonempty translations: import_unsupported",
+    "Format-argument parity: restore_purchases",
+    "Nonempty translations: restore_purchases",
+    "Format-argument parity: category_leisure",
+    "Nonempty translations: category_leisure",
+    "Format-argument parity: support_privacy",
+    "Nonempty translations: support_privacy",
+    "Format-argument parity: color_muted",
+    "Nonempty translations: color_muted",
+    "Format-argument parity: bank_app_permissions",
+    "Nonempty translations: bank_app_permissions",
+    "Format-argument parity: bank_dashboard",
+    "Nonempty translations: bank_dashboard",
+    "Format-argument parity: cinematic_month_average",
+    "Nonempty translations: cinematic_month_average",
+    "Format-argument parity: fps_title",
+    "Nonempty translations: fps_title",
+    "Format-argument parity: sms_scan_result",
+    "Nonempty translations: sms_scan_result",
+    "Format-argument parity: load_more",
+    "Nonempty translations: load_more",
+    "Format-argument parity: activity",
+    "Nonempty translations: activity",
+    "Format-argument parity: privat_api_token",
+    "Nonempty translations: privat_api_token",
+    "Format-argument parity: delete_named_entry",
+    "Nonempty translations: delete_named_entry",
+    "Format-argument parity: premium_feature_mascot",
+    "Nonempty translations: premium_feature_mascot",
+    "Format-argument parity: empty_ledger_title",
+    "Nonempty translations: empty_ledger_title",
+    "Format-argument parity: telegram_support",
+    "Nonempty translations: telegram_support",
+    "Format-argument parity: diagnostics_hint",
+    "Nonempty translations: diagnostics_hint",
+    "Format-argument parity: help_entries_body",
+    "Nonempty translations: help_entries_body",
+    "Format-argument parity: bank_transfer_review",
+    "Nonempty translations: bank_transfer_review",
+    "Format-argument parity: period_month",
+    "Nonempty translations: period_month",
+    "Format-argument parity: billing_pending",
+    "Nonempty translations: billing_pending",
+    "Format-argument parity: cat_tap_hint",
+    "Nonempty translations: cat_tap_hint",
+    "Format-argument parity: api_error_no_accounts",
+    "Nonempty translations: api_error_no_accounts",
+    "Format-argument parity: brand_intro_body",
+    "Nonempty translations: brand_intro_body",
+    "Format-argument parity: premium_name",
+    "Nonempty translations: premium_name",
+    "Format-argument parity: erase_digit",
+    "Nonempty translations: erase_digit",
+    "Format-argument parity: sms_howto",
+    "Nonempty translations: sms_howto",
+    "Format-argument parity: trial_explanation",
+    "Nonempty translations: trial_explanation",
+    "Format-argument parity: import_reconnect",
+    "Nonempty translations: import_reconnect",
+    "Format-argument parity: diagnostics_copy",
+    "Nonempty translations: diagnostics_copy",
+    "Format-argument parity: mascot_card_title",
+    "Nonempty translations: mascot_card_title",
+    "Format-argument parity: undo_expired",
+    "Nonempty translations: undo_expired",
+    "Format-argument parity: bank_unknown",
+    "Nonempty translations: bank_unknown",
+    "Format-argument parity: bank_import_title",
+    "Nonempty translations: bank_import_title",
+    "Format-argument parity: import_disconnected",
+    "Nonempty translations: import_disconnected",
+    "Format-argument parity: major_release_title",
+    "Nonempty translations: major_release_title",
+    "Format-argument parity: color_text",
+    "Nonempty translations: color_text",
+    "Format-argument parity: bank_privacy_body",
+    "Nonempty translations: bank_privacy_body",
+    "Format-argument parity: category_health",
+    "Nonempty translations: category_health",
+    "Format-argument parity: diagnostics_close",
+    "Nonempty translations: diagnostics_close",
+    "Format-argument parity: voice_smalltalk_greeting",
+    "Nonempty translations: voice_smalltalk_greeting",
+    "Format-argument parity: premium_source_play",
+    "Nonempty translations: premium_source_play",
+    "Format-argument parity: cinematic_week_average",
+    "Nonempty translations: cinematic_week_average",
+    "Format-argument parity: get_started",
+    "Nonempty translations: get_started",
+    "Format-argument parity: installation_id_label",
+    "Nonempty translations: installation_id_label",
+    "Format-argument parity: color_chart_top",
+    "Nonempty translations: color_chart_top",
+    "Format-argument parity: help_entries_title",
+    "Nonempty translations: help_entries_title",
+    "Format-argument parity: help_banks_body",
+    "Nonempty translations: help_banks_body",
+    "Format-argument parity: category_transaction_count",
+    "Nonempty translations: category_transaction_count",
+    "Format-argument parity: fps_value",
+    "Nonempty translations: fps_value",
+    "Format-argument parity: biometric_unavailable",
+    "Nonempty translations: biometric_unavailable",
+    "Format-argument parity: mascot_premium_note",
+    "Nonempty translations: mascot_premium_note",
+    "Format-argument parity: premium_active",
+    "Nonempty translations: premium_active",
+    "Format-argument parity: onboard_title_three",
+    "Nonempty translations: onboard_title_three",
+    "Format-argument parity: bank_notification_permission",
+    "Nonempty translations: bank_notification_permission",
+    "Format-argument parity: create_pin",
+    "Nonempty translations: create_pin",
+    "Format-argument parity: billing_acknowledgement",
+    "Nonempty translations: billing_acknowledgement",
+    "Format-argument parity: note_optional",
+    "Nonempty translations: note_optional",
+    "Format-argument parity: need_help",
+    "Nonempty translations: need_help",
+    "Format-argument parity: api_error_bad_token",
+    "Nonempty translations: api_error_bad_token",
+    "Format-argument parity: import_empty",
+    "Nonempty translations: import_empty",
+    "Format-argument parity: lock_now",
+    "Nonempty translations: lock_now",
+    "Format-argument parity: no_matches_body",
+    "Nonempty translations: no_matches_body",
+    "Format-argument parity: diagnostics_title",
+    "Nonempty translations: diagnostics_title",
+    "Format-argument parity: contact_telegram",
+    "Nonempty translations: contact_telegram",
+    "Format-argument parity: api_error_network",
+    "Nonempty translations: api_error_network",
+    "Format-argument parity: colors_edit",
+    "Nonempty translations: colors_edit",
+    "Format-argument parity: cinematic_transactions",
+    "Nonempty translations: cinematic_transactions",
+    "Format-argument parity: colors_collapse",
+    "Nonempty translations: colors_collapse",
+    "Format-argument parity: cinematic_income_categories",
+    "Nonempty translations: cinematic_income_categories",
+    "Format-argument parity: last_30_days_plus",
+    "Nonempty translations: last_30_days_plus",
+    "Format-argument parity: name_invalid",
+    "Nonempty translations: name_invalid",
+    "Format-argument parity: rates_empty",
+    "Nonempty translations: rates_empty",
+    "Format-argument parity: pin_mismatch",
+    "Nonempty translations: pin_mismatch",
+    "Format-argument parity: assistant_write_short",
+    "Nonempty translations: assistant_write_short",
+    "Format-argument parity: bank_battery",
+    "Nonempty translations: bank_battery",
+    "Format-argument parity: bank_day",
+    "Nonempty translations: bank_day",
+    "Format-argument parity: biometric_subtitle",
+    "Nonempty translations: biometric_subtitle",
+    "Format-argument parity: color_icons",
+    "Nonempty translations: color_icons",
+    "Format-argument parity: bank_consent",
+    "Nonempty translations: bank_consent",
+    "Format-argument parity: support_intro",
+    "Nonempty translations: support_intro",
+    "Format-argument parity: period_today",
+    "Nonempty translations: period_today",
+    "Format-argument parity: expenses",
+    "Nonempty translations: expenses",
+    "Format-argument parity: onboard_body_three",
+    "Nonempty translations: onboard_body_three",
+    "Format-argument parity: pin_locked",
+    "Nonempty translations: pin_locked",
+    "Format-argument parity: cash_flow",
+    "Nonempty translations: cash_flow",
+    "Format-argument parity: title_hint",
+    "Nonempty translations: title_hint",
+    "Format-argument parity: bank_export",
+    "Nonempty translations: bank_export",
+    "Format-argument parity: total_seven_days",
+    "Nonempty translations: total_seven_days",
+    "Format-argument parity: voice_assistant_hint",
+    "Nonempty translations: voice_assistant_hint",
+    "Format-argument parity: pin_setup_subtitle",
+    "Nonempty translations: pin_setup_subtitle",
+    "Format-argument parity: bank_cash",
+    "Nonempty translations: bank_cash",
+    "Format-argument parity: diagnostics_none",
+    "Nonempty translations: diagnostics_none",
+    "Format-argument parity: last_30_days",
+    "Nonempty translations: last_30_days",
+    "Format-argument parity: import_to_queue",
+    "Nonempty translations: import_to_queue",
+    "Format-argument parity: bank_limit_recent",
+    "Nonempty translations: bank_limit_recent",
+    "Format-argument parity: default_currency",
+    "Nonempty translations: default_currency",
+    "Format-argument parity: chart_description",
+    "Nonempty translations: chart_description",
+    "Format-argument parity: analytics_title",
+    "Nonempty translations: analytics_title",
+    "Format-argument parity: entry_deleted",
+    "Nonempty translations: entry_deleted",
+    "Format-argument parity: api_sync_now",
+    "Nonempty translations: api_sync_now",
+    "Format-argument parity: bank_new_category",
+    "Nonempty translations: bank_new_category",
+    "Format-argument parity: premium_buy",
+    "Nonempty translations: premium_buy",
+    "Format-argument parity: activation_invalid",
+    "Nonempty translations: activation_invalid",
+    "Format-argument parity: cinematic_period",
+    "Nonempty translations: cinematic_period",
+    "Format-argument parity: bank_budget",
+    "Nonempty translations: bank_budget",
+    "Format-argument parity: import_mode_notify",
+    "Nonempty translations: import_mode_notify",
+    "Format-argument parity: save_entry",
+    "Nonempty translations: save_entry",
+    "Format-argument parity: cat_asset_status",
+    "Nonempty translations: cat_asset_status",
+    "Format-argument parity: page_of",
+    "Nonempty translations: page_of",
+    "Format-argument parity: category_home",
+    "Nonempty translations: category_home",
+    "Format-argument parity: import_confirm_permission",
+    "Nonempty translations: import_confirm_permission",
+    "Format-argument parity: period_year",
+    "Nonempty translations: period_year",
+    "Format-argument parity: language_en",
+    "Nonempty translations: language_en",
+    "Format-argument parity: legend_expense",
+    "Nonempty translations: legend_expense",
+    "Format-argument parity: voice_entry_added",
+    "Nonempty translations: voice_entry_added",
+    "Format-argument parity: currency_explanation",
+    "Nonempty translations: currency_explanation",
+    "Format-argument parity: app_version",
+    "Nonempty translations: app_version",
+    "Format-argument parity: color_brightness",
+    "Nonempty translations: color_brightness",
+    "Format-argument parity: bank_access_no",
+    "Nonempty translations: bank_access_no",
+    "Format-argument parity: pay_source_required",
+    "Nonempty translations: pay_source_required",
+    "Format-argument parity: color_background",
+    "Nonempty translations: color_background",
+    "Format-argument parity: voice_statistics",
+    "Nonempty translations: voice_statistics",
+    "Format-argument parity: retry",
+    "Nonempty translations: retry",
+    "Format-argument parity: chart_empty",
+    "Nonempty translations: chart_empty",
+    "Format-argument parity: premium_expires",
+    "Nonempty translations: premium_expires",
+    "Format-argument parity: billing_unavailable",
+    "Nonempty translations: billing_unavailable",
+    "Format-argument parity: assistant_send",
+    "Nonempty translations: assistant_send",
+    "Format-argument parity: legend_income",
+    "Nonempty translations: legend_income",
+    "Format-argument parity: expense",
+    "Nonempty translations: expense",
+    "Format-argument parity: discard",
+    "Nonempty translations: discard",
+    "Format-argument parity: fps_fallback",
+    "Nonempty translations: fps_fallback",
+    "Format-argument parity: premium_offline_notice",
+    "Nonempty translations: premium_offline_notice",
+    "Format-argument parity: positive_amount",
+    "Nonempty translations: positive_amount",
+    "Format-argument parity: other_api_note",
+    "Nonempty translations: other_api_note",
+    "Format-argument parity: import_confirm_enabled",
+    "Nonempty translations: import_confirm_enabled",
+    "Format-argument parity: color_invalid",
+    "Nonempty translations: color_invalid",
+    "Format-argument parity: premium_unlock",
+    "Nonempty translations: premium_unlock",
+    "Format-argument parity: copy_handle",
+    "Nonempty translations: copy_handle",
+    "Format-argument parity: bank_setup",
+    "Nonempty translations: bank_setup",
+    "Format-argument parity: category_transport",
+    "Nonempty translations: category_transport",
+    "Format-argument parity: premium_activated",
+    "Nonempty translations: premium_activated",
+    "Format-argument parity: cinematic_expense_categories",
+    "Nonempty translations: cinematic_expense_categories",
+    "Format-argument parity: search_scope",
+    "Nonempty translations: search_scope",
+    "Format-argument parity: add_entry",
+    "Nonempty translations: add_entry",
+    "Format-argument parity: category_transfer",
+    "Nonempty translations: category_transfer",
+    "Format-argument parity: cinematic_apply",
+    "Nonempty translations: cinematic_apply",
+    "Format-argument parity: bank_ignore",
+    "Nonempty translations: bank_ignore",
+    "Format-argument parity: storage_error",
+    "Nonempty translations: storage_error",
+    "Format-argument parity: privat_api_title",
+    "Nonempty translations: privat_api_title",
+    "Format-argument parity: voice_permission_denied",
+    "Nonempty translations: voice_permission_denied",
+    "Format-argument parity: bank_sms_no",
+    "Nonempty translations: bank_sms_no",
+    "Format-argument parity: voice_ask_source",
+    "Nonempty translations: voice_ask_source",
+    "Format-argument parity: import_repeated",
+    "Nonempty translations: import_repeated",
+    "Format-argument parity: biometric_title",
+    "Nonempty translations: biometric_title",
+    "Format-argument parity: rates_disclaimer",
+    "Nonempty translations: rates_disclaimer",
+    "Format-argument parity: help_premium_title",
+    "Nonempty translations: help_premium_title",
+    "Format-argument parity: undo",
+    "Nonempty translations: undo",
+    "Format-argument parity: mascot_sky",
+    "Nonempty translations: mascot_sky",
+    "Format-argument parity: dashboard_heading",
+    "Nonempty translations: dashboard_heading",
+    "Format-argument parity: theme_system",
+    "Nonempty translations: theme_system",
+    "Format-argument parity: color_saturation",
+    "Nonempty translations: color_saturation",
+    "Format-argument parity: sms_restricted_tip",
+    "Nonempty translations: sms_restricted_tip",
+    "Format-argument parity: cinematic_tooltip",
+    "Nonempty translations: cinematic_tooltip",
+    "Format-argument parity: rate_value",
+    "Nonempty translations: rate_value",
+    "Format-argument parity: onboard_title_two",
+    "Nonempty translations: onboard_title_two",
+    "Format-argument parity: premium_source_developer",
+    "Nonempty translations: premium_source_developer",
+    "Format-argument parity: bank_clear_history",
+    "Nonempty translations: bank_clear_history",
+    "Format-argument parity: category",
+    "Nonempty translations: category",
+    "Format-argument parity: import_mode_sms",
+    "Nonempty translations: import_mode_sms",
+    "Format-argument parity: category_food",
+    "Nonempty translations: category_food",
+    "Format-argument parity: discard_title",
+    "Nonempty translations: discard_title",
+    "Format-argument parity: cinematic_expenses_period",
+    "Nonempty translations: cinematic_expenses_period",
+    "Format-argument parity: category_salary",
+    "Nonempty translations: category_salary",
+    "Format-argument parity: theme_dark",
+    "Nonempty translations: theme_dark",
+    "Format-argument parity: color_contrast_warning",
+    "Nonempty translations: color_contrast_warning",
+    "Format-argument parity: entry_not_found",
+    "Nonempty translations: entry_not_found",
+    "Format-argument parity: bank_privacy",
+    "Nonempty translations: bank_privacy",
+    "Format-argument parity: language",
+    "Nonempty translations: language",
+    "Format-argument parity: fps_supported",
+    "Nonempty translations: fps_supported",
+    "Format-argument parity: onboard_title_one",
+    "Nonempty translations: onboard_title_one",
+    "Format-argument parity: total_thirty_days",
+    "Nonempty translations: total_thirty_days",
+    "Format-argument parity: api_connected",
+    "Nonempty translations: api_connected",
+    "Format-argument parity: support_handle",
+    "Nonempty translations: support_handle",
+    "Format-argument parity: premium_feature_support",
+    "Nonempty translations: premium_feature_support",
+    "Format-argument parity: total_all_time",
+    "Nonempty translations: total_all_time",
+    "Format-argument parity: mascot_style",
+    "Nonempty translations: mascot_style",
+    "Format-argument parity: import_package_warning",
+    "Nonempty translations: import_package_warning",
+    "Format-argument parity: bank_enabled",
+    "Nonempty translations: bank_enabled",
+    "Format-argument parity: voice_reply_opening_entry",
+    "Nonempty translations: voice_reply_opening_entry",
+    "Format-argument parity: color_apply",
+    "Nonempty translations: color_apply",
+    "Format-argument parity: support_network_error",
+    "Nonempty translations: support_network_error",
+    "Format-argument parity: unlock_biometric",
+    "Nonempty translations: unlock_biometric",
+    "Format-argument parity: diagnostics_show_button",
+    "Nonempty translations: diagnostics_show_button",
+    "Format-argument parity: privat_api_site",
+    "Nonempty translations: privat_api_site",
+    "Format-argument parity: rates_as_of",
+    "Nonempty translations: rates_as_of",
+    "Format-argument parity: help_security_body",
+    "Nonempty translations: help_security_body",
+    "Format-argument parity: premium_source_trial",
+    "Nonempty translations: premium_source_trial",
+    "Format-argument parity: api_token_label",
+    "Nonempty translations: api_token_label",
+    "Format-argument parity: cat_locked_hint",
+    "Nonempty translations: cat_locked_hint",
+    "Format-argument parity: search_entries",
+    "Nonempty translations: search_entries",
+    "Format-argument parity: refreshing",
+    "Nonempty translations: refreshing",
+    "Format-argument parity: security",
+    "Nonempty translations: security",
+    "Format-argument parity: support",
+    "Nonempty translations: support",
+    "Format-argument parity: auto_lock_explanation",
+    "Nonempty translations: auto_lock_explanation",
+    "Format-argument parity: bank_source",
+    "Nonempty translations: bank_source",
+    "Format-argument parity: app_name",
+    "Nonempty translations: app_name",
+    "Format-argument parity: pay_source_title",
+    "Nonempty translations: pay_source_title",
+    "Format-argument parity: security_error",
+    "Nonempty translations: security_error",
+    "Format-argument parity: keep_editing",
+    "Nonempty translations: keep_editing",
+    "Format-argument parity: import_mode_title",
+    "Nonempty translations: import_mode_title",
+    "Format-argument parity: start_over",
+    "Nonempty translations: start_over",
+    "Format-argument parity: import_mode_api",
+    "Nonempty translations: import_mode_api",
+    "Format-argument parity: amount_invalid",
+    "Nonempty translations: amount_invalid",
+    "Format-argument parity: cinematic_less_than_previous",
+    "Nonempty translations: cinematic_less_than_previous",
+    "Format-argument parity: bank_budget_disable",
+    "Nonempty translations: bank_budget_disable",
+    "Format-argument parity: voice_assistant_listening",
+    "Nonempty translations: voice_assistant_listening",
+    "Format-argument parity: privat_api_connected",
+    "Nonempty translations: privat_api_connected",
+    "Format-argument parity: mascot_hear_again",
+    "Nonempty translations: mascot_hear_again",
+    "Format-argument parity: cinematic_more",
+    "Nonempty translations: cinematic_more",
+    "Format-argument parity: premium_assistant_toggle",
+    "Nonempty translations: premium_assistant_toggle",
+    "Format-argument parity: refresh_rates",
+    "Nonempty translations: refresh_rates",
+    "Format-argument parity: voice_reply_spent_today",
+    "Nonempty translations: voice_reply_spent_today",
+    "Format-argument parity: biometric_unlock",
+    "Nonempty translations: biometric_unlock",
+    "Format-argument parity: colors_explanation",
+    "Nonempty translations: colors_explanation",
+    "Format-argument parity: billing_activation_code",
+    "Nonempty translations: billing_activation_code",
+    "Format-argument parity: voice_recognizer_unavailable",
+    "Nonempty translations: voice_recognizer_unavailable",
+    "Format-argument parity: bank_duplicate",
+    "Nonempty translations: bank_duplicate",
+    "Format-argument parity: colors_categories",
+    "Nonempty translations: colors_categories",
+    "Format-argument parity: voice_smalltalk_bye",
+    "Nonempty translations: voice_smalltalk_bye",
+    "Format-argument parity: entry_currency_notice",
+    "Nonempty translations: entry_currency_notice",
+    "Format-argument parity: delete_entry",
+    "Nonempty translations: delete_entry",
+    "Format-argument parity: import_waiting",
+    "Nonempty translations: import_waiting",
+    "Format-argument parity: reference_rates",
+    "Nonempty translations: reference_rates",
+    "Format-argument parity: color_hue",
+    "Nonempty translations: color_hue",
+    "Format-argument parity: activation_code_hint",
+    "Nonempty translations: activation_code_hint",
+    "Format-argument parity: premium_feature_trends",
+    "Nonempty translations: premium_feature_trends",
+    "Format-argument parity: appearance",
+    "Nonempty translations: appearance",
+    "Format-argument parity: fps_explanation",
+    "Nonempty translations: fps_explanation",
+    "Format-argument parity: brand_copyright",
+    "Nonempty translations: brand_copyright",
+    "Format-argument parity: bank_clear_warning",
+    "Nonempty translations: bank_clear_warning",
+    "Format-argument parity: import_connected",
+    "Nonempty translations: import_connected",
+    "Format-argument parity: no_matches",
+    "Nonempty translations: no_matches",
+    "Format-argument parity: assistant_text_hint",
+    "Nonempty translations: assistant_text_hint",
+    "Format-argument parity: installation_id_copied",
+    "Nonempty translations: installation_id_copied",
+    "Format-argument parity: color_error",
+    "Nonempty translations: color_error",
+    "Format-argument parity: mascot_animations",
+    "Nonempty translations: mascot_animations",
+    "Format-argument parity: total_balance",
+    "Nonempty translations: total_balance",
+    "Format-argument parity: cinematic_history",
+    "Nonempty translations: cinematic_history",
+    "Format-argument parity: api_connect",
+    "Nonempty translations: api_connect",
+    "Format-argument parity: import_package_settings",
+    "Nonempty translations: import_package_settings",
+    "Format-argument parity: dashboard_subtitle",
+    "Nonempty translations: dashboard_subtitle",
+    "Format-argument parity: bank_recent",
+    "Nonempty translations: bank_recent",
+    "Format-argument parity: all_categories",
+    "Nonempty translations: all_categories",
+    "Format-argument parity: voice_assistant_button",
+    "Nonempty translations: voice_assistant_button",
+    "Format-argument parity: done",
+    "Nonempty translations: done",
+    "Format-argument parity: categories",
+    "Nonempty translations: categories",
+    "Format-argument parity: import_manual_privacy",
+    "Nonempty translations: import_manual_privacy",
+    "Format-argument parity: fps_auto",
+    "Nonempty translations: fps_auto",
+    "Format-argument parity: developer_purchase_title",
+    "Nonempty translations: developer_purchase_title",
+    "Format-argument parity: activation_code_label",
+    "Nonempty translations: activation_code_label",
+    "Format-argument parity: help_security_title",
+    "Nonempty translations: help_security_title",
+    "Format-argument parity: import_auto_done",
+    "Nonempty translations: import_auto_done",
+    "Format-argument parity: premium_assistant_toggle_hint",
+    "Nonempty translations: premium_assistant_toggle_hint",
+    "Format-argument parity: cinematic_more_buckets",
+    "Nonempty translations: cinematic_more_buckets",
+    "Format-argument parity: colors_reset_all",
+    "Nonempty translations: colors_reset_all",
+    "Format-argument parity: bank_week",
+    "Nonempty translations: bank_week",
+    "Format-argument parity: developer_purchase_button",
+    "Nonempty translations: developer_purchase_button",
+    "Format-argument parity: bank_month",
+    "Nonempty translations: bank_month",
+    "Format-argument parity: profile",
+    "Nonempty translations: profile",
+    "Format-argument parity: settings",
+    "Nonempty translations: settings",
+    "Format-argument parity: negative_amount",
+    "Nonempty translations: negative_amount",
+    "Format-argument parity: pin_recovery_notice",
+    "Nonempty translations: pin_recovery_notice",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "No NUL bytes: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "No implementation markers: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "Resolved app string: all_time",
+    "Resolved app string: cinematic_period",
+    "Resolved app string: all_time",
+    "Resolved app string: cinematic_apply",
+    "Resolved app string: back",
+    "Resolved app string: back",
+    "Resolved app string: cinematic_history",
+    "Resolved app string: analytics_title",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: retry",
+    "Resolved app string: cinematic_expenses_period",
+    "Resolved app string: cinematic_comparison",
+    "Resolved app string: cinematic_more_than_previous",
+    "Resolved app string: cinematic_less_than_previous",
+    "Resolved app string: cinematic_month_average",
+    "Resolved app string: cinematic_week_average",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_more",
+    "Resolved app string: category_empty",
+    "Resolved app string: back",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: reference_total_for",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: all_categories",
+    "Resolved app string: cinematic_transactions",
+    "Resolved app string: category_empty",
+    "Resolved app string: load_more",
+    "Resolved app string: category_transaction_count",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "Resolved app string: cinematic_chart_accessibility",
+    "Resolved app string: cinematic_tooltip",
+    "Resolved app string: cinematic_more_buckets",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: category_empty",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "Resolved app string: entry_deleted",
+    "Resolved app string: undo",
+    "Resolved app string: storage_error",
+    "Resolved app string: app_name",
+    "Resolved app string: add_entry",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: income",
+    "Resolved app string: expense",
+    "Resolved app string: voice_entry_added",
+    "Resolved app string: voice_ask_source",
+    "Resolved app string: bank_card",
+    "Resolved app string: bank_cash",
+    "Resolved app string: cancel",
+    "Resolved app string: voice_reply_balance",
+    "Resolved app string: period_today",
+    "Resolved app string: last_7_days",
+    "Resolved app string: period_month",
+    "Resolved app string: period_year",
+    "Resolved app string: all_time",
+    "Resolved app string: all_categories",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: voice_statistics",
+    "Resolved app string: voice_ask_source",
+    "Resolved app string: voice_reply_balance",
+    "Resolved app string: voice_reply_spent_today",
+    "Resolved app string: voice_reply_opening_entry",
+    "Resolved app string: voice_reply_not_understood",
+    "Resolved app string: voice_reply_not_understood",
+    "Resolved app string: voice_permission_denied",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: retry",
+    "Resolved app string: dashboard_heading",
+    "Resolved app string: greeting",
+    "Resolved app string: dashboard_subtitle",
+    "Resolved app string: activity",
+    "Resolved app string: search_entries",
+    "Resolved app string: clear_search",
+    "Resolved app string: all",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: search_scope",
+    "Resolved app string: no_matches",
+    "Resolved app string: empty_ledger_title",
+    "Resolved app string: no_matches_body",
+    "Resolved app string: empty_ledger_body",
+    "Resolved app string: clear_filters",
+    "Resolved app string: add_first_entry",
+    "Resolved app string: delete_entry",
+    "Resolved app string: load_more",
+    "Resolved app string: voice_smalltalk_greeting",
+    "Resolved app string: voice_smalltalk_how_are_you",
+    "Resolved app string: voice_smalltalk_thanks",
+    "Resolved app string: voice_smalltalk_who_are_you",
+    "Resolved app string: voice_smalltalk_bye",
+    "Resolved app string: voice_smalltalk_compliment",
+    "Resolved app string: voice_smalltalk_joke",
+    "Resolved app string: total_balance",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: total_balance",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: positive_amount",
+    "Resolved app string: negative_amount",
+    "Resolved app string: delete_named_entry",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_more",
+    "Resolved app string: category_empty",
+    "Resolved app string: all_time",
+    "Resolved app string: last_30_days",
+    "Resolved app string: last_7_days",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: back",
+    "Resolved app string: last_7_days",
+    "Resolved app string: last_30_days",
+    "Resolved app string: all_time",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: total_all_time",
+    "Resolved app string: total_thirty_days",
+    "Resolved app string: total_seven_days",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: category_transaction_count",
+    "Resolved app string: category_transaction_count",
+    "Resolved app string: load_more",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "Resolved app string: all_time",
+    "Resolved app string: chart_description",
+    "Resolved app string: cash_flow",
+    "Resolved app string: last_7_days",
+    "Resolved app string: last_30_days",
+    "Resolved app string: last_30_days_plus",
+    "Resolved app string: all_time",
+    "Resolved app string: chart_empty",
+    "Resolved app string: legend_income",
+    "Resolved app string: legend_expense",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "Resolved app string: voice_assistant_button",
+    "Resolved app string: mascot_card_title",
+    "Resolved app string: cat_locked_hint",
+    "Resolved app string: voice_assistant_listening",
+    "Resolved app string: cat_tap_hint",
+    "Resolved app string: assistant_write_short",
+    "Resolved app string: assistant_text_hint",
+    "Resolved app string: assistant_send",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "Resolved app string: here_to_help",
+    "Resolved app string: support_intro",
+    "Resolved app string: lead_developer",
+    "Resolved app string: support_handle",
+    "Resolved app string: support",
+    "Resolved app string: copy_handle",
+    "Resolved app string: handle_copied",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: support_privacy",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "Resolved app string: help",
+    "Resolved app string: close",
+    "Resolved app string: help_heading",
+    "Resolved app string: help_intro",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: major_release_title",
+    "Resolved app string: major_release_body",
+    "Resolved app string: help_entries_title",
+    "Resolved app string: help_entries_body",
+    "Resolved app string: help_banks_title",
+    "Resolved app string: help_banks_body",
+    "Resolved app string: help_privacy_title",
+    "Resolved app string: help_privacy_body",
+    "Resolved app string: help_security_title",
+    "Resolved app string: help_security_body",
+    "Resolved app string: help_premium_title",
+    "Resolved app string: help_premium_body",
+    "Resolved app string: app_version",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "Resolved app string: telegram_support",
+    "Resolved app string: back",
+    "Resolved app string: support_network_error",
+    "Resolved app string: retry",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: back",
+    "Resolved app string: settings",
+    "Resolved app string: close",
+    "Resolved app string: lock_now",
+    "Resolved app string: profile",
+    "Resolved app string: local_profile",
+    "Resolved app string: display_name",
+    "Resolved app string: save_profile",
+    "Resolved app string: language",
+    "Resolved app string: language_instant",
+    "Resolved app string: language_en",
+    "Resolved app string: language_uk",
+    "Resolved app string: bank_import_title",
+    "Resolved app string: bank_consent",
+    "Resolved app string: bank_dashboard",
+    "Resolved app string: appearance",
+    "Resolved app string: theme_system",
+    "Resolved app string: theme_light",
+    "Resolved app string: theme_dark",
+    "Resolved app string: fps_title",
+    "Resolved app string: fps_explanation",
+    "Resolved app string: fps_auto",
+    "Resolved app string: fps_value",
+    "Resolved app string: fps_supported",
+    "Resolved app string: fps_fallback",
+    "Resolved app string: default_currency",
+    "Resolved app string: currency_explanation",
+    "Resolved app string: security",
+    "Resolved app string: biometric_unlock",
+    "Resolved app string: biometric_explanation",
+    "Resolved app string: biometric_unavailable",
+    "Resolved app string: auto_lock_explanation",
+    "Resolved app string: lock_now",
+    "Resolved app string: premium_name",
+    "Resolved app string: premium_body",
+    "Resolved app string: premium_feature_trends",
+    "Resolved app string: premium_feature_mascot",
+    "Resolved app string: premium_feature_support",
+    "Resolved app string: premium_active",
+    "Resolved app string: premium_source_developer",
+    "Resolved app string: premium_source_trial",
+    "Resolved app string: premium_source_play",
+    "Resolved app string: premium_expires",
+    "Resolved app string: premium_offline_notice",
+    "Resolved app string: premium_local_notice",
+    "Resolved app string: premium_assistant_toggle",
+    "Resolved app string: premium_assistant_toggle_hint",
+    "Resolved app string: premium_unlock",
+    "Resolved app string: premium_buy",
+    "Resolved app string: billing_configuration",
+    "Resolved app string: trial_explanation",
+    "Resolved app string: trial_14",
+    "Resolved app string: mascot_style",
+    "Resolved app string: mascot_gray",
+    "Resolved app string: mascot_sky",
+    "Resolved app string: mascot_animations",
+    "Resolved app string: developer_purchase_title",
+    "Resolved app string: developer_purchase_body",
+    "Resolved app string: developer_purchase_banner",
+    "Resolved app string: developer_purchase_note",
+    "Resolved app string: developer_purchase_button",
+    "Resolved app string: installation_id_label",
+    "Resolved app string: installation_id_copied",
+    "Resolved app string: installation_id_copy",
+    "Resolved app string: activation_code_label",
+    "Resolved app string: activation_code_hint",
+    "Resolved app string: activation_code_button",
+    "Resolved app string: reference_rates",
+    "Resolved app string: rates_disclaimer",
+    "Resolved app string: rates_empty",
+    "Resolved app string: rate_value",
+    "Resolved app string: rates_as_of",
+    "Resolved app string: refreshing",
+    "Resolved app string: refresh_rates",
+    "Resolved app string: support",
+    "Resolved app string: support_intro",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: diagnostics_none",
+    "Resolved app string: diagnostics_show_button",
+    "Resolved app string: diagnostics_title",
+    "Resolved app string: diagnostics_hint",
+    "Resolved app string: diagnostics_copied",
+    "Resolved app string: diagnostics_copy",
+    "Resolved app string: diagnostics_clear",
+    "Resolved app string: diagnostics_close",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "Resolved app string: colors_title",
+    "Resolved app string: colors_explanation",
+    "Resolved app string: colors_collapse",
+    "Resolved app string: colors_edit",
+    "Resolved app string: colors_categories",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: colors_reset_all",
+    "Resolved app string: color_hue",
+    "Resolved app string: color_saturation",
+    "Resolved app string: color_brightness",
+    "Resolved app string: color_invalid",
+    "Resolved app string: color_contrast_warning",
+    "Resolved app string: color_reset",
+    "Resolved app string: color_apply",
+    "Resolved app string: cancel",
+    "Resolved app string: color_accent",
+    "Resolved app string: color_background",
+    "Resolved app string: color_surface",
+    "Resolved app string: color_text",
+    "Resolved app string: color_muted",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: color_chart_top",
+    "Resolved app string: color_chart_bottom",
+    "Resolved app string: color_error",
+    "Resolved app string: color_grid",
+    "Resolved app string: color_icons",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "Resolved app string: restore_purchases",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "Resolved app string: brand_intro_title",
+    "Resolved app string: onboard_title_one",
+    "Resolved app string: onboard_title_two",
+    "Resolved app string: onboard_title_three",
+    "Resolved app string: brand_intro_body",
+    "Resolved app string: onboard_body_one",
+    "Resolved app string: onboard_body_two",
+    "Resolved app string: onboard_body_three",
+    "Resolved app string: app_name",
+    "Resolved app string: skip",
+    "Resolved app string: brand_author_signature",
+    "Resolved app string: brand_design_label",
+    "Resolved app string: brand_copyright",
+    "Resolved app string: page_of",
+    "Resolved app string: get_started",
+    "Resolved app string: next",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "Resolved app string: unlock_title",
+    "Resolved app string: confirm_pin",
+    "Resolved app string: create_pin",
+    "Resolved app string: pin_digit_count",
+    "Resolved app string: pin_setup_subtitle",
+    "Resolved app string: pin_unlock_subtitle",
+    "Resolved app string: pin_locked",
+    "Resolved app string: pin_incorrect",
+    "Resolved app string: pin_mismatch",
+    "Resolved app string: security_error",
+    "Resolved app string: biometric_failed",
+    "Resolved app string: unlock_biometric",
+    "Resolved app string: erase_digit",
+    "Resolved app string: start_over",
+    "Resolved app string: need_help",
+    "Resolved app string: pin_recovery_notice",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "Resolved app string: load_error_title",
+    "Resolved app string: security_error",
+    "Resolved app string: retry",
+    "Resolved app string: need_help",
+    "Resolved app string: biometric_title",
+    "Resolved app string: biometric_subtitle",
+    "Resolved app string: use_pin",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "Resolved app string: cinematic_history",
+    "Resolved app string: back",
+    "Resolved app string: all_time",
+    "Resolved app string: history_search",
+    "Resolved app string: all",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: storage_error",
+    "Resolved app string: category_empty",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_unknown",
+    "Resolved app string: load_more",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "Resolved app string: category_food",
+    "Resolved app string: category_transport",
+    "Resolved app string: category_home",
+    "Resolved app string: category_health",
+    "Resolved app string: category_leisure",
+    "Resolved app string: category_salary",
+    "Resolved app string: category_other",
+    "Resolved app string: category_transfer",
+    "Resolved app string: category_dining",
+    "Resolved app string: category_cashback",
+    "Resolved app string: storage_error",
+    "Resolved app string: saved",
+    "Resolved app string: entry_deleted",
+    "Resolved app string: undo_expired",
+    "Resolved app string: rate_offline",
+    "Resolved app string: biometric_unavailable",
+    "Resolved app string: name_invalid",
+    "Resolved app string: entry_not_found",
+    "Resolved app string: premium_activated",
+    "Resolved app string: activation_invalid",
+    "Resolved app string: billing_unavailable",
+    "Resolved app string: billing_configuration",
+    "Resolved app string: billing_network",
+    "Resolved app string: billing_pending",
+    "Resolved app string: billing_verification",
+    "Resolved app string: billing_acknowledgement",
+    "Resolved app string: billing_activation_code",
+    "Resolved app string: overview",
+    "Resolved app string: settings",
+    "Resolved app string: help",
+    "Resolved app string: analytics_title",
+    "Resolved app string: bank_dashboard",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "Resolved app string: edit_entry",
+    "Resolved app string: add_entry",
+    "Resolved app string: back",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: back",
+    "Resolved app string: expense",
+    "Resolved app string: income",
+    "Resolved app string: amount",
+    "Resolved app string: amount_invalid",
+    "Resolved app string: pay_source_title",
+    "Resolved app string: bank_card",
+    "Resolved app string: bank_cash",
+    "Resolved app string: pay_source_required",
+    "Resolved app string: entry_title",
+    "Resolved app string: title_optional_hint",
+    "Resolved app string: date_invalid",
+    "Resolved app string: save_entry",
+    "Resolved app string: discard_title",
+    "Resolved app string: discard_body",
+    "Resolved app string: discard",
+    "Resolved app string: keep_editing",
+    "Resolved app string: done",
+    "Resolved app string: cancel",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "Resolved app string: bank_dashboard",
+    "Resolved app string: close",
+    "Resolved app string: add_entry",
+    "Resolved app string: storage_error",
+    "Resolved app string: bank_setup",
+    "Resolved app string: bank_import_title",
+    "Resolved app string: bank_consent",
+    "Resolved app string: bank_enabled",
+    "Resolved app string: bank_auto",
+    "Resolved app string: import_mode_title",
+    "Resolved app string: import_mode_notify",
+    "Resolved app string: import_mode_api",
+    "Resolved app string: import_mode_sms",
+    "Resolved app string: api_howto",
+    "Resolved app string: api_open_site",
+    "Resolved app string: api_token_label",
+    "Resolved app string: api_connecting",
+    "Resolved app string: api_connect",
+    "Resolved app string: api_connected",
+    "Resolved app string: api_last_sync",
+    "Resolved app string: api_imported_last",
+    "Resolved app string: api_syncing",
+    "Resolved app string: api_sync_now",
+    "Resolved app string: api_disconnect",
+    "Resolved app string: api_error_bad_token",
+    "Resolved app string: api_error_rate",
+    "Resolved app string: api_error_no_accounts",
+    "Resolved app string: api_error_network",
+    "Resolved app string: privat_api_title",
+    "Resolved app string: privat_api_howto",
+    "Resolved app string: privat_api_site",
+    "Resolved app string: privat_api_token",
+    "Resolved app string: api_connecting",
+    "Resolved app string: api_connect",
+    "Resolved app string: privat_api_connected",
+    "Resolved app string: api_last_sync",
+    "Resolved app string: api_sync_now",
+    "Resolved app string: api_disconnect",
+    "Resolved app string: privat_api_error",
+    "Resolved app string: other_api_note",
+    "Resolved app string: sms_howto",
+    "Resolved app string: bank_sms_yes",
+    "Resolved app string: bank_sms_no",
+    "Resolved app string: bank_sms_permission",
+    "Resolved app string: sms_scanning",
+    "Resolved app string: sms_scan",
+    "Resolved app string: bank_sms_no",
+    "Resolved app string: sms_scan_result",
+    "Resolved app string: sms_restricted_tip",
+    "Resolved app string: push_howto",
+    "Resolved app string: bank_access_yes",
+    "Resolved app string: bank_access_no",
+    "Resolved app string: bank_notification_permission",
+    "Resolved app string: bank_app_permissions",
+    "Resolved app string: bank_battery",
+    "Resolved app string: import_confirm_permission",
+    "Resolved app string: import_confirm_enabled",
+    "Resolved app string: bank_privacy",
+    "Resolved app string: import_diagnostics",
+    "Resolved app string: import_connected",
+    "Resolved app string: import_disconnected",
+    "Resolved app string: import_counts",
+    "Resolved app string: import_reconnect",
+    "Resolved app string: import_package_settings",
+    "Resolved app string: import_paste",
+    "Resolved app string: import_queue_note",
+    "Resolved app string: bank_day",
+    "Resolved app string: bank_week",
+    "Resolved app string: bank_month",
+    "Resolved app string: all_time",
+    "Resolved app string: expenses",
+    "Resolved app string: all",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_unknown",
+    "Resolved app string: bank_budget_progress",
+    "Resolved app string: bank_category_stats",
+    "Resolved app string: bank_new_category",
+    "Resolved app string: bank_review_count",
+    "Resolved app string: bank_time_received",
+    "Resolved app string: bank_transfer_review",
+    "Resolved app string: bank_duplicate",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: bank_ignore",
+    "Resolved app string: bank_recent",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_limit_recent",
+    "Resolved app string: bank_budget",
+    "Resolved app string: save_entry",
+    "Resolved app string: bank_budget_disable",
+    "Resolved app string: bank_export",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: import_paste",
+    "Resolved app string: import_text",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: import_unrecognized",
+    "Resolved app string: import_manual_privacy",
+    "Resolved app string: import_to_queue",
+    "Resolved app string: cancel",
+    "Resolved app string: import_package_settings",
+    "Resolved app string: import_package_warning",
+    "Resolved app string: save_entry",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_new_category",
+    "Resolved app string: category",
+    "Resolved app string: save_entry",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: bank_clear_warning",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_privacy",
+    "Resolved app string: bank_privacy_body",
+    "Resolved app string: done",
+    "Resolved app string: import_disabled",
+    "Resolved app string: import_unsupported",
+    "Resolved app string: import_empty",
+    "Resolved app string: import_group",
+    "Resolved app string: import_unrecognized",
+    "Resolved app string: import_auto_done",
+    "Resolved app string: import_queued",
+    "Resolved app string: bank_duplicate",
+    "Resolved app string: import_repeated",
+    "Resolved app string: storage_error",
+    "Resolved app string: import_waiting",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "No NUL bytes: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No implementation markers: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "Lexically balanced Kotlin delimiters: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "No NUL bytes: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No implementation markers: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "Lexically balanced Kotlin delimiters: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "Actual SQL: sums keep currencies separate",
+    "Actual SQL: normalized Ukrainian search",
+    "Actual SQL: literal percent search",
+    "Actual SQL: bound input cannot change query structure",
+    "Actual SQL: type filter",
+    "Actual SQL: stable creation ordering and limit",
+    "Actual SQL: first delete succeeds",
+    "Actual SQL: repeated delete is idempotent",
+    "Actual SQL: deleted entries are hidden",
+    "Actual SQL: stale undo token is rejected",
+    "Actual SQL: exact undo token restores entry",
+    "Actual SQL: old tombstone is purged",
+    "Actual SQL: date-window aggregation excludes deletions",
+    "Android cloud backup disabled",
+    "Cleartext traffic disabled",
+    "Support WebView is non-exported",
+    "Unicode normalization implemented in repository",
+    "Requested v7 flavor included",
+    "Current-submission v8 flavor included",
+    "Android 16 target configured",
+    "No destructive migration fallback"
+  ]
+}
+```
+
+## verification/upgrade-sql.json
+
+```json
+{
+  "kind": "exact-Room-SQL-in-SQLite",
+  "passed": 14,
+  "checks": [
+    "Calendar month: exact food sum across more than 50 records",
+    "Calendar month: all expense categories",
+    "Income excludes expenses",
+    "All-time includes earlier years and excludes deleted/future/currency",
+    "Empty category returns zero",
+    "Category pagination initial window plus sentinel",
+    "Load more obtains every category transaction",
+    "Transaction details retained",
+    "Seven-day details share exact seven-day bounds",
+    "Category header uses full dataset rather than current page",
+    "Assistant statistics exclude newly deleted entries",
+    "Undo restores aggregate",
+    "Income/expense counts remain separate inside one category",
+    "Combined category detail count remains backwards compatible"
+  ],
+  "compiled_android": false,
+  "executed_junit": false
+}
+```
+
+## verification/voice-regex-jvm.json
+
+```json
+{
+  "kind": "exact-source-regex-on-JVM",
+  "passed": 7,
+  "compiled_kotlin": false,
+  "compiled_android": false,
+  "output": "JVM monetary-regex checks passed: 7"
+}
+```

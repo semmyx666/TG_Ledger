@@ -4,10 +4,10 @@ from pathlib import Path
 import json
 R=Path(__file__).resolve().parents[1]
 A=R/'app/src/main/kotlin/com/semmyx/ledger'
-root=(A/'presentation/AppRoot.kt').read_text()
-analytics=(A/'presentation/analytics/AnalyticsScreen.kt').read_text()
-bank=(A/'presentation/bank/BankScreen.kt').read_text()
-repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/repository/BankImportRepository.kt').read_text()
+root=(A/'navigation/AppRoot.kt').read_text()
+analytics=(A/'analytics/AnalyticsScreen.kt').read_text()
+bank=(A/'bank/BankScreen.kt').read_text()
+repo=(R/'data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt').read_text()
 checks=[]
 def check(condition,label):
  assert condition,label

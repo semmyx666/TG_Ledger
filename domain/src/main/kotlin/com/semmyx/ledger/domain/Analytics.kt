@@ -11,7 +11,9 @@ object FinanceWindow {
 }
 
 object TrialPolicy {
-    fun validDays(days: Int) = days == 7 || days == 14
+    /** One trial only: 14 days. */
+    const val DAYS = 14
+    fun validDays(days: Int) = days == DAYS
     fun active(start: Long, end: Long, now: Long, lastSeen: Long): Boolean =
         start > 0 && end > start && now >= start && now >= lastSeen && now < end
 }

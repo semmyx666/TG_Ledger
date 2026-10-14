@@ -1,6 +1,7 @@
 name: Android validation
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -14,6 +15,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
@@ -23,6 +26,10 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks
+          path: app/build/outputs/apk/*/debug/*.apk
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -44,6 +51,8 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - uses: gradle/actions/setup-gradle@v4
       - name: Enable emulator acceleration
         run: |
@@ -57,9 +66,11 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: chmod +x gradlew && ./gradlew :data:connectedPlayDebugAndroidTest :app:connectedPlayDebugAndroidTest --stacktrace
+          script: bash tools/run_device_tests.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: device-reports-api-${{ matrix.api }}
-          path: '**/build/reports/androidTests/'
+          path: |
+            **/build/reports/androidTests/
+            verification/device-screenshots/
