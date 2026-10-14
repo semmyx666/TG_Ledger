@@ -55,10 +55,9 @@ class BankScreenLayoutTest {
         compose.runOnIdle { assertEquals(1,requests); assertEquals("DAY",model.state.value.filter.period) }
         compose.onNodeWithTag("bankPeriod:MONTH").performClick()
         compose.runOnIdle { assertEquals(2,requests) }
-        val file = File(app.getExternalFilesDir(null),"screenshots/bank-320dp-font140-uk.png").also { it.parentFile!!.mkdirs() }
-        file.outputStream().use { compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it) }
+        NativeScreenshots.save(compose.onRoot().captureToImage(),"bank-320dp-font140-uk")
         compose.onNodeWithTag("bankSetup").performClick()
         compose.onNodeWithTag("bankList").performScrollToNode(hasText("Push банку (рекомендовано)"))
-        compose.onNodeWithText("Push банку (рекомендовано)").assertIsDisplayed()
+        compose.onNodeWithText("Push банку (рекомендовано)").performScrollTo().assertIsDisplayed()
     }
 }

@@ -22,11 +22,7 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class CompactLayoutTest {
     @get:Rule val compose = createComposeRule()
-    private fun screenshot(name: String) {
-        val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
-        val file = File(app.getExternalFilesDir(null), "screenshots/$name.png").also { it.parentFile!!.mkdirs() }
-        file.outputStream().use { compose.onRoot().captureToImage().asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it) }
-    }
+    private fun screenshot(name: String) { NativeScreenshots.save(compose.onRoot().captureToImage(),name) }
     private fun content(width: Dp, fontScale: Float) {
         compose.setContent {
             LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
@@ -64,7 +60,7 @@ class CompactLayoutTest {
         val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
         compose.onNodeWithText("Відновити покупки",useUnmergedTree=true)
             .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
-        assertFalse(layouts.any { it.hasVisualOverflow })
+        assertFalse("Restore overflow: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
         assertTrue(layouts.all { it.lineCount <= 2 })
         screenshot("compact-320dp-font170-uk")
     }

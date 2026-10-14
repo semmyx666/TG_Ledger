@@ -3,7 +3,7 @@
 set -eu
 collect_screenshots() {
     mkdir -p verification/device-screenshots
-    adb pull /sdcard/Android/data/com.semmyx.ledger.debug/files/screenshots/. verification/device-screenshots/ || true
+    adb pull /data/local/tmp/tg-ledger-screenshots/. verification/device-screenshots/ || true
 }
 trap collect_screenshots EXIT
 chmod +x gradlew
