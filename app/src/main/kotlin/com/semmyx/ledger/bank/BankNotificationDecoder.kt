@@ -1,6 +1,7 @@
 package com.semmyx.ledger.bank
 
 import android.app.Notification
+import androidx.core.app.NotificationCompat
 import com.semmyx.ledger.domain.bank.Bank
 import com.semmyx.ledger.domain.bank.BankParser
 
@@ -14,7 +15,7 @@ object BankNotificationDecoder {
         val at = notification.`when`.takeIf { it in 1..(postedAt + 300_000) } ?: postedAt
         val title = (extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
             ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString()?.trim().orEmpty()
-        val messaging = runCatching { Notification.MessagingStyle.extractMessagingStyleFromNotification(notification)?.messages }.getOrNull().orEmpty()
+        val messaging = runCatching { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)?.messages }.getOrNull().orEmpty()
         if (messaging.isNotEmpty()) return messaging.mapNotNull { message ->
             val text = message.text?.toString()?.trim().orEmpty()
             if (text.isEmpty()) null else Message("$title\n$text", message.timestamp.takeIf { it in 1..(postedAt + 300_000) } ?: at)

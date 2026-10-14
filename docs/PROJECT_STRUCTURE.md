@@ -1,3 +1,14 @@
+# Оновлення структури 3.3.3
+
+- `bank-fixture/` — окремий QA-застосунок для CI; не частина релізного APK.
+- `app/.../bank/BankNotificationDecoder.kt` — окремі повідомлення зі стилів BigText, Inbox та Messaging.
+- `domain/.../bank/BankPeriodAccess.kt` — перевірка доступу до банківських періодів.
+- `data/.../bank/PrivatBankClient.kt` — read-only Автоклієнт Приват24 для бізнесу/ФОП.
+- `app/.../settings/RestorePurchasesAction.kt` — адаптивна кнопка відновлення покупок.
+- Поточна інструкція: `BANKS_3.3.3_RU.md`. Історичний опис нижче може описувати попередні режими за замовчуванням.
+
+---
+
 # Карта проекта (где что лежит)
 
 Корневой пакет: `com.semmyx.ledger`. Три Gradle-модуля: `app` (экраны и Android), `domain` (чистая логика), `data` (база, сеть, безопасность, платежи).

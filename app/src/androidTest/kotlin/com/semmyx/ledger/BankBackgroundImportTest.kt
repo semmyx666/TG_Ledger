@@ -6,6 +6,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.semmyx.ledger.bank.BankNotificationListener
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
 import org.junit.After
 import org.junit.Assert.*
 import org.junit.Before
@@ -71,6 +72,14 @@ class BankBackgroundImportTest {
         shell("cmd notification allow_listener $listener")
         assertTrue("Active notification not replayed: ${repo.diagnostics.value.lastCode}", waitFor { entries().any { it.amountMinor == 33445L } })
         assertEquals(at, entries().first { it.amountMinor == 33445L }.eventAtMillis)
+    }
+    @Test fun equalAmountSeparatePaymentIsRetainedForReviewInsteadOfDropped() {
+        val at = System.currentTimeMillis()
+        post(10, 77889, at)
+        assertTrue(waitFor { entries().any { it.amountMinor == 77889L } })
+        post(11, 77889, at + 1000)
+        assertTrue(waitFor { runBlocking { repo.reviews().first().any { it.amountMinor == 77889L && it.status == "DUPLICATE_REVIEW" } } })
+        assertEquals(1, entries().count { it.amountMinor == 77889L })
     }
     @Test fun inboxStyleContainsTwoSeparatePayments() {
         post(3, 44556, System.currentTimeMillis(), "inbox")
