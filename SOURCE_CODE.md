@@ -1,9 +1,8 @@
-# TG Ledger 3.3.2 — complete file-by-file source
+# TG Ledger 3.3.3 — complete file-by-file source
 
-138 implementation, configuration and test files, included without truncation.
+166 implementation, configuration and test files, without truncation.
 
-The same files are editable at the paths below. Build instructions, architectural notes, visual references and verification limitations are in README.md and docs/.
-
+Generated from tracked files. Local keys and build outputs are excluded.
 
 ## .github/workflows/android.yml
 
@@ -11,6 +10,7 @@ The same files are editable at the paths below. Build instructions, architectura
 name: Android validation
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read
@@ -75,34 +75,14 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: chmod +x gradlew && ./gradlew :data:connectedPlayDebugAndroidTest :app:connectedPlayDebugAndroidTest --stacktrace
+          script: bash tools/run_device_tests.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: device-reports-api-${{ matrix.api }}
-          path: '**/build/reports/androidTests/'
-```
-
-## .gitignore
-
-```text
-.gradle/
-.kotlin/
-.idea/
-**/build/
-local.properties
-secrets.properties
-*.jks
-*.keystore
-*.pem
-tools/developer_private_key.pem
-tools/developer_public_key.der
-.DS_Store
-verification/local-*
-gradle/wrapper/gradle-wrapper.jar
-
-__pycache__/
-*.pyc
+          path: |
+            **/build/reports/androidTests/
+            verification/device-screenshots/
 ```
 
 ## app/build.gradle.kts
@@ -128,8 +108,8 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "3.3.2"
+        versionCode = 17
+        versionName = "3.3.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
@@ -213,14 +193,6 @@ dependencies {
 }
 ```
 
-## app/proguard-rules.pro
-
-```text
-# Retrofit / Gson consumer rules come from the data module and their libraries.
-# Room and Compose ship their own shrinker rules. Do not globally keep the app.
--keepattributes Signature,InnerClasses,EnclosingMethod
-```
-
 ## app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt
 
 ```kotlin
@@ -230,71 +202,282 @@ import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import com.semmyx.ledger.bank.BankNotificationListener
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.first
 import org.junit.After
 import org.junit.Assert.*
-import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 
-/**
- * End-to-end test of the real background path: a notification posted by another app is read by the
- * system-bound [com.semmyx.ledger.bank.BankNotificationListener] while no Activity is on screen, parsed and
- * written to the ledger. "com.android.shell" plays the role of the bank app (its package is mapped to monobank).
- */
+/** Real Android listener + another installed app + Room. No open ledger Activity. API 26 and 36. */
 @RunWith(AndroidJUnit4::class)
 class BankBackgroundImportTest {
     private val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
     private val repo get() = app.container.bankImport
     private val automation get() = InstrumentationRegistry.getInstrumentation().uiAutomation
     private val listener get() = "${app.packageName}/com.semmyx.ledger.bank.BankNotificationListener"
-
-    private fun shell(command: String): String {
-        val fd = automation.executeShellCommand(command)
-        return ParcelFileDescriptor.AutoCloseInputStream(fd).use { it.readBytes().toString(Charsets.UTF_8) }
-    }
-
-    private fun waitFor(timeoutMs: Long, check: () -> Boolean): Boolean {
+    private val fixture = "com.semmyx.ledger.bankfixture/.FixtureReceiver"
+    private fun shell(command: String): String = ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(command))
+        .use { it.readBytes().toString(Charsets.UTF_8) }
+    private fun waitFor(timeoutMs: Long = 30_000, check: () -> Boolean): Boolean {
         val end = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < end) { if (check()) return true; Thread.sleep(500) }
+        while (System.currentTimeMillis() < end) { if (check()) return true; Thread.sleep(250) }
         return check()
     }
-
-    private fun entries() = runBlocking { repo.exportEntries() }
-
-    @Before fun setUp() {
-        repo.enabled = true
-        repo.autoImport = true
-        repo.importMode = "NOTIFY"
-        repo.setPackage("mono", "com.android.shell")
-        shell("cmd notification allow_listener $listener")
-        val current = shell("settings get secure enabled_notification_listeners").trim()
-        if (!current.contains(listener)) {
-            shell("settings put secure enabled_notification_listeners ${if (current.isBlank() || current == "null") listener else "$current:$listener"}")
-        }
-        assertTrue("Notification listener did not bind", waitFor(30_000) { repo.diagnostics.value.connected })
+    private fun listenerAccess(enabled: Boolean) {
+        shell("cmd notification ${if (enabled) "allow_listener" else "disallow_listener"} $listener")
+        // Android 8 does not implement these cmd notification subcommands. Use the same
+        // secure setting that its notification-access Settings screen writes, via shell.
+        val existing = shell("settings get secure enabled_notification_listeners").trim()
+            .takeUnless { it == "null" }.orEmpty().split(':').filter { it.isNotBlank() }.toMutableSet()
+        if (enabled) existing.add(listener) else existing.remove(listener)
+        if (existing.isEmpty()) shell("settings delete secure enabled_notification_listeners")
+        else shell("settings put secure enabled_notification_listeners ${existing.joinToString(":")}")
+        if (enabled) android.service.notification.NotificationListenerService.requestRebind(android.content.ComponentName(app,BankNotificationListener::class.java))
     }
-
-    @After fun tearDown() { repo.setPackage("mono", "com.ftband.mono"); repo.importMode = "SMS" }
-
-    @Test fun bankPushIsImportedInBackgroundAndRepeatIsIgnored() {
-        // No spaces: UiAutomation tokenises the command line without quote handling.
-        val probe = shell("cmd notification post -t Probe probe_tag probe_text")
-        assumeTrue("cmd notification post unsupported on this API: $probe", probe.isNotBlank() && !probe.contains("Unknown", true) && !probe.contains("Exception", true))
-
-        shell("cmd notification post -t Сільпо bank_a −125,50₴|Залишок:1000,00₴")
-        assertTrue("Bank push was not imported in the background; last=${repo.diagnostics.value.lastCode}",
-            waitFor(30_000) { entries().any { it.amountMinor == 12550L } })
+    private fun entries() = runBlocking { repo.exportEntries() }
+    private fun post(id: Int, cents: Int, at: Long, style: String = "big") {
+        val response = shell("am broadcast --receiver-foreground -n $fixture --ei id $id --ei cents $cents --el at $at --es style $style")
+        assertFalse("Fixture failed: $response", response.contains("Exception"))
+    }
+    @Before fun setUp() {
+        assertTrue("Install bank-fixture APK first", shell("pm path com.semmyx.ledger.bankfixture").contains("package:"))
+        repo.enabled = true; repo.autoImport = true; repo.importMode = "NOTIFY"
+        repo.setPackage("mono", "com.semmyx.ledger.bankfixture")
+        runBlocking {
+            repo.clearHistory()
+            entries().filter { it.origin == "PUSH" }.forEach { app.container.entries.delete(it.id) }
+        }
+        shell("am broadcast -n $fixture --ez cancel true")
+        listenerAccess(true)
+        assertTrue("Listener did not bind", waitFor { repo.diagnostics.value.connected })
+    }
+    @After fun tearDown() {
+        shell("am broadcast -n $fixture --ez cancel true")
+        repo.setPackage("mono", "com.ftband.mono"); repo.importMode = "NOTIFY"
+    }
+    @Test fun pushIsImportedWithoutAnActivityAndExactReplayIsIdempotent() {
+        val at = System.currentTimeMillis()
+        post(1, 12550, at)
+        assertTrue("No background import: ${repo.diagnostics.value.lastCode}", waitFor { entries().any { it.amountMinor == 12550L } })
         val imported = entries().first { it.amountMinor == 12550L }
-        assertEquals("Сільпо", imported.title)
         assertEquals(com.semmyx.ledger.domain.EntryType.EXPENSE, imported.type)
         assertEquals(com.semmyx.ledger.domain.Category.FOOD, imported.category)
-
-        // The same push delivered again must not create a second entry.
-        shell("cmd notification post -t Сільпо bank_b −125,50₴|Залишок:1000,00₴")
-        Thread.sleep(5_000)
+        post(1, 12550, at)
+        Thread.sleep(1500)
+        BankNotificationListener.replayIfConnected()
+        Thread.sleep(1500)
         assertEquals(1, entries().count { it.amountMinor == 12550L })
+    }
+    @Test fun twoMinuteOldPushIsRecoveredWhenListenerReconnects() {
+        listenerAccess(false)
+        assertTrue("Listener did not disconnect", waitFor { !repo.diagnostics.value.connected })
+        val at = System.currentTimeMillis() - 120_000
+        post(2, 33445, at)
+        Thread.sleep(800)
+        assertFalse(entries().any { it.amountMinor == 33445L })
+        listenerAccess(true)
+        assertTrue("Active notification not replayed: ${repo.diagnostics.value.lastCode}", waitFor { entries().any { it.amountMinor == 33445L } })
+        assertEquals(at, entries().first { it.amountMinor == 33445L }.eventAtMillis)
+    }
+    @Test fun equalAmountSeparatePaymentIsRetainedForReviewInsteadOfDropped() {
+        val at = System.currentTimeMillis()
+        post(10, 77889, at)
+        assertTrue(waitFor { entries().any { it.amountMinor == 77889L } })
+        post(11, 77889, at + 1000)
+        assertTrue(waitFor { runBlocking { repo.reviews().first().any { it.amountMinor == 77889L && it.status == "DUPLICATE_REVIEW" } } })
+        assertEquals(1, entries().count { it.amountMinor == 77889L })
+    }
+    @Test fun inboxStyleContainsTwoSeparatePayments() {
+        post(3, 44556, System.currentTimeMillis(), "inbox")
+        assertTrue(waitFor { entries().any { it.amountMinor == 44556L } && entries().any { it.amountMinor == 1122L } })
+    }
+    @Test fun messagesStyleWorksWithoutSmsOrApiToken() {
+        post(4, 55667, System.currentTimeMillis(), "messaging")
+        assertTrue(waitFor { entries().any { it.amountMinor == 55667L } })
+    }
+    @Test fun switchingBackToPushReplaysWhileListenerIsAlreadyConnected() {
+        repo.importMode = "API"
+        post(5, 66778, System.currentTimeMillis())
+        Thread.sleep(800)
+        assertFalse(entries().any { it.amountMinor == 66778L })
+        repo.importMode = "NOTIFY"
+        assertTrue(BankNotificationListener.replayIfConnected())
+        assertTrue(waitFor { entries().any { it.amountMinor == 66778L } })
+    }
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.compose.foundation.layout.*
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.lifecycle.ViewModelStore
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.bank.*
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.theme.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import java.io.File
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class BankScreenLayoutTest {
+    @get:Rule val compose = createComposeRule()
+    private val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+    private val owner = ViewModelStore()
+    @After fun cleanup() { compose.runOnUiThread { owner.clear() } }
+    @Test fun bankPeriodsOpenPremiumAndCompactScreenStaysReadable() {
+        val access = object : PremiumRepository {
+            override val state = MutableStateFlow(PremiumState())
+            override suspend fun refresh() {}
+            override suspend fun activateDeveloperToken(token: String) = false
+            override suspend fun developerInstallationId() = "test"
+            override fun clearIssue() {}
+        }
+        val model = BankViewModel(app.container.bankImport,app.container.preferences,access,app.container.clock)
+        owner.put("bank",model)
+        var requests = 0
+        compose.setContent {
+            val registryOwner = requireNotNull(LocalActivityResultRegistryOwner.current)
+            val backOwner = requireNotNull(LocalOnBackPressedDispatcherOwner.current)
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner, LocalOnBackPressedDispatcherOwner provides backOwner) {
+            LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Box(Modifier.width(320.dp).fillMaxHeight()) {
+                    BankScreen(model,app.container.bankImport, {}, {}, {}, { requests++ })
+                }
+            }
+        } } } }
+        compose.onNodeWithTag("bankPeriod:WEEK").performClick()
+        compose.runOnIdle { assertEquals(1,requests); assertEquals("DAY",model.state.value.filter.period) }
+        compose.onNodeWithTag("bankPeriod:MONTH").performClick()
+        compose.runOnIdle { assertEquals(2,requests) }
+        NativeScreenshots.save(compose.onRoot().captureToImage(),"bank-320dp-font140-uk")
+        compose.onNodeWithTag("bankSetup").performClick()
+        compose.onNodeWithTag("bankList").performScrollToNode(hasText("Push банку (рекомендовано)"))
+        compose.onNodeWithText("Push банку (рекомендовано)").performScrollTo().assertIsDisplayed()
+    }
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.dashboard.*
+import com.semmyx.ledger.settings.RestorePurchasesAction
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.theme.*
+import java.io.File
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class CompactLayoutTest {
+    @get:Rule val compose = createComposeRule()
+    private fun screenshot(name: String) { NativeScreenshots.save(compose.onRoot().captureToImage(),name) }
+    private fun content(width: Dp, fontScale: Float) {
+        compose.setContent {
+            LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+                val density = LocalDensity.current
+                CompositionLocalProvider(LocalDensity provides Density(density.density,fontScale)) {
+                    Column(Modifier.width(width).padding(8.dp)) {
+                        CompactBalanceSummary(DashboardState(snapshot = DashboardSnapshot(balance = Balance(250000,123450,2)), loading = false))
+                        RestorePurchasesAction(true) {}
+                    }
+                }
+            } }
+        }
+    }
+    private fun checkTextFits(tag: String) {
+        compose.onNodeWithTag(tag).assertIsDisplayed()
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag(tag, useUnmergedTree = true).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertTrue("Missing text layout: $tag", layouts.isNotEmpty())
+        assertFalse("Text overflow: $tag: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
+        if (tag == "restorePurchases") assertTrue("Restore label squeezed into letters", layouts.all { it.lineCount <= 2 })
+    }
+    @Test fun smallPhoneHasOneBalanceCardAndReadableRestore() {
+        content(288.dp, 1f)
+        compose.onAllNodesWithTag("balanceSummary").assertCountEquals(1)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        // Button merges its text semantics; use the descendant Text to inspect actual line breaks.
+        compose.onNodeWithText("Відновити покупки",useUnmergedTree=true).assertIsDisplayed()
+        screenshot("compact-288dp-uk")
+    }
+    @Test fun enlargedSystemFontRemainsWithinPhoneBounds() {
+        content(320.dp, 1.7f)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithText("Відновити покупки",useUnmergedTree=true)
+            .performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertFalse("Restore overflow: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
+        assertTrue(layouts.all { it.lineCount <= 2 })
+        screenshot("compact-320dp-font170-uk")
+    }
+    @Test fun longBankCategoryDoesNotBreakIntoLetterFragments() {
+        val label = "Супермаркети та продукти"
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Column(Modifier.width(320.dp).padding(16.dp)) {
+                    com.semmyx.ledger.bank.BankAmountRow(label,"778,89 ₴", androidx.compose.ui.graphics.Color.Magenta, labelTag="longCategory")
+                }
+            }
+        } } }
+        val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag("longCategory").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        assertTrue(layouts.isNotEmpty())
+        layouts.forEach { layout ->
+            assertFalse(layout.hasVisualOverflow)
+            for (line in 0 until layout.lineCount-1) {
+                val boundary = layout.getLineEnd(line,visibleEnd=true)
+                assertTrue("Category word split into fragments at $boundary", boundary >= label.length || label[boundary].isWhitespace())
+            }
+        }
+        screenshot("category-320dp-font140-uk")
+    }
+    @Test fun normalPhoneUsesThreeCompactMetrics() {
+        content(360.dp, 1f)
+        val positions = listOf("totalBalance","totalIncome","totalExpenses")
+            .map { compose.onNodeWithTag(it).fetchSemanticsNode().boundsInRoot.left }
+        assertTrue("Expected three horizontal metrics, viewport may be too narrow: $positions",
+            positions[0] < positions[1] && positions[1] < positions[2])
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
+        listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
+        screenshot("compact-360dp-uk")
     }
 }
 ```
@@ -369,6 +552,32 @@ class ComposeScreensTest {
         compose.onNodeWithText("Username copied").assertIsDisplayed()
         compose.onNodeWithTag("contactTelegram").performClick()
         compose.runOnIdle { assertTrue(contacted) }
+    }
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import android.os.ParcelFileDescriptor
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
+
+/** Copy out before Gradle uninstalls the test app and deletes its external files. */
+object NativeScreenshots {
+    fun save(bitmap: ImageBitmap, name: String) {
+        val app = ApplicationProvider.getApplicationContext<LedgerApplication>()
+        val file = File(app.getExternalFilesDir(null),"screenshots/$name.png").also { it.parentFile!!.mkdirs() }
+        file.outputStream().use { bitmap.asAndroidBitmap().compress(android.graphics.Bitmap.CompressFormat.PNG,100,it) }
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        fun shell(command: String) = ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(command)).use { it.readBytes() }
+        shell("mkdir -p /data/local/tmp/tg-ledger-screenshots")
+        shell("cp ${file.absolutePath} /data/local/tmp/tg-ledger-screenshots/$name.png")
     }
 }
 ```
@@ -1403,6 +1612,53 @@ private fun PinKey(value: Int, enabled: Boolean, onClick: () -> Unit, modifier: 
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.dp
+
+/** Never let a right-hand amount squeeze the bank/category name into a few letters. */
+@Composable
+fun BankAmountRow(label: String, amount: String, color: Color? = null,
+    onClick: (() -> Unit)? = null, labelTag: String = "") {
+    val labelStyle = MaterialTheme.typography.bodyMedium
+    val amountStyle = MaterialTheme.typography.titleSmall
+    val measurer = rememberTextMeasurer()
+    BoxWithConstraints(Modifier.fillMaxWidth().then(if (onClick == null) Modifier else Modifier.clickable(onClick = onClick)).padding(vertical = 4.dp)) {
+        val available = with(LocalDensity.current) { maxWidth.toPx() }
+        val desired = measurer.measure(label, style = labelStyle, softWrap = false).size.width +
+            measurer.measure(amount, style = amountStyle, softWrap = false).size.width +
+            with(LocalDensity.current) { (if (color == null) 12.dp else 44.dp).toPx() }
+        @Composable fun Label(modifier: Modifier) {
+            Text(label, modifier.testTag(labelTag), style = labelStyle)
+        }
+        @Composable fun Dot() { color?.let { Box(Modifier.size(18.dp).background(it,CircleShape)) } }
+        if (desired > available) Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Dot(); Label(Modifier.weight(1f))
+            }
+            Text(amount, modifier = Modifier.fillMaxWidth(), style = amountStyle)
+        } else Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Dot(); Label(Modifier.weight(1f)); Text(amount, style = amountStyle)
+        }
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt
 
 ```kotlin
@@ -1429,7 +1685,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
             when (repository.importMode) {
-                "API" -> repository.syncMonobank()
+                "API" -> { repository.syncMonobank(); repository.syncPrivat() }
                 "SMS" -> BankSmsCatchUp.run(applicationContext, repository)
                 else -> if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
                     ensureListenerBound(applicationContext, repository)
@@ -1449,6 +1705,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
          * Android bind it again (and it then replays the notifications still in the shade).
          */
         suspend fun ensureListenerBound(context: Context, repository: com.semmyx.ledger.data.bank.BankImportRepository) {
+            if (repository.diagnostics.value.connected && BankNotificationListener.replayIfConnected()) return
             val component = ComponentName(context, BankNotificationListener::class.java)
             runCatching { NotificationListenerService.requestRebind(component) }
             kotlinx.coroutines.delay(3_000)
@@ -1476,6 +1733,52 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt
+
+```kotlin
+package com.semmyx.ledger.bank
+
+import android.app.Notification
+import androidx.core.app.NotificationCompat
+import com.semmyx.ledger.domain.bank.Bank
+import com.semmyx.ledger.domain.bank.BankParser
+
+/** No network, no raw message persistence. Handles plain, big, inbox and messaging styles. */
+object BankNotificationDecoder {
+    data class Message(val text: String, val at: Long)
+
+    fun messages(notification: Notification, bank: Bank, postedAt: Long): List<Message> {
+        val extras = notification.extras ?: return emptyList()
+        // Some apps re-post an old notification. Preserve its original event time when valid.
+        val at = notification.`when`.takeIf { it in 1..(postedAt + 300_000) } ?: postedAt
+        val title = (extras.getCharSequence(Notification.EXTRA_TITLE_BIG)
+            ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString()?.trim().orEmpty()
+        val messaging = runCatching { NotificationCompat.MessagingStyle.extractMessagingStyleFromNotification(notification)?.messages }.getOrNull().orEmpty()
+        if (messaging.isNotEmpty()) return messaging.mapNotNull { message ->
+            val text = message.text?.toString()?.trim().orEmpty()
+            if (text.isEmpty()) null else Message("$title\n$text", message.timestamp.takeIf { it in 1..(postedAt + 300_000) } ?: at)
+        }.distinct()
+        val lines = extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES).orEmpty()
+            .map { it.toString().trim() }.filter { it.isNotEmpty() }
+        // Inbox style can contain several independent payments. Do not merge their amounts.
+        val payments = lines.map { Message("$title\n$it", at) }
+            .filter { BankParser.parse(bank, it.text, it.at) != null }
+        if (payments.isNotEmpty()) return payments.distinct()
+        val parts = linkedSetOf<String>()
+        fun add(value: CharSequence?) { value?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(parts::add) }
+        add(title)
+        add(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
+        add(extras.getCharSequence(Notification.EXTRA_TEXT))
+        lines.forEach(::add)
+        add(extras.getCharSequence(Notification.EXTRA_SUB_TEXT))
+        if (parts.size < 2) add(notification.tickerText)
+        val text = parts.filter { part -> parts.none { other -> other.length > part.length && other.contains(part) } }
+            .joinToString("\n")
+        return if (text.isBlank()) emptyList() else listOf(Message(text, at))
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
 
 ```kotlin
@@ -1497,7 +1800,8 @@ import kotlinx.coroutines.*
  *
  * Catch-up: every time the system (re)binds this service we replay the notifications that are still
  * in the shade, so anything that arrived while the service was dead, the phone rebooted or the app
- * was force-closed is still recorded.
+ * process was killed is still recorded. Force-stop requires opening the app again; dismissed
+ * notifications are not recoverable through this Android API.
  */
 class BankNotificationListener : NotificationListenerService() {
 
@@ -1506,10 +1810,10 @@ class BankNotificationListener : NotificationListenerService() {
     private fun repository() = (application as LedgerApplication).container.bankImport
 
     override fun onListenerConnected() {
+        current = java.lang.ref.WeakReference(this)
         try {
             repository().connected(true)
-            val pending = try { activeNotifications } catch (_: Exception) { null }
-            pending?.forEach { handle(it) }
+            replayActive()
         } catch (e: Exception) {
             android.util.Log.w("BankImport", "Catch-up failed: ${e.javaClass.simpleName}")
         }
@@ -1545,50 +1849,43 @@ class BankNotificationListener : NotificationListenerService() {
         // Group summaries carry no transaction data.
         if (notification.flags and Notification.FLAG_GROUP_SUMMARY != 0) { repository.note("GROUP_SUMMARY"); return }
 
-        val text = readText(notification)
-        if (text.isBlank()) { repository.note("EMPTY_TEXT"); return }
+        val messages = BankNotificationDecoder.messages(notification, bank, sbn.postTime)
+        if (messages.isEmpty()) { repository.note("EMPTY_TEXT"); return }
         if (!repository.enabled) { repository.note("DISABLED"); return }
-
-        // NonCancellable: a started import must finish even if the service is being torn down.
-        scope.launch(NonCancellable) {
-            try {
-                repository.receive(
-                    bank, text,
-                    eventKey = "PUSH:${sbn.packageName}:${sbn.key}:${sbn.postTime}:$text",
-                    at = sbn.postTime,
-                    origin = "PUSH",
-                )
-            } catch (e: CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                repository.note("ERROR")
-                android.util.Log.w("BankImport", "Background import failed; no message contents logged")
+        scope.launch {
+            // Finish a started database import if Android tears down the listener mid-write.
+            withContext(NonCancellable) {
+                messages.forEach { message ->
+                    try {
+                        repository.receive(bank, message.text,
+                            eventKey = "PUSH:${sbn.packageName}:${sbn.key}:${message.at}:${message.text}",
+                            at = message.at, origin = "PUSH")
+                    } catch (_: Exception) {
+                        repository.note("ERROR")
+                        android.util.Log.w("BankImport", "Background import failed; no message contents logged")
+                    }
+                }
             }
         }
     }
 
-    /**
-     * Banks put the shop into the title and the amount into the text, or use big/inbox styles.
-     * Everything readable is joined, first line = title, duplicates removed.
-     */
-    private fun readText(notification: Notification): String {
-        val extras = notification.extras ?: return ""
-        val parts = LinkedHashSet<String>()
-        fun add(value: CharSequence?) { value?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(parts::add) }
-        add(extras.getCharSequence(Notification.EXTRA_TITLE_BIG) ?: extras.getCharSequence(Notification.EXTRA_TITLE))
-        add(extras.getCharSequence(Notification.EXTRA_BIG_TEXT))
-        add(extras.getCharSequence(Notification.EXTRA_TEXT))
-        extras.getCharSequenceArray(Notification.EXTRA_TEXT_LINES)?.forEach(::add)
-        add(extras.getCharSequence(Notification.EXTRA_SUB_TEXT))
-        add(extras.getCharSequence(Notification.EXTRA_SUMMARY_TEXT))
-        if (parts.size < 2) add(notification.tickerText)
-        // Remove parts that are entirely contained in a longer part (BIG_TEXT repeats TEXT).
-        val list = parts.toList()
-        return list.filter { part -> list.none { other -> other !== part && other.length > part.length && other.contains(part) } }
-            .joinToString("\n").take(8001)
+    private fun replayActive() {
+        runCatching { activeNotifications?.sortedBy { it.postTime }?.forEach(::handle) }
+            .onFailure { repository().note("ERROR") }
+    }
+
+    companion object {
+        @Volatile private var current = java.lang.ref.WeakReference<BankNotificationListener>(null)
+        /** Also used when switching into push mode while the listener is already bound. */
+        fun replayIfConnected(): Boolean {
+            val listener = current.get() ?: return false
+            listener.replayActive()
+            return true
+        }
     }
 
     override fun onDestroy() {
+        if (current.get() === this) current.clear()
         runCatching { repository().connected(false) }
         scope.cancel()
         super.onDestroy()
@@ -1623,6 +1920,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -1645,7 +1943,7 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit, onPremium: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val reviews by model.reviews.collectAsStateWithLifecycle()
@@ -1656,10 +1954,12 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     val revision by model.revision.collectAsStateWithLifecycle()
     val mode by model.mode.collectAsStateWithLifecycle()
     val mono by model.mono.collectAsStateWithLifecycle()
+    val privat by model.privat.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val palette = LocalAppearance.current
     var notificationAccess by remember { mutableStateOf(false) }
+    var confirmationAccess by remember { mutableStateOf(false) }
     var smsAccess by remember { mutableStateOf(false) }
     var exportFailed by remember { mutableStateOf(false) }
     var pasteDialog by remember { mutableStateOf(false) }
@@ -1668,14 +1968,18 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     var privacy by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
     var token by remember { mutableStateOf("") }
+    var privatToken by remember { mutableStateOf("") }
+    var connectingPrivat by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
     var smsScan by remember { mutableStateOf<BankSmsCatchUp.Result?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var setupExpanded by remember { mutableStateOf(false) }
     
     fun openSettings(action: String, data: Uri? = null) {
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { exportFailed = true }
     }
+    val confirmationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { confirmationAccess = it }
     val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         smsAccess = result[Manifest.permission.RECEIVE_SMS] == true
         if (smsAccess) BankImportWorker.schedule(context)
@@ -1699,7 +2003,9 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     }
     LifecycleResumeEffect(Unit) {
         notificationAccess = context.packageName in NotificationManagerCompat.getEnabledListenerPackages(context)
+        confirmationAccess = android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         smsAccess = ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+        if (repository.importMode == "NOTIFY") BankImportWorker.runNow(context)
         onPauseOrDispose { }
     }
     val currency = state.preferences.currency
@@ -1710,7 +2016,16 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.bank_dashboard)) }, navigationIcon = {
         IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
     }, actions = { IconButton(onClick = onAdd) { Icon(Icons.Default.Add, stringResource(R.string.add_entry)) } }) }) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding).testTag("bankList"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            item {
+                OutlinedButton(onClick = { setupExpanded = !setupExpanded }, modifier = Modifier.fillMaxWidth().testTag("bankSetup")) {
+                    Icon(if (setupExpanded) Icons.Default.ExpandLess else Icons.Default.Settings, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.bank_setup))
+                }
+            }
+            if (setupExpanded) {
             item { ContentCard {
                 Text(stringResource(R.string.bank_import_title), style = MaterialTheme.typography.titleMedium)
                 Text(stringResource(R.string.bank_consent), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1718,7 +2033,7 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_auto), Modifier.weight(1f)); Switch(automatic, model::auto, enabled = enabled) }
                 Text(stringResource(R.string.import_mode_title), style = MaterialTheme.typography.titleSmall)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms, "NOTIFY" to R.string.import_mode_notify).forEach { (value, title) ->
+                    listOf("NOTIFY" to R.string.import_mode_notify, "API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms).forEach { (value, title) ->
                         FilterChip(selected = mode == value, onClick = { model.mode(value); BankImportWorker.runNow(context) }, label = { Text(stringResource(title)) })
                     }
                 }
@@ -1744,7 +2059,7 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                                 Instant.ofEpochMilli(mono.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))) + " · " +
                                 stringResource(R.string.api_imported_last, mono.lastImported), style = MaterialTheme.typography.bodySmall)
                             if (mono.syncing) Text(stringResource(R.string.api_syncing), style = MaterialTheme.typography.bodySmall)
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedButton(enabled = !mono.syncing, onClick = { BankImportWorker.runNow(context) }) { Text(stringResource(R.string.api_sync_now)) }
                                 TextButton(onClick = { scope.launch { repository.disconnectMonobank() } }) { Text(stringResource(R.string.api_disconnect)) }
                             }
@@ -1755,6 +2070,30 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                                 "NO_ACCOUNTS" -> R.string.api_error_no_accounts; else -> R.string.api_error_network
                             }), color = MaterialTheme.colorScheme.error)
                         }
+                        HorizontalDivider()
+                        Text(stringResource(R.string.privat_api_title), style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.privat_api_howto), style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://privatbank.ua/business/intehratsiya")) }) { Text(stringResource(R.string.privat_api_site)) }
+                        if (!privat.connected) {
+                            OutlinedTextField(privatToken, { privatToken = it.trim().take(2048) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.privat_api_token)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                            Button(enabled = privatToken.length >= 20 && !connectingPrivat, onClick = {
+                                connectingPrivat = true
+                                scope.launch {
+                                    try { if (repository.connectPrivat(privatToken)) { privatToken = ""; BankImportWorker.runNow(context) } }
+                                    finally { connectingPrivat = false }
+                                }
+                            }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(if (connectingPrivat) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.privat_api_connected))
+                            if (privat.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(privat.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))), style = MaterialTheme.typography.bodySmall)
+                            OutlinedButton(enabled = !privat.syncing, onClick = { BankImportWorker.runNow(context) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_sync_now)) }
+                            TextButton(onClick = { scope.launch { repository.disconnectPrivat() } }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_disconnect)) }
+                        }
+                        privat.error?.let { Text(stringResource(R.string.privat_api_error), color = MaterialTheme.colorScheme.error) }
+                        Text(stringResource(R.string.other_api_note), style = MaterialTheme.typography.bodySmall)
                     }
                     "SMS" -> {
                         Text(stringResource(R.string.sms_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1771,12 +2110,15 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                         Text(stringResource(R.string.sms_restricted_tip), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     else -> {
+                        Text(stringResource(R.string.push_howto), style = MaterialTheme.typography.bodySmall)
                         Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
                         OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
                     }
                 }
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
                 TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
+                if (!confirmationAccess && android.os.Build.VERSION.SDK_INT >= 33) OutlinedButton(onClick = { confirmationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.import_confirm_permission)) }
+                else Text(stringResource(R.string.import_confirm_enabled), style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
@@ -1796,10 +2138,12 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Button(onClick = { pasteDialog = true }) { Text(stringResource(R.string.import_paste)) }
                 Text(stringResource(R.string.import_queue_note), color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
-            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            }
             item { FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("DAY" to R.string.bank_day, "WEEK" to R.string.bank_week, "MONTH" to R.string.bank_month, "ALL" to R.string.all_time).forEach { (period, title) ->
-                    FilterChip(selected = state.filter.period == period, onClick = { model.period(period) }, label = { Text(stringResource(title)) })
+                    FilterChip(modifier = Modifier.testTag("bankPeriod:$period"), selected = state.filter.period == period, onClick = { if (period == "DAY" || state.premium) model.period(period) else onPremium() }, label = {
+                        Text(stringResource(title) + if (period != "DAY" && !state.premium) " · Plus" else "")
+                    })
                 }
             } }
             item { ContentCard {
@@ -1808,9 +2152,8 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 FilterChip(selected = state.filter.source == null, onClick = { model.source(null) }, label = { Text(stringResource(R.string.all)) })
                 state.sources.forEach { source ->
                     val name = when (source.sourceType) { "CASH" -> stringResource(R.string.bank_cash); "CARD" -> Banks.name(source.bankId); else -> stringResource(R.string.bank_unknown) }
-                    Row(Modifier.fillMaxWidth().clickable { model.source(source.sourceType, source.bankId) }.padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Text(name, Modifier.weight(1f)); Text(formatMoney(source.totalMinor, currency, language))
-                    }
+                    BankAmountRow(name, formatMoney(source.totalMinor, currency, language),
+                        onClick = { model.source(source.sourceType, source.bankId) })
                 }
                 if (state.filter.period == "MONTH" && budget > 0) {
                     Text(stringResource(R.string.bank_budget_progress, formatMoney(state.sources.sumOf { it.totalMinor }, currency, language), formatMoney(budget, currency, language)))
@@ -1821,11 +2164,8 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Text(stringResource(R.string.bank_category_stats), style = MaterialTheme.typography.titleMedium)
                 state.categories.forEach { cat ->
                     val color = cat.colorHex?.let { Color(0xFF000000L or it.removePrefix("#").toLong(16)) } ?: palette.category(cat.category, false)
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Box(Modifier.size(22.dp).background(color, CircleShape))
-                        Text(cat.customName ?: stringResource(cat.category.label()), Modifier.weight(1f))
-                        Text(formatMoney(cat.totalMinor, currency, language))
-                    }
+                    BankAmountRow(cat.customName ?: stringResource(cat.category.label()),
+                        formatMoney(cat.totalMinor, currency, language), color, labelTag = "bankCategoryLabel:${cat.category.name}")
                     LinearProgressIndicator(progress = { if (total == 0L) 0f else (cat.totalMinor.toDouble() / total).toFloat() }, modifier = Modifier.fillMaxWidth(), color = color)
                 }
                 TextButton(onClick = { categoryDialog = true }) { Text(stringResource(R.string.bank_new_category)) }
@@ -1969,7 +2309,7 @@ private fun importReason(code: String): Int = when (code) {
     "GROUP_SUMMARY" -> R.string.import_group
     "UNRECOGNIZED" -> R.string.import_unrecognized
     "AUTO_IMPORTED" -> R.string.import_auto_done
-    "QUEUED" -> R.string.import_queued
+    "QUEUED", "REVIEW", "CROSS_DUPLICATE_REVIEW" -> R.string.import_queued
     "DUPLICATE_REVIEW" -> R.string.bank_duplicate
     "REDELIVERED" -> R.string.import_repeated
     "ERROR" -> R.string.storage_error
@@ -2082,12 +2422,12 @@ import java.time.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-data class BankFilter(val period: String = "MONTH", val source: String? = null, val bank: String? = null)
+data class BankFilter(val period: String = "DAY", val source: String? = null, val bank: String? = null)
 data class BankDashboardState(val preferences: UserPreferences = UserPreferences(), val filter: BankFilter = BankFilter(),
     val sources: List<BankSourceSpend> = emptyList(), val categories: List<BankCategorySpend> = emptyList(),
-    val entries: List<LedgerEntry> = emptyList(), val failed: Boolean = false)
+    val entries: List<LedgerEntry> = emptyList(), val premium: Boolean = false, val failed: Boolean = false)
 @OptIn(ExperimentalCoroutinesApi::class)
-class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, private val clock: Clock) : ViewModel() {
+class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, premium: PremiumRepository, private val clock: Clock) : ViewModel() {
     private val filter = MutableStateFlow(BankFilter())
     private val today = MutableStateFlow(LocalDate.now(clock))
     init { viewModelScope.launch {
@@ -2103,17 +2443,20 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
     val reviews = repo.reviews().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val enabled = MutableStateFlow(repo.enabled)
     val mode = MutableStateFlow(repo.importMode)
+    val privat = repo.privatStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
     val mono = repo.monobankStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
     fun mode(value: String) { repo.importMode = value; mode.value = value }
     val auto = MutableStateFlow(repo.autoImport)
     val error = MutableStateFlow(false)
     val revision = MutableStateFlow(0)
-    val state = combine(preferences.preferences, filter, today) { prefs, selected, date -> Triple(prefs, selected, date) }.flatMapLatest { (prefs, selected, through) ->
-        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.withDayOfMonth(1) }
+    val state = combine(preferences.preferences, premium.state, filter, today) { prefs, access, selected, date ->
+        Request(prefs, access.entitled, selected.copy(period = BankPeriodAccess.effective(selected.period, access.entitled)), date)
+    }.flatMapLatest { (prefs, entitled, selected, through) ->
+        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.minusDays(29) }
         combine(repo.sources(prefs.currency, from, through), repo.categorySpending(prefs.currency, from, through, selected.source, selected.bank),
-            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries) }
+            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries, premium = entitled) }
     }.catch { emit(BankDashboardState(failed = true)) }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BankDashboardState())
-    fun period(value: String) { filter.update { it.copy(period = value) } }
+    fun period(value: String) { if (value in BankPeriodAccess.periods) filter.update { it.copy(period = value) } }
     fun source(value: String?, bank: String? = null) { filter.update { it.copy(source = value, bank = bank) } }
     fun enabled(value: Boolean) { repo.enabled = value; enabled.value = value }
     fun auto(value: Boolean) { repo.autoImport = value; auto.value = value }
@@ -2127,6 +2470,7 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
         val parsed = Money.parseMinor(amount) ?: kotlin.error("Invalid amount")
         repo.setBudget(currency, parsed); revision.value++
     }
+    private data class Request(val prefs: UserPreferences, val entitled: Boolean, val selected: BankFilter, val through: LocalDate)
     private fun task(block: suspend () -> Unit) { viewModelScope.launch { try { block(); error.value = false }
         catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { error.value = true } } }
 }
@@ -2267,6 +2611,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -2285,13 +2630,28 @@ fun CatAssistantCard(language: AppLanguage, listening: Boolean, lastReply: Strin
     Surface(modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.background, contentColor = MaterialTheme.colorScheme.onSurface, shape = RoundedCornerShape(24.dp)) {
         Column(Modifier.padding(horizontal = 12.dp, vertical = 4.dp), horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            LiveCatHost(balanceMinor, listening, skin, Modifier.fillMaxWidth().height(224.dp)
-                .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
-                .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
-            Text(if (locked) stringResource(R.string.cat_locked_hint) else if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
-                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!locked) TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_text_hint)) }
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                @Composable fun Cat(modifier: Modifier) {
+                    LiveCatHost(balanceMinor, listening, skin, modifier
+                        .clickable(enabled = !listening, onClickLabel = label, role = Role.Button, onClick = onTalk)
+                        .semantics { contentDescription = label }.testTag("voiceAssistantButton"), motionEnabled = animations)
+                }
+                @Composable fun Caption(modifier: Modifier) {
+                    Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(stringResource(R.string.mascot_card_title), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                        Text(if (locked) stringResource(R.string.cat_locked_hint) else if (listening) stringResource(R.string.voice_assistant_listening) else lastReply ?: stringResource(R.string.cat_tap_hint),
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (!locked) TextButton(onClick = { typing = !typing }) { Text(stringResource(R.string.assistant_write_short)) }
+                    }
+                }
+                if (LocalDensity.current.fontScale > 1.5f || maxWidth < 250.dp) Column {
+                    Cat(Modifier.fillMaxWidth().height(104.dp))
+                    Caption(Modifier.fillMaxWidth())
+                } else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Cat(Modifier.size(104.dp))
+                    Caption(Modifier.weight(1f))
+                }
+            }
             AnimatedVisibility(typing && !locked, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                 Column {
                     OutlinedTextField(text, { text = it.take(500) }, modifier = Modifier.fillMaxWidth().testTag("assistantText"),
@@ -2603,8 +2963,8 @@ fun ContentCard(modifier: Modifier = Modifier, content: @Composable ColumnScope.
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp, pressedElevation = 4.dp),
     ) {
         Column(
-            Modifier.fillMaxWidth().padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            Modifier.fillMaxWidth().padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
             content = content,
         )
     }
@@ -2981,6 +3341,8 @@ import android.content.pm.PackageManager
 import androidx.activity.result.ActivityResultLauncher
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -2999,6 +3361,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -3049,7 +3412,7 @@ fun DashboardRoute(model: DashboardViewModel, host: FragmentActivity, onNavigate
         } })
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: FragmentActivity, onNavigate: (Int) -> Unit,
     onAdd: () -> Unit, onEdit: (String) -> Unit, onDelete: (String) -> Unit, onSearch: (String) -> Unit,
@@ -3239,7 +3602,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
             else if (state.failed) EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry)
             else LazyColumn(Modifier.widthIn(max = 720.dp).fillMaxSize().testTag("ledgerList"),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 100.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item(key = "greeting", contentType = "heading") {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(if (state.preferences.displayName.isBlank()) stringResource(R.string.dashboard_heading)
@@ -3247,6 +3610,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                         Text(stringResource(R.string.dashboard_subtitle), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
+                item(key = "balance", contentType = "summary") { CompactBalanceSummary(state) }
                 // The cat is always on the home screen; without Premium it is shown locked and opens the Premium card.
                 if (!state.premium || state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
@@ -3256,8 +3620,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                             onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor, locked = !state.premium)
                     }
                 }
-                item(key = "balance", contentType = "summary") { BalanceCard(state) }
-                item(key = "totals", contentType = "summary") { BalanceBreakdown(state) }
+
                 item(key = "chart", contentType = "chart") {
                     ActivityChart(state.snapshot.activity, state.preferences.currency, state.preferences.language, state.premium,
                         state.days, onDays, onPremium = { onNavigate(1) })
@@ -3273,7 +3636,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                             singleLine = true, label = { Text(stringResource(R.string.search_entries)) },
                             leadingIcon = { Icon(Icons.Default.Search, null) },
                             trailingIcon = { if (state.query.isNotEmpty()) IconButton(onClick = { onSearch("") }) { Icon(Icons.Default.Close, stringResource(R.string.clear_search)) } })
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilterChip(selected = state.type == null, onClick = { onFilter(null) }, label = { Text(stringResource(R.string.all)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.secondary, selectedLabelColor = MaterialTheme.colorScheme.secondary, selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f)), selected = state.type == EntryType.INCOME, onClick = { onFilter(EntryType.INCOME) }, label = { Text(stringResource(R.string.income)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.tertiary, selectedLabelColor = MaterialTheme.colorScheme.tertiary, selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f)), selected = state.type == EntryType.EXPENSE, onClick = { onFilter(EntryType.EXPENSE) }, label = { Text(stringResource(R.string.expenses)) })
@@ -3331,70 +3694,36 @@ private fun smallTalkReply(context: android.content.Context, heard: String): Str
         null -> null
     }
 
+/** One compact card instead of a tall balance card and two separate totals. */
 @Composable
-private fun BalanceCard(state: DashboardState) {
-    Card(
-        modifier  = Modifier.fillMaxWidth(),
-        shape     = MaterialTheme.shapes.extraLarge,
-        colors    = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor   = MaterialTheme.colorScheme.onPrimary,
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(28.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment     = Alignment.CenterVertically,
-            ) {
-                Text(
-                    stringResource(R.string.total_balance),
-                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .75f),
-                    style = MaterialTheme.typography.labelLarge,
-                )
-                Surface(
-                    shape = MaterialTheme.shapes.medium,
-                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .15f),
-                ) {
-                    Icon(Icons.Default.AccountBalanceWallet, null, Modifier.padding(8.dp).size(20.dp),
-                        tint = MaterialTheme.colorScheme.onPrimary)
+fun CompactBalanceSummary(state: DashboardState) {
+    ContentCard(Modifier.testTag("balanceSummary")) {
+        val balance = state.snapshot.balance
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val compact = maxWidth >= 300.dp && LocalDensity.current.fontScale <= 1.3f &&
+                listOf(balance.netMinor, balance.incomeMinor, balance.expenseMinor).all {
+                    formatMoney(it, state.preferences.currency, state.preferences.language).length <= 14
+                }
+            @Composable fun Metric(label: Int, amount: Long, color: Color, tag: String, modifier: Modifier = Modifier) {
+                Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = if (compact) Modifier.heightIn(min = with(LocalDensity.current) { 32.sp.toDp() }) else Modifier)
+                    BasicText(formatMoney(amount, state.preferences.currency, state.preferences.language),
+                        style = MaterialTheme.typography.titleMedium.copy(color = color),
+                        maxLines = 1, autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = 16.sp, stepSize = 1.sp),
+                        modifier = Modifier.fillMaxWidth().testTag(tag))
                 }
             }
-            Text(
-                formatMoney(state.snapshot.balance.netMinor, state.preferences.currency, state.preferences.language),
-                style    = MaterialTheme.typography.headlineLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.testTag("totalBalance"),
-            )
-            Text(
-                stringResource(R.string.currency_scope, state.preferences.currency.name),
-                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .65f),
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
-    }
-}
-
-
-@Composable
-private fun BalanceBreakdown(state: DashboardState) {
-    val language = state.preferences.language
-    val currency = state.preferences.currency
-    @Composable fun Metric(income: Boolean, modifier: Modifier) {
-        ContentCard(modifier) {
-            Text(stringResource(if (income) R.string.income else R.string.expenses), style = MaterialTheme.typography.bodyMedium,
-                color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-            Text(formatMoney(if (income) state.snapshot.balance.incomeMinor else state.snapshot.balance.expenseMinor, currency, language),
-                style = MaterialTheme.typography.titleMedium, color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-        }
-    }
-    BoxWithConstraints {
-        if (maxWidth < 340.dp || LocalDensity.current.fontScale > 1.3f) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { Metric(true, Modifier); Metric(false, Modifier) }
-        } else Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Metric(true, Modifier.weight(1f)); Metric(false, Modifier.weight(1f))
+            if (compact) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance", Modifier.weight(1f))
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome", Modifier.weight(1f))
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses", Modifier.weight(1f))
+            } else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance")
+                // Each metric gets the entire line at large system font sizes.
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome")
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses")
+            }
         }
     }
 }
@@ -4147,10 +4476,10 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
         }
         composable("banks") {
             val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
-                BankViewModel(container.bankImport, container.preferences, container.clock)
+                BankViewModel(container.bankImport, container.preferences, container.premium, container.clock)
             })
             BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
-                onEdit = { nav.navigate("entry/$it") })
+                onEdit = { nav.navigate("entry/$it") }, onPremium = { onNavigate(1) })
         }
         composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
             val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }
@@ -4577,6 +4906,29 @@ private fun roleLabel(role: String): Int = when (role) {
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt
+
+```kotlin
+package com.semmyx.ledger.settings
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import com.semmyx.ledger.R
+
+@Composable
+fun RestorePurchasesAction(enabled: Boolean, onClick: () -> Unit) {
+    // A dedicated full-width line, never the squeezed last child of a button row.
+    TextButton(onClick = onClick, enabled = enabled,
+        modifier = Modifier.fillMaxWidth().testTag("restorePurchases")) {
+        Text(stringResource(R.string.restore_purchases), modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt
 
 ```kotlin
@@ -4766,7 +5118,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION }?.let {
                     Text(stringResource(it.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
-                TextButton(onClick = model::restorePurchases, enabled = !state.premium.busy) { Text(stringResource(R.string.restore_purchases)) }
+                RestorePurchasesAction(enabled = !state.premium.busy, onClick = model::restorePurchases)
             } }
             if (state.premium.developerPurchaseEnabled && (!state.premium.entitled || state.premium.expiresAtMillis != null)) item(key = "developerPurchase") { ContentCard {
                 Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
@@ -4965,6 +5317,10 @@ fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
             item { ContentCard {
                 Text(stringResource(R.string.help_entries_title), style = MaterialTheme.typography.titleLarge)
                 Text(stringResource(R.string.help_entries_body))
+            } }
+            item { ContentCard {
+                Text(stringResource(R.string.help_banks_title), style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.help_banks_body))
             } }
             item { ContentCard {
                 Text(stringResource(R.string.help_privacy_title), style = MaterialTheme.typography.titleLarge)
@@ -5899,6 +6255,181 @@ object VoiceSmallTalk {
 </vector>
 ```
 
+## app/src/main/res/drawable/ic_launcher_background.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#3DDC84"
+        android:pathData="M0,0h108v108h-108z" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M9,0L9,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,0L19,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,0L29,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,0L39,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,0L49,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,0L59,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,0L69,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,0L79,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M89,0L89,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M99,0L99,108"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,9L108,9"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,19L108,19"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,29L108,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,39L108,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,49L108,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,59L108,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,69L108,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,79L108,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,89L108,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M0,99L108,99"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,29L89,29"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,39L89,39"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,49L89,49"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,59L89,59"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,69L89,69"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M19,79L89,79"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M29,19L29,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39,19L39,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M49,19L49,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M59,19L59,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M69,19L69,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M79,19L79,89"
+        android:strokeWidth="0.8"
+        android:strokeColor="#33FFFFFF" />
+</vector>
+```
+
 ## app/src/main/res/drawable/ic_launcher_foreground.xml
 
 ```xml
@@ -6188,7 +6719,7 @@ object VoiceSmallTalk {
     <string name="help_premium_title">Покупки й офлайн-доступ</string>
     <string name="help_premium_body">TG Plus у Google Play — довічна покупка без автоматичного продовження. Незавершений платіж не відкриває доступ. Відновлення — з тим самим Google Play акаунтом. Покупки Play потребують періодичної перевірки власності та працюють до 7 днів офлайн. Код розробника може бути довічним або строковим. Локальний пробний доступ надається один раз на 7 АБО 14 днів — без платіжних даних і списань.</string>
     <string name="app_version">Версія %1$s</string>
-    <string name="premium_feature_trends">Рух коштів за 30 днів і весь час із деталями категорій</string>
+    <string name="premium_feature_trends">Розширені графіки та статистика банків: 7 днів, 30 днів і весь час</string>
     <string name="premium_feature_mascot">Власний персонаж-помічник на головному екрані</string>
     <string name="premium_feature_support">Пріоритетна увага розробника в Telegram</string>
     <string name="premium_source_play">Активовано через Google Play</string>
@@ -6309,7 +6840,7 @@ object VoiceSmallTalk {
     <string name="color_error">Помилки й попередження</string>
     <string name="bank_dashboard">Банки</string>
     <string name="bank_import_title">Локальний імпорт банківських операцій</string>
-    <string name="bank_consent">Обробляються лише банківські застосунки та банківські SMS-відправники. Імпорт працює у фоні, навіть коли застосунок закрито: записує нові платежі та підхоплює ті, що надійшли, поки застосунок був вимкнений. Достатньо один раз надати доступ.</string>
+    <string name="bank_consent">Push-сповіщення банків розпізнаються на телефоні. Один раз надайте доступ до сповіщень. Однозначні платежі зберігаються автоматично; сумнівні — у черзі перевірки. SMS — окремий необов’язковий спосіб.</string>
     <string name="bank_enabled">Увімкнути банківський імпорт</string>
     <string name="bank_auto">Автоімпорт однозначних операцій</string>
     <string name="bank_access_yes">Доступ до сповіщень надано</string>
@@ -6323,7 +6854,7 @@ object VoiceSmallTalk {
     <string name="bank_privacy_body">Розпізнавання банківських повідомлень відбувається на пристрої. Повні тексти, OTP-коди й повні номери карток не зберігаються та не надсилаються на сервери. Room зберігає виділені операції та записи підтвердження у приватному сховищі; системні резервні копії вимкнено. Зберігаються лише останні 4 цифри картки. Вимкнення імпорту зупиняє нові записи; для скасування системного доступу відкличте дозволи Android. CSV-експорт виконується лише за вашою дією; обрана папка може належати хмарному провайдеру. PIN блокує застосунок, але не шифрує базу. Курси валют, Play і системне розпізнавання голосу — окремі функції, які можуть використовувати мережу. Імпорт не є підтвердженою банком випискою.</string>
     <string name="bank_day">Сьогодні</string>
     <string name="bank_week">Останні 7 днів</string>
-    <string name="bank_month">Цей місяць</string>
+    <string name="bank_month">Останні 30 днів</string>
     <string name="bank_cash">Готівка</string>
     <string name="bank_card">Банківська картка</string>
     <string name="bank_unknown">Невідоме джерело (старі записи)</string>
@@ -6337,14 +6868,14 @@ object VoiceSmallTalk {
     <string name="bank_ignore">Ігнорувати / між своїми рахунками</string>
     <string name="bank_recent">Останні операції · натисніть для редагування</string>
     <string name="bank_limit_recent">Тут показано до 100 останніх операцій. Підсумки враховують усі записи; основний журнал має пошук і пагінацію.</string>
-    <string name="bank_budget">Місячний ліміт витрат</string>
-    <string name="bank_budget_progress">Витрати за місяць: %1$s / %2$s</string>
+    <string name="bank_budget">Ліміт витрат за 30 днів</string>
+    <string name="bank_budget_progress">Витрати за 30 днів: %1$s / %2$s</string>
     <string name="bank_export">Експортувати всі операції у CSV</string>
     <string name="bank_clear_history">Очистити історію розпізнавання</string>
     <string name="bank_clear_warning">Чергу підтвердження та відбитки дублікатів буде видалено. Збережені операції залишаться. Після очищення старі сповіщення можуть бути розпізнані знову.</string>
     <string name="bank_app_permissions">Дозволи застосунку Android</string>
     <string name="bank_battery">Дозволити роботу у фоні (батарея)</string>
-    <string name="bank_budget_disable">Вимкнути місячний ліміт</string>
+    <string name="bank_budget_disable">Вимкнути ліміт витрат</string>
     <string name="history_search">Пошук операцій</string>
     <string name="import_diagnostics">Діагностика імпорту</string>
     <string name="import_connected">Сервіс сповіщень підключено</string>
@@ -6366,11 +6897,11 @@ object VoiceSmallTalk {
     <string name="import_auto_done">Операцію збережено автоматично.</string>
     <string name="import_queued">Операція очікує підтвердження нижче.</string>
     <string name="import_repeated">Повторну доставку проігноровано; дублікат не збережено.</string>
-    <string name="import_waiting">Очікування нового банківського сповіщення. Минулі сповіщення не скануються.</string>
+    <string name="import_waiting">Очікуємо push банку. Перепідключення читає сповіщення, що залишилися у шторці.</string>
     <string name="import_mode_title">Спосіб імпорту</string>
-    <string name="import_mode_api">API-ключ (monobank)</string>
+    <string name="import_mode_api">API банку</string>
     <string name="import_mode_sms">SMS</string>
-    <string name="import_mode_notify">Сповіщення</string>
+    <string name="import_mode_notify">Push банку (рекомендовано)</string>
     <string name="api_howto">1) Відкрийте api.monobank.ua і увійдіть через застосунок monobank. 2) Скопіюйте особистий токен. 3) Вставте його сюди. Застосунок лише читає виписку (read-only) і перевіряє нові платежі приблизно кожні 15 хвилин, навіть коли закритий. Токен зберігається на телефоні в зашифованому вигляді.</string>
     <string name="api_open_site">Відкрити api.monobank.ua</string>
     <string name="api_token_label">API-токен monobank</string>
@@ -6395,6 +6926,20 @@ object VoiceSmallTalk {
     <string name="pay_source_required">Оберіть: картка чи готівка</string>
     <string name="voice_ask_source">Картка чи готівка?</string>
     <string name="cat_locked_hint">Кіт-помічник входить у Premium. Торкніться, щоб розблокувати (14 днів безкоштовно).</string>
+    <string name="bank_setup">Налаштування імпорту</string>
+    <string name="push_howto">Увімкніть доступ до сповіщень, автоімпорт і роботу у фоні. Новий push банку читається без відкритого екрана. Повторне підключення також читає сповіщення, що ще є у шторці, навіть отримані кілька хвилин тому. Android не надає цьому застосунку історію вже прибраних сповіщень. Після «Примусово зупинити» відкрийте TG Ledger знову. На деяких телефонах спочатку потрібен дозвіл «Обмежені налаштування».</string>
+    <string name="privat_api_title">ПриватБанк · Бізнес / ФОП</string>
+    <string name="privat_api_howto">Для рахунків Приват24 для бізнесу / ФОП, не для звичайних особистих карток Приват24. Інтеграція (Автоклієнт) → API: створіть токен з доступом лише до балансів і транзакцій. Застосунок тільки читає виписку. Токен шифрується на телефоні. Перша синхронізація — за 30 днів, наступні — приблизно кожні 15 хвилин.</string>
+    <string name="privat_api_site">Інструкція API ПриватБанку</string>
+    <string name="privat_api_token">Токен Автоклієнта</string>
+    <string name="privat_api_connected">Приват24 для бізнесу підключено</string>
+    <string name="privat_api_error">Не вдалося прочитати виписку. Перевірте інтернет, токен Автоклієнта та дозвіл читання транзакцій. Токен має бути з Приват24 для бізнесу.</string>
+    <string name="other_api_note">Інші банки: універсального API-ключа немає. Open Banking потребує підтримуваної банком згоди та авторизованого постачальника. Для особистого Приват24 та інших банків оберіть push. Якщо застосунку немає у списку, додайте package у «Застосунки банків» → «Інший банк». Не вводьте тут пароль банку, PIN чи CVV.</string>
+    <string name="help_banks_title">Банки та автоматичний імпорт</string>
+    <string name="help_banks_body">Банки показують витрати за картками, готівкою та банками. Безкоштовно — сьогодні. TG Plus або активний пробний період — 7 днів, 30 днів і весь час. Період змінює статистику, а не збирання операцій.\n\nРекомендовано: Push банку → доступ до сповіщень → увімкнений автоімпорт. Розпізнавання локальне, без SMS і API-токена. Однозначні платежі записуються до журналу, коли екран застосунку закритий. Підтримуються звичайні, розгорнуті сповіщення, списки та повідомлення. OTP, відхилені платежі та лише баланс не додаються. Сумнівні суми, перекази та можливі дублікати потребують перевірки.\n\nПерепідключення / відкриття застосунку читає сповіщення банків, що ще залишилися у шторці. Прибрані повідомлення недоступні. «Примусово зупинити» вимикає фонову роботу до нового відкриття застосунку. Обмеження батареї можуть зупиняти або затримувати імпорт.\n\nAPI: особистий токен monobank та токен Автоклієнта Приват24 для бізнесу. Автоклієнт — для бізнесу / ФОП, не для звичайних особистих карток. API-синхронізація періодична, не миттєва. Інші банки потребують окремої авторизованої інтеграції Open Banking; за наявності використовуйте push. Відсутній застосунок можна додати як «Інший банк».\n\nДодаткові підтвердження потребують дозволу Android на сповіщення; він не впливає на збереження операцій. Імпорт не є підтвердженою банком випискою: звіряйте журнал із банком і перевіряйте чергу.</string>
+    <string name="import_confirm_permission">Дозволити сповіщення про збережені платежі</string>
+    <string name="import_confirm_enabled">Сповіщення про збережені платежі ввімкнено</string>
+    <string name="assistant_write_short">Написати</string>
 </resources>
 ```
 
@@ -6406,6 +6951,21 @@ object VoiceSmallTalk {
     <!-- Author-provided alias. Edit these two resources to your preferred signature. -->
     <string name="brand_author_signature" translatable="false">S.</string>
     <string name="brand_copyright" translatable="false">© 2026 S. · TG Ledger</string>
+</resources>
+```
+
+## app/src/main/res/values/colors.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
 </resources>
 ```
 
@@ -6588,7 +7148,7 @@ object VoiceSmallTalk {
     <string name="help_premium_title">Purchases &amp; offline access</string>
     <string name="help_premium_body">TG Plus on Google Play is a non-consumable lifetime purchase, not an auto-renewing subscription. Pending payments never unlock access. Restore with the same Google Play account. Signed Play purchases require periodic ownership verification and allow up to 7 days offline. Developer codes may be lifetime or time-limited. A local trial is available once for 7 OR 14 days, without payment details or charges.</string>
     <string name="app_version">Version %1$s</string>
-    <string name="premium_feature_trends">30-day and all-time cash flow with category details</string>
+    <string name="premium_feature_trends">Extended trends and bank statistics: 7 days, 30 days and all time</string>
     <string name="premium_feature_mascot">Your own assistant character on the dashboard</string>
     <string name="premium_feature_support">Priority attention from the developer on Telegram</string>
     <string name="premium_source_play">Active via Google Play</string>
@@ -6709,7 +7269,7 @@ object VoiceSmallTalk {
     <string name="color_error">Errors and alerts</string>
     <string name="bank_dashboard">Banks</string>
     <string name="bank_import_title">Offline bank import</string>
-    <string name="bank_consent">Only enabled bank apps and bank SMS senders are examined. Import runs in the background, even when the app is closed: it records new payments, and picks up ones that arrived while the app was off. Just grant access once.</string>
+    <string name="bank_consent">Bank push notifications are parsed on this phone. Enable notification access once. Unambiguous payments are saved automatically; uncertain messages wait for review. SMS is optional, not required for push.</string>
     <string name="bank_enabled">Enable bank import</string>
     <string name="bank_auto">Auto-import confident operations</string>
     <string name="bank_access_yes">Notification access granted</string>
@@ -6723,7 +7283,7 @@ object VoiceSmallTalk {
     <string name="bank_privacy_body">Bank parsing happens on this device. Raw message texts, OTPs and full card numbers are not saved or sent to servers. Room stores extracted operations and review records in private app storage; system backup is disabled. Only the final four card digits are retained. Turning import off stops new ingestion; revoke notification/SMS access in Android settings to remove system access. CSV export is explicit and saves to the location you choose, which may be a cloud provider. PIN is an app lock, not database encryption. Optional exchange-rate, Play and system speech services are separate and may use the network. Imported statements are not bank-verified and must be reviewed.</string>
     <string name="bank_day">Today</string>
     <string name="bank_week">Last 7 days</string>
-    <string name="bank_month">This month</string>
+    <string name="bank_month">Last 30 days</string>
     <string name="bank_cash">Cash</string>
     <string name="bank_card">Bank card</string>
     <string name="bank_unknown">Unspecified source (older entries)</string>
@@ -6737,14 +7297,14 @@ object VoiceSmallTalk {
     <string name="bank_ignore">Ignore / own-account transfer</string>
     <string name="bank_recent">Recent operations · tap to edit</string>
     <string name="bank_limit_recent">This view shows up to 100 recent operations. Totals include every matching entry; the main ledger has search and paging.</string>
-    <string name="bank_budget">Monthly expense limit</string>
-    <string name="bank_budget_progress">Monthly spending: %1$s / %2$s</string>
+    <string name="bank_budget">30-day spending limit</string>
+    <string name="bank_budget_progress">Spending over 30 days: %1$s / %2$s</string>
     <string name="bank_export">Export all transactions to CSV</string>
     <string name="bank_clear_history">Clear recognition history</string>
     <string name="bank_clear_warning">Pending reviews and duplicate fingerprints will be deleted. Saved transactions are kept. Old notifications could be recognized again after clearing.</string>
     <string name="bank_app_permissions">Android app permissions</string>
     <string name="bank_battery">Allow background work (battery)</string>
-    <string name="bank_budget_disable">Disable monthly limit</string>
+    <string name="bank_budget_disable">Disable spending limit</string>
     <string name="history_search">Search operations</string>
     <string name="import_diagnostics">Import diagnostics</string>
     <string name="import_connected">Notification service is connected</string>
@@ -6766,11 +7326,11 @@ object VoiceSmallTalk {
     <string name="import_auto_done">Operation saved automatically.</string>
     <string name="import_queued">Operation awaits confirmation below.</string>
     <string name="import_repeated">Repeated delivery ignored; no duplicate was saved.</string>
-    <string name="import_waiting">Waiting for a new bank notification. Past notification history is not scanned.</string>
+    <string name="import_waiting">Waiting for bank push. Reconnect scans notifications still in the shade.</string>
     <string name="import_mode_title">Import method</string>
-    <string name="import_mode_api">API key (monobank)</string>
+    <string name="import_mode_api">Bank API</string>
     <string name="import_mode_sms">SMS</string>
-    <string name="import_mode_notify">Notifications</string>
+    <string name="import_mode_notify">Bank push (recommended)</string>
     <string name="api_howto">1) Open api.monobank.ua and sign in with the monobank app. 2) Copy your personal token. 3) Paste it here. The app only reads your statement (read-only) and checks for new payments every ~15 minutes, even when closed. The token is stored encrypted on this phone.</string>
     <string name="api_open_site">Open api.monobank.ua</string>
     <string name="api_token_label">monobank API token</string>
@@ -6795,6 +7355,20 @@ object VoiceSmallTalk {
     <string name="pay_source_required">Choose card or cash</string>
     <string name="voice_ask_source">Card or cash?</string>
     <string name="cat_locked_hint">The cat assistant is part of Premium. Tap to unlock (14-day trial is free).</string>
+    <string name="bank_setup">Import settings</string>
+    <string name="push_howto">Enable access to notifications, turn on auto-import and allow background activity. New bank push is read without an open screen. Reconnect also reads bank notifications still visible in the shade, including recent ones. Android does not expose dismissed notification history to this app. After Force stop, open TG Ledger again. Some phones require Allow restricted settings before notification access.</string>
+    <string name="privat_api_title">PrivatBank · Business / sole proprietor</string>
+    <string name="privat_api_howto">For Privat24 Business AutoClient accounts, not ordinary retail Privat24 cards. In Privat24 Business → Integration (AutoClient) → API, create a token restricted to balances and transactions. Only statements are requested. The token is encrypted on this phone. First sync imports 30 days; later syncs run approximately every 15 minutes.</string>
+    <string name="privat_api_site">PrivatBank API instructions</string>
+    <string name="privat_api_token">AutoClient token</string>
+    <string name="privat_api_connected">Privat24 Business connected</string>
+    <string name="privat_api_error">Could not read the statement. Check internet, AutoClient token and its read permissions. This token must belong to Privat24 Business.</string>
+    <string name="other_api_note">Other banks: there is no universal API key. Open Banking needs a bank-supported consent flow and an authorised provider. For retail Privat24 and other banks, use push. Add the bank app package under App mapping → Other bank if it is missing. Never enter your bank password, PIN or CVV here.</string>
+    <string name="help_banks_title">Banks and automatic import</string>
+    <string name="help_banks_body">Banks shows card, cash and bank spending. Free access: today. TG Plus or an active trial: 7 days, 30 days and all time. A period changes statistics, not whether operations are captured.\n\nRecommended: Bank push → grant notification access → keep auto-import enabled. Recognition runs locally, without SMS or an API token, and writes clear payments into the ledger while its screen is closed. It supports plain, expanded, inbox and messaging notifications. OTPs, declines and balance-only messages are not operations. Ambiguous messages, transfers and possible duplicates need review.\n\nReconnect / opening the app reads bank notifications still in the notification shade. Dismissed messages cannot be recovered through notification access. Force-stop disables background work until you open the app again. Battery restrictions can delay or stop it.\n\nAPI: monobank personal token and Privat24 Business AutoClient token are supported. PrivatBank AutoClient is for business/sole proprietor accounts, not ordinary retail cards. API sync is periodic, not instant. Other banks need a bank-specific authorised Open Banking integration; use push where available. A missing bank app can be mapped under Other bank.\n\nOptional confirmations need Android notification permission. They do not affect saving. Import is not a certified bank statement: reconcile against your bank and check the review queue.</string>
+    <string name="import_confirm_permission">Allow saved-payment notifications</string>
+    <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
+    <string name="assistant_write_short">Write</string>
 </resources>
 ```
 
@@ -6816,6 +7390,24 @@ object VoiceSmallTalk {
     </style>
     <color name="launcher_background">#10223F</color>
 </resources>
+```
+
+## app/src/main/res/xml/backup_rules.xml
+
+```xml
+<?xml version="1.0" encoding="utf-8"?><!--
+   Sample backup rules file; uncomment and customize as necessary.
+   See https://developer.android.com/guide/topics/data/autobackup
+   for details.
+   Note: This file is ignored for devices older than API 31
+   See https://developer.android.com/about/versions/12/backup-restore
+-->
+<full-backup-content>
+    <!--
+   <include domain="sharedpref" path="."/>
+   <exclude domain="sharedpref" path="device.xml"/>
+-->
+</full-backup-content>
 ```
 
 ## app/src/main/res/xml/data_extraction_rules.xml
@@ -6849,6 +7441,89 @@ object VoiceSmallTalk {
         <trust-anchors><certificates src="system" /></trust-anchors>
     </base-config>
 </network-security-config>
+```
+
+## app/src/test/java/com/example/myapplication/ExampleUnitTest.kt
+
+```kotlin
+package com.example.myapplication
+
+import org.junit.Test
+
+import org.junit.Assert.*
+
+/**
+ * Example local unit test, which will execute on the development machine (host).
+ *
+ * See [testing documentation](http://d.android.com/tools/testing).
+ */
+class ExampleUnitTest {
+    @Test
+    fun addition_isCorrect() {
+        assertEquals(4, 2 + 2)
+    }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt
+
+```kotlin
+package com.semmyx.ledger
+import androidx.lifecycle.ViewModelStore
+import com.semmyx.ledger.bank.BankViewModel
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.lang.reflect.Proxy
+import java.time.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.test.*
+import org.junit.*
+import org.junit.Assert.*
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class BankViewModelAccessTest {
+    @get:Rule val main = MainDispatcherRule()
+    @Test fun freeQueriesOnlyTodayAndExpiredPremiumCannotKeepThirtyDays() = runTest {
+        val now = LocalDate.of(2026,10,14)
+        var from: LocalDate? = null
+        val repo = Proxy.newProxyInstance(BankRepository::class.java.classLoader,arrayOf(BankRepository::class.java)) { _, method, args ->
+            when (method.name) {
+                "getDiagnostics" -> MutableStateFlow(ImportDiagnostics())
+                "getMonobankStatus", "getPrivatStatus" -> MutableStateFlow(MonobankStatus())
+                "getEnabled", "getAutoImport" -> true
+                "getImportMode" -> "NOTIFY"
+                "sources" -> { from = args!![1] as LocalDate; flowOf(emptyList<BankSourceSpend>()) }
+                "categorySpending" -> flowOf(emptyList<BankCategorySpend>())
+                "recent" -> flowOf(emptyList<LedgerEntry>())
+                "categories" -> flowOf(emptyList<CustomBankCategory>())
+                "reviews" -> flowOf(emptyList<ImportReview>())
+                else -> error("Unexpected method ${method.name}")
+            }
+        } as BankRepository
+        val preferences = Proxy.newProxyInstance(PreferencesRepository::class.java.classLoader,arrayOf(PreferencesRepository::class.java)) { _, _, _ -> MutableStateFlow(UserPreferences()) } as PreferencesRepository
+        val access = MutableStateFlow(PremiumState())
+        val premium = object : PremiumRepository {
+            override val state = access
+            override suspend fun refresh() {}
+            override suspend fun activateDeveloperToken(token: String) = false
+            override suspend fun developerInstallationId() = "test"
+            override fun clearIssue() {}
+        }
+        val model = BankViewModel(repo,preferences,premium,Clock.fixed(now.atStartOfDay(ZoneOffset.UTC).toInstant(),ZoneOffset.UTC))
+        val store = ViewModelStore().apply { put("bank",model) }
+        val collector = backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { model.state.collect {} }
+        try {
+            model.period("MONTH"); runCurrent()
+            assertEquals("DAY",model.state.value.filter.period); assertEquals(now,from)
+            access.value = PremiumState(entitled=true, source=PremiumSource.TRIAL); runCurrent()
+            assertEquals(now.minusDays(29),from); assertEquals("MONTH",model.state.value.filter.period)
+            access.value = PremiumState(entitled=false); runCurrent()
+            assertEquals("DAY",model.state.value.filter.period); assertEquals(now,from)
+            model.period("ALL"); runCurrent(); assertEquals(now,from)
+        } finally { collector.cancel(); store.clear() }
+    }
+}
 ```
 
 ## app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt
@@ -7110,6 +7785,61 @@ class VoiceSourceTest {
 }
 ```
 
+## bank-fixture/build.gradle.kts
+
+```kotlin
+plugins { id("com.android.application") }
+android {
+    namespace = "com.semmyx.ledger.bankfixture"
+    compileSdk = 36
+    defaultConfig { applicationId = "com.semmyx.ledger.bankfixture"; minSdk = 26; targetSdk = 36; versionCode = 1; versionName = "1" }
+    buildTypes { release { isMinifyEnabled = false } }
+    compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+}
+```
+
+## bank-fixture/src/main/AndroidManifest.xml
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application android:label="QA Bank (test only)" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <receiver android:name=".FixtureReceiver" android:exported="true" />
+    </application>
+</manifest>
+```
+
+## bank-fixture/src/main/java/com/semmyx/ledger/bankfixture/FixtureReceiver.java
+
+```java
+package com.semmyx.ledger.bankfixture;
+import android.app.*;
+import android.content.*;
+
+/** CI-only second app. Never bundled into TG Ledger or included in its release APK. */
+public class FixtureReceiver extends BroadcastReceiver {
+    @Override public void onReceive(Context context, Intent intent) {
+        NotificationManager nm = context.getSystemService(NotificationManager.class);
+        if (intent.getBooleanExtra("cancel", false)) { nm.cancelAll(); return; }
+        nm.createNotificationChannel(new NotificationChannel("qa_bank", "QA Bank payments", NotificationManager.IMPORTANCE_DEFAULT));
+        int id = intent.getIntExtra("id", 1);
+        int cents = intent.getIntExtra("cents", 12550);
+        long at = intent.getLongExtra("at", System.currentTimeMillis());
+        String text = "Ви витратили " + (cents / 100) + "," + String.format(java.util.Locale.ROOT, "%02d", cents % 100) + " грн у Сільпо; Залишок: 10000 грн";
+        Notification.Builder b = new Notification.Builder(context, "qa_bank")
+            .setSmallIcon(android.R.drawable.ic_dialog_info).setContentTitle("Сільпо")
+            .setContentText(text).setWhen(at).setShowWhen(true);
+        String style = intent.getStringExtra("style");
+        if ("big".equals(style)) b.setStyle(new Notification.BigTextStyle().bigText(text));
+        if ("inbox".equals(style)) b.setStyle(new Notification.InboxStyle().addLine(text)
+            .addLine("Оплата 11,22 грн у АТБ; Баланс: 9000 грн"));
+        if ("messaging".equals(style)) b.setStyle(new Notification.MessagingStyle("Bank")
+            .addMessage(text, at, "Сільпо"));
+        nm.notify("qa_" + id, id, b.build());
+    }
+}
+```
+
 ## build.gradle.kts
 
 ```kotlin
@@ -7175,12 +7905,670 @@ dependencies {
 }
 ```
 
-## data/consumer-rules.pro
+## data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/2.json
 
-```text
-# Gson reads DTO fields reflectively, including after release shrinking.
--keep class com.semmyx.ledger.data.remote.RateDto { *; }
--keepattributes Signature,RuntimeVisibleAnnotations,AnnotationDefault
+```json
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 2,
+    "identityHash": "26836e1c65598d48f9b1e51268027d2f",
+    "entities": [
+      {
+        "tableName": "entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `category` TEXT NOT NULL, `epochDay` INTEGER NOT NULL, `note` TEXT NOT NULL, `searchText` TEXT NOT NULL, `createdAtMillis` INTEGER NOT NULL, `deletedAtMillis` INTEGER, `sourceType` TEXT NOT NULL DEFAULT 'UNKNOWN', `bankId` TEXT, `cardLast4` TEXT, `eventAtMillis` INTEGER, `customCategoryId` TEXT, `origin` TEXT NOT NULL DEFAULT 'MANUAL', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchText",
+            "columnName": "searchText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMillis",
+            "columnName": "createdAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deletedAtMillis",
+            "columnName": "deletedAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sourceType",
+            "columnName": "sourceType",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'UNKNOWN'"
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "customCategoryId",
+            "columnName": "customCategoryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'MANUAL'"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_entries_currency_deletedAtMillis_epochDay_createdAtMillis",
+            "unique": false,
+            "columnNames": [
+              "currency",
+              "deletedAtMillis",
+              "epochDay",
+              "createdAtMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_entries_currency_deletedAtMillis_epochDay_createdAtMillis` ON `${TABLE_NAME}` (`currency`, `deletedAtMillis`, `epochDay`, `createdAtMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "rates",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`currency` TEXT NOT NULL, `uahPerUnit` REAL NOT NULL, `epochDay` INTEGER NOT NULL, `fetchedAtMillis` INTEGER NOT NULL, PRIMARY KEY(`currency`))",
+        "fields": [
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uahPerUnit",
+            "columnName": "uahPerUnit",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fetchedAtMillis",
+            "columnName": "fetchedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "currency"
+          ]
+        }
+      },
+      {
+        "tableName": "custom_categories",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `colorHex` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorHex",
+            "columnName": "colorHex",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "bank_inbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `eventKey` TEXT NOT NULL, `bankId` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `merchant` TEXT NOT NULL, `cardLast4` TEXT, `eventAtMillis` INTEGER NOT NULL, `receivedAtMillis` INTEGER NOT NULL, `timeFromMessage` INTEGER NOT NULL, `transfer` INTEGER NOT NULL, `category` TEXT NOT NULL, `origin` TEXT NOT NULL, `status` TEXT NOT NULL, `entryId` TEXT, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventKey",
+            "columnName": "eventKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "merchant",
+            "columnName": "merchant",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedAtMillis",
+            "columnName": "receivedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timeFromMessage",
+            "columnName": "timeFromMessage",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transfer",
+            "columnName": "transfer",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryId",
+            "columnName": "entryId",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_bank_inbox_eventKey",
+            "unique": true,
+            "columnNames": [
+              "eventKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_bank_inbox_eventKey` ON `${TABLE_NAME}` (`eventKey`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '26836e1c65598d48f9b1e51268027d2f')"
+    ]
+  }
+}
+```
+
+## data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/3.json
+
+```json
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 3,
+    "identityHash": "d2c7b95ecb8ce12dbbd2f6fb3e5066fd",
+    "entities": [
+      {
+        "tableName": "entries",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `category` TEXT NOT NULL, `epochDay` INTEGER NOT NULL, `note` TEXT NOT NULL, `searchText` TEXT NOT NULL, `createdAtMillis` INTEGER NOT NULL, `deletedAtMillis` INTEGER, `sourceType` TEXT NOT NULL DEFAULT 'UNKNOWN', `bankId` TEXT, `cardLast4` TEXT, `eventAtMillis` INTEGER, `customCategoryId` TEXT, `origin` TEXT NOT NULL DEFAULT 'MANUAL', PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "title",
+            "columnName": "title",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "note",
+            "columnName": "note",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "searchText",
+            "columnName": "searchText",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAtMillis",
+            "columnName": "createdAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "deletedAtMillis",
+            "columnName": "deletedAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "sourceType",
+            "columnName": "sourceType",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'UNKNOWN'"
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "customCategoryId",
+            "columnName": "customCategoryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true,
+            "defaultValue": "'MANUAL'"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_entries_currency_deletedAtMillis_epochDay_createdAtMillis",
+            "unique": false,
+            "columnNames": [
+              "currency",
+              "deletedAtMillis",
+              "epochDay",
+              "createdAtMillis"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_entries_currency_deletedAtMillis_epochDay_createdAtMillis` ON `${TABLE_NAME}` (`currency`, `deletedAtMillis`, `epochDay`, `createdAtMillis`)"
+          }
+        ]
+      },
+      {
+        "tableName": "rates",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`currency` TEXT NOT NULL, `uahPerUnit` REAL NOT NULL, `epochDay` INTEGER NOT NULL, `fetchedAtMillis` INTEGER NOT NULL, PRIMARY KEY(`currency`))",
+        "fields": [
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "uahPerUnit",
+            "columnName": "uahPerUnit",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "epochDay",
+            "columnName": "epochDay",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "fetchedAtMillis",
+            "columnName": "fetchedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "currency"
+          ]
+        }
+      },
+      {
+        "tableName": "custom_categories",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `colorHex` TEXT NOT NULL, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "name",
+            "columnName": "name",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "colorHex",
+            "columnName": "colorHex",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        }
+      },
+      {
+        "tableName": "bank_inbox",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` TEXT NOT NULL, `eventKey` TEXT NOT NULL, `bankId` TEXT NOT NULL, `amountMinor` INTEGER NOT NULL, `currency` TEXT NOT NULL, `type` TEXT NOT NULL, `merchant` TEXT NOT NULL, `cardLast4` TEXT, `eventAtMillis` INTEGER NOT NULL, `receivedAtMillis` INTEGER NOT NULL, `timeFromMessage` INTEGER NOT NULL, `transfer` INTEGER NOT NULL, `category` TEXT NOT NULL, `origin` TEXT NOT NULL, `status` TEXT NOT NULL, `entryId` TEXT, `groupKey` TEXT, PRIMARY KEY(`id`))",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "eventKey",
+            "columnName": "eventKey",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "bankId",
+            "columnName": "bankId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "amountMinor",
+            "columnName": "amountMinor",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "currency",
+            "columnName": "currency",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "type",
+            "columnName": "type",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "merchant",
+            "columnName": "merchant",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "cardLast4",
+            "columnName": "cardLast4",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "eventAtMillis",
+            "columnName": "eventAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "receivedAtMillis",
+            "columnName": "receivedAtMillis",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timeFromMessage",
+            "columnName": "timeFromMessage",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "transfer",
+            "columnName": "transfer",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "category",
+            "columnName": "category",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "origin",
+            "columnName": "origin",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "entryId",
+            "columnName": "entryId",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "groupKey",
+            "columnName": "groupKey",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_bank_inbox_eventKey",
+            "unique": true,
+            "columnNames": [
+              "eventKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_bank_inbox_eventKey` ON `${TABLE_NAME}` (`eventKey`)"
+          },
+          {
+            "name": "index_bank_inbox_groupKey",
+            "unique": false,
+            "columnNames": [
+              "groupKey"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_bank_inbox_groupKey` ON `${TABLE_NAME}` (`groupKey`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'd2c7b95ecb8ce12dbbd2f6fb3e5066fd')"
+    ]
+  }
+}
 ```
 
 ## data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt
@@ -7516,7 +8904,7 @@ import kotlinx.coroutines.flow.update
 
 /**
  * Imports and acknowledgements are atomic with the existing ledger.
- * No HTTP, no raw text storage, no PAN storage.
+ * Push parsing is offline. API clients only read statements; no raw text or PAN storage.
  *
  * ## Cross-source deduplication
  *
@@ -7539,6 +8927,7 @@ class BankImportRepository(
     private val db: LedgerDatabase, context: Context,
     private val vault: com.semmyx.ledger.data.security.KeystoreVault? = null,
     private val monobank: MonobankClient = MonobankClient(),
+    private val privat: PrivatBankClient = PrivatBankClient(),
 ) : BankRepository {
 
     private val ctx = context.applicationContext
@@ -7622,7 +9011,7 @@ class BankImportRepository(
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
     override var importMode: String
-        get() = config.getString("mode", "SMS") ?: "SMS"
+        get() = config.getString("mode", "NOTIFY") ?: "NOTIFY"
         set(value) { require(value in listOf("API", "SMS", "NOTIFY")); config.edit().putString("mode", value).apply() }
 
     // -------------------------------------------------------------------------
@@ -7711,7 +9100,7 @@ class BankImportRepository(
         } catch (e: java.io.IOException) {
             monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
+            if (e is CancellationException) { monoState.update { it.copy(syncing = false) }; throw e }
             monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
         } finally { syncLock.unlock() }
     }
@@ -7738,6 +9127,7 @@ class BankImportRepository(
         parsed: ParsedBankOperation, eventKey: String, at: Long, origin: String,
         manual: Boolean = false, authoritative: Boolean = false,
     ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
         var result = "QUEUED"
         db.withTransaction {
             // --- Tier 1: same-bank re-delivery guard ---
@@ -7756,7 +9146,7 @@ class BankImportRepository(
             // app and the issuing bank announcing the same tap. Otherwise they wait in the review queue.
             val walletInvolved = Banks.WALLET_ID == parsed.bankId || crossSourceDup && dao.walletTwin(
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis) > 0
-            val silentDrop = !manual && autoImport && (sameBankDup || (crossSourceDup && walletInvolved))
+            val silentDrop = !manual && autoImport && crossSourceDup && walletInvolved
             val status = when {
                 silentDrop -> "DUPLICATE_IGNORED"
                 sameBankDup   -> "DUPLICATE_REVIEW"
@@ -7792,14 +9182,81 @@ class BankImportRepository(
 
             // Auto-import: only for confident single-source entries.
             // Cross-source duplicates are NEVER auto-imported — the user must review.
-            if (!manual && autoImport && parsed.confident && status == "REVIEW") {
+            if (!manual && autoImport && parsed.confident && !parsed.transfer && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
-                if (System.currentTimeMillis() - parsed.happenedAtMillis < 15 * 60_000L) postImportNotification(parsed)
+                
             }
         }
+        // Notify only AFTER commit. A denied notification permission must never undo the entry.
+        if (result == "AUTO_IMPORTED" && System.currentTimeMillis() - parsed.happenedAtMillis in 0 until 15 * 60_000L) postImportNotification(parsed)
         note(result)
         return result
+    }
+
+    private val privatState = MutableStateFlow(MonobankStatus(
+        connected = config.getBoolean("privat_connected", false),
+        lastSyncMillis = config.getLong("privat_last_sync", 0L)))
+    override val privatStatus = privatState.asStateFlow()
+    private val privatLock = kotlinx.coroutines.sync.Mutex()
+
+    override suspend fun connectPrivat(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..2048 || clean.any { it.code !in 33..126 }) {
+            privatState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val today = LocalDate.now(ZoneId.of("Europe/Kyiv"))
+            // Validate access before storing credentials. No payment endpoints are called.
+            privat.statement(clean, today, today)
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("privatToken", clean); Unit }
+            config.edit().putBoolean("privat_connected", true).remove("privat_last_sync").putString("mode", "API").apply()
+            privatState.value = MonobankStatus(connected = true)
+            true
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { privatState.update { it.copy(error = privatError(e)) }; false }
+    }
+
+    override suspend fun disconnectPrivat() = withContext(Dispatchers.IO) {
+        vault?.update { it.remove("privatToken"); Unit }
+        config.edit().remove("privat_connected").remove("privat_last_sync").apply()
+        privatState.value = MonobankStatus()
+    }
+
+    override suspend fun syncPrivat(): Int = withContext(Dispatchers.IO) {
+        if (!privatLock.tryLock()) return@withContext 0
+        try {
+            if (!enabled || !config.getBoolean("privat_connected", false)) return@withContext 0
+            val token = vault?.read { it.optString("privatToken", "") }.orEmpty()
+            if (token.isBlank()) { privatState.update { it.copy(connected = false) }; return@withContext 0 }
+            privatState.update { it.copy(syncing = true, error = null) }
+            val now = System.currentTimeMillis()
+            val zone = ZoneId.of("Europe/Kyiv")
+            val through = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+            val last = config.getLong("privat_last_sync", 0L)
+            val from = if (last > 0) Instant.ofEpochMilli(last).atZone(zone).toLocalDate().minusDays(1).coerceAtLeast(through.minusDays(29)) else through.minusDays(29)
+            var imported = 0
+            // Short bounded windows also accommodate banks with restrictive statement date limits.
+            var begin = from
+            while (!begin.isAfter(through)) {
+                val end = begin.plusDays(6).coerceAtMost(through)
+                privat.statement(token, begin, end).forEach { row ->
+                    val key = "PRIVAT:${row.key}"
+                    if (store(row.parsed, key, row.parsed.happenedAtMillis, "API", authoritative = true) == "AUTO_IMPORTED") imported++
+                }
+                begin = end.plusDays(1)
+            }
+            config.edit().putLong("privat_last_sync", now).apply()
+            privatState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null) }
+            imported
+        } catch (e: CancellationException) { privatState.update { it.copy(syncing = false) }; throw e }
+        catch (e: Exception) { privatState.update { it.copy(syncing = false, error = privatError(e)) }; 0 }
+        finally { privatLock.unlock() }
+    }
+
+    private fun privatError(e: Exception): String = when ((e as? PrivatBankClient.ApiException)?.code) {
+        401, 403 -> "BAD_TOKEN"; 429 -> "RATE_LIMIT"; else -> "NETWORK"
     }
 
     // -------------------------------------------------------------------------
@@ -7860,10 +9317,10 @@ class BankImportRepository(
     private fun postImportNotification(parsed: ParsedBankOperation) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val channelId = "ledger_import"
+        val channelId = "ledger_import_v2"
         if (nm.getNotificationChannel(channelId) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(channelId, "Ledger Import", NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(channelId, "Saved bank payments", NotificationManager.IMPORTANCE_DEFAULT).apply {
                     description = "Background bank import events"
                     setShowBadge(false)
                 },
@@ -7876,6 +9333,10 @@ class BankImportRepository(
             .setSmallIcon(android.R.drawable.ic_menu_save)
             .setContentTitle(title)
             .setContentText(body)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(android.app.PendingIntent.getActivity(ctx, 0,
+                ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: android.content.Intent(),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
@@ -7914,7 +9375,8 @@ import okhttp3.Request
  * sent only to this host in the `X-Token` header. Blocking calls: run on a background dispatcher.
  */
 class MonobankClient(
-    private val http: OkHttpClient = OkHttpClient(),
+    private val http: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+        .callTimeout(45, java.util.concurrent.TimeUnit.SECONDS).build(),
     private val baseUrl: String = "https://api.monobank.ua",
 ) {
     data class Account(val id: String, val currency: LedgerCurrency, val type: String, val cardLast4: String?)
@@ -7957,6 +9419,89 @@ class MonobankClient(
                 amount = o.get("amount")?.asLong ?: return@mapNotNull null,
                 comment = o.get("comment")?.takeIf { !it.isJsonNull }?.asString.orEmpty(),
             )
+        }
+    }
+}
+```
+
+## data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+
+import com.google.gson.JsonObject
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.domain.bank.*
+import java.io.IOException
+import java.math.BigDecimal
+import java.time.*
+import java.time.format.DateTimeFormatter
+import java.time.format.ResolverStyle
+import java.util.concurrent.TimeUnit
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.HttpUrl.Companion.toHttpUrl
+
+/** Privat24 Business AutoClient. GET statements only; not the API for retail Privat24 cards. */
+class PrivatBankClient(
+    private val http: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+        .callTimeout(45, TimeUnit.SECONDS).build(),
+    private val baseUrl: String = "https://acp.privatbank.ua",
+) {
+    data class Operation(val key: String, val parsed: ParsedBankOperation)
+    class ApiException(val code: Int) : IOException("PrivatBank request failed ($code)")
+
+    fun statement(token: String, from: LocalDate, through: LocalDate): List<Operation> {
+        require(!through.isBefore(from))
+        val result = mutableListOf<Operation>()
+        var cursor: String? = null
+        val cursors = mutableSetOf<String>()
+        // Pagination is bounded; a broken/repeated cursor cannot loop forever or silently truncate.
+        repeat(100) {
+            val url = (baseUrl.trimEnd('/') + "/api/statements/transactions").toHttpUrl().newBuilder()
+                .addQueryParameter("startDate", from.format(DateTimeFormatter.ofPattern("dd-MM-uuuu")))
+                .addQueryParameter("endDate", through.format(DateTimeFormatter.ofPattern("dd-MM-uuuu")))
+                .addQueryParameter("limit", "100")
+            cursor?.let { url.addQueryParameter("followId", it) }
+            val request = Request.Builder().url(url.build()).get().header("token", token)
+                .header("User-Agent", "TG-Ledger/3.3.3")
+                .header("Content-Type", "application/json;charset=utf8").header("Accept", "application/json").build()
+            val root = http.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw ApiException(response.code)
+                JsonParser.parseString(response.body?.string().orEmpty()).asJsonObject
+            }
+            if (root.string("status") != "SUCCESS") throw ApiException(422)
+            root.getAsJsonArray("transactions")?.forEach { row -> map(row.asJsonObject)?.let(result::add) }
+            val more = root.string("exist_next_page").equals("true", ignoreCase = true)
+            if (!more) return result.distinctBy { it.key }
+            cursor = root.string("next_page_id").takeIf { it.isNotBlank() } ?: throw ApiException(422)
+            if (!cursors.add(cursor!!)) throw ApiException(422)
+        }
+        throw ApiException(422)
+    }
+
+    companion object {
+        private fun JsonObject.string(key: String) = get(key)?.takeUnless { it.isJsonNull }?.asString.orEmpty()
+        fun map(row: JsonObject): Operation? {
+            if (row.string("PR_PR") != "r" || row.string("FL_REAL") != "r") return null
+            val type = when (row.string("TRANTYPE")) { "D" -> EntryType.EXPENSE; "C" -> EntryType.INCOME; else -> return null }
+            val currency = runCatching { LedgerCurrency.valueOf(row.string("CCY")) }.getOrNull() ?: return null
+            val minor = runCatching { BigDecimal(row.string("SUM")).abs().movePointRight(2).longValueExact() }.getOrNull() ?: return null
+            if (minor <= 0 || minor > Money.MAX_ENTRY_MINOR) return null
+            val ref = row.string("REF"); val refn = row.string("REFN"); val account = row.string("AUT_MY_ACC")
+            if (ref.isBlank() || refn.isBlank() || account.isBlank()) return null
+            val timestamp = runCatching {
+                LocalDateTime.parse(row.string("DATE_TIME_DAT_OD_TIM_P"),
+                    DateTimeFormatter.ofPattern("dd.MM.uuuu HH:mm:ss").withResolverStyle(ResolverStyle.STRICT))
+                    .atZone(ZoneId.of("Europe/Kyiv")).toInstant().toEpochMilli()
+            }.getOrNull() ?: return null
+            val merchant = row.string("AUT_CNTR_NAM").take(60).ifBlank { "ПриватБанк" }
+            val purpose = row.string("OSND")
+            val transfer = Regex("між власними|власн.*рахунк|между своими|own accounts", RegexOption.IGNORE_CASE).containsMatchIn(purpose)
+            val category = if (transfer) Category.TRANSFER else BankParser.categorize(merchant)
+            return Operation("$account|$ref|$refn", ParsedBankOperation("privat", minor, currency, type,
+                merchant, null, timestamp, true, transfer, !transfer, category))
         }
     }
 }
@@ -9219,6 +10764,57 @@ class MonobankClientTest {
 }
 ```
 
+## data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt
+
+```kotlin
+package com.semmyx.ledger.data.bank
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.*
+import okhttp3.mockwebserver.*
+import java.time.LocalDate
+import org.junit.*
+import org.junit.Assert.*
+
+class PrivatBankClientTest {
+    private lateinit var server: MockWebServer
+    private lateinit var client: PrivatBankClient
+    private val row = """{"AUT_MY_ACC":"UA111111111111111111111111111","AUT_CNTR_NAM":"Сільпо","CCY":"UAH","FL_REAL":"r","PR_PR":"r","SUM":"125.50","REF":"ref1","REFN":"1","TRANTYPE":"D","DATE_TIME_DAT_OD_TIM_P":"14.10.2026 12:01:02","OSND":"Оплата"}"""
+    @Before fun before() { server = MockWebServer().also { it.start() }; client = PrivatBankClient(baseUrl = server.url("/").toString()) }
+    @After fun after() { server.shutdown() }
+    @Test fun readOnlyRequestPaginationAndExactMoney() {
+        server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":true,"next_page_id":"cursor1","transactions":[$row]}"""))
+        server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":false,"transactions":[$row]}"""))
+        val rows = client.statement("test-token", LocalDate.of(2026,10,1), LocalDate.of(2026,10,7))
+        assertEquals(1, rows.size); assertEquals(12550L, rows[0].parsed.amountMinor)
+        assertEquals(EntryType.EXPENSE, rows[0].parsed.type)
+        assertEquals(Category.FOOD, rows[0].parsed.category)
+        val first = server.takeRequest()
+        assertEquals("GET", first.method); assertEquals("test-token", first.getHeader("token"))
+        assertEquals("01-10-2026", first.requestUrl!!.queryParameter("startDate"))
+        assertEquals("cursor1", server.takeRequest().requestUrl!!.queryParameter("followId"))
+    }
+    @Test fun onlyBookedRowsAndSupportedCurrenciesAreImported() {
+        fun map(text: String) = PrivatBankClient.map(JsonParser.parseString(text).asJsonObject)
+        assertNull(map(row.replace("\"PR_PR\":\"r\"", "\"PR_PR\":\"p\"")))
+        assertNull(map(row.replace("\"FL_REAL\":\"r\"", "\"FL_REAL\":\"i\"")))
+        assertNull(map(row.replace("\"UAH\"", "\"JPY\"")))
+        assertNull(map(row.replace("125.50", "0")))
+        assertEquals(EntryType.INCOME, map(row.replace("\"D\"", "\"C\""))!!.parsed.type)
+        assertNull(map(row.replace("14.10.2026", "31.02.2026")))
+    }
+    @Test fun repeatedOrMissingCursorFailsRatherThanSilentlyLosingHistory() {
+        repeat(2) { server.enqueue(MockResponse().setBody("""{"status":"SUCCESS","exist_next_page":true,"next_page_id":"same","transactions":[]}""")) }
+        try { client.statement("test", LocalDate.now(), LocalDate.now()); fail() }
+        catch (e: PrivatBankClient.ApiException) { assertEquals(422, e.code) }
+    }
+    @Test fun badCredentialsAreReported() {
+        server.enqueue(MockResponse().setResponseCode(403))
+        try { client.statement("test", LocalDate.now(), LocalDate.now()); fail() }
+        catch (e: PrivatBankClient.ApiException) { assertEquals(403, e.code) }
+    }
+}
+```
+
 ## data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
 
 ```kotlin
@@ -9715,6 +11311,7 @@ object Banks {
         Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise"), setOf("transferwise")),
         Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"), setOf("number26")),
         // Wallet apps announce the same tap as the issuing bank; the pair is collapsed by cross-source deduplication.
+        Bank("other", "Інший банк / Other bank", emptySet(), emptySet()),
         Bank(WALLET_ID, "Google Wallet", setOf("com.google.android.apps.walletnfcrel", "com.samsung.android.spay"), emptySet(), setOf("walletnfcrel")),
     )
     fun byPackage(value: String): Bank? =
@@ -9752,7 +11349,7 @@ object BankParser {
         RegexOption.IGNORE_CASE)
     private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
     private val expense = Regex(
-        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
+        "(?:списан|потрат|потрач|сплачен|розрахува|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
         RegexOption.IGNORE_CASE)
     private val income = Regex(
         "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",
@@ -9945,6 +11542,19 @@ object BankParser {
 }
 ```
 
+## domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+
+/** Enforced before any bank statistics query, including after entitlement expires. */
+object BankPeriodAccess {
+    val periods = setOf("DAY", "WEEK", "MONTH", "ALL")
+    fun effective(requested: String, premium: Boolean): String =
+        if (requested in periods && (requested == "DAY" || premium)) requested else "DAY"
+}
+```
+
 ## domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt
 
 ```kotlin
@@ -9968,6 +11578,10 @@ data class MonobankStatus(val connected: Boolean = false, val syncing: Boolean =
 interface BankRepository {
     /** "API" (monobank token), "SMS" or "NOTIFY" (bank app notifications). */
     var importMode: String
+    val privatStatus: Flow<MonobankStatus>
+    suspend fun connectPrivat(token: String): Boolean
+    suspend fun disconnectPrivat()
+    suspend fun syncPrivat(): Int
     val monobankStatus: Flow<MonobankStatus>
     suspend fun connectMonobank(token: String): Boolean
     suspend fun disconnectMonobank()
@@ -10445,6 +12059,26 @@ class BankParserTest {
 }
 ```
 
+## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt
+
+```kotlin
+package com.semmyx.ledger.domain.bank
+import org.junit.Assert.*
+import org.junit.Test
+class BankPeriodAccessTest {
+    @Test fun freeOnlyTodayAndNoAllTimeBypass() {
+        BankPeriodAccess.periods.forEach { assertEquals("DAY", BankPeriodAccess.effective(it, false)) }
+    }
+    @Test fun premiumAndTrialCanUseEveryPeriod() {
+        BankPeriodAccess.periods.forEach { assertEquals(it, BankPeriodAccess.effective(it, true)) }
+    }
+    @Test fun expiredAccessFallsBackAndInvalidPeriodIsRejected() {
+        assertEquals("DAY", BankPeriodAccess.effective("MONTH", false))
+        assertEquals("DAY", BankPeriodAccess.effective("INVALID", true))
+    }
+}
+```
+
 ## domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt
 
 ```kotlin
@@ -10523,6 +12157,45 @@ if (!(Test-Path $jar)) {
 if ((Get-FileHash $jar -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Untrusted Gradle wrapper. Refusing to run.' }
 ```
 
+## gradle/gradle-daemon-jvm.properties
+
+```properties
+#This file is generated by updateDaemonJvm
+toolchainUrl.FREE_BSD.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.FREE_BSD.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.LINUX.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.LINUX.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.MAC_OS.AARCH64=https\://api.foojay.io/disco/v3.0/ids/c2dd35c9d0aaf0ba6ad0791320f99dfc/redirect
+toolchainUrl.MAC_OS.X86_64=https\://api.foojay.io/disco/v3.0/ids/e5810bd7fd1f8a586644409d395a7e55/redirect
+toolchainUrl.UNIX.AARCH64=https\://api.foojay.io/disco/v3.0/ids/cf726b4a1c84b50457225f9bba6d7650/redirect
+toolchainUrl.UNIX.X86_64=https\://api.foojay.io/disco/v3.0/ids/fa1e318c287360478e3c83a9a3ef1007/redirect
+toolchainUrl.WINDOWS.AARCH64=https\://api.foojay.io/disco/v3.0/ids/7b3c4877c0749019e6805bb61e421497/redirect
+toolchainUrl.WINDOWS.X86_64=https\://api.foojay.io/disco/v3.0/ids/d76df094a9cbbabd3b08251f9e61444a/redirect
+toolchainVersion=25
+```
+
+## gradle/libs.versions.toml
+
+```toml
+[versions]
+coreKtx = "1.10.1"
+junit = "4.13.2"
+junitVersion = "1.1.5"
+espressoCore = "3.5.1"
+appcompat = "1.6.1"
+material = "1.10.0"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+
+[plugins]
+```
+
 ## gradle/wrapper/gradle-wrapper.properties
 
 ```properties
@@ -10594,7 +12267,7 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TGLedger"
 include(":app", ":domain", ":data")
-include(":app")
+include(":bank-fixture")
 ```
 
 ## tools/audit_project.py
@@ -10757,6 +12430,43 @@ output.parent.mkdir(exist_ok=True)
 output.write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n')
 print(json.dumps({key:value for key,value in result.items() if key!='checks'}, ensure_ascii=False, indent=2))
 sys.exit(1 if failures else 0)
+```
+
+## tools/export_sources.py
+
+```python
+#!/usr/bin/env python3
+"""Regenerate the source book, project tree and SHA-256 manifest from tracked files.
+Never includes .git, ignored local credentials, build outputs or developer private keys.
+Run after staging new files; repeat after changing the release verification report.
+"""
+from pathlib import Path
+import hashlib
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+tracked = sorted(set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines()))
+version = re.search(r'versionName = "([^"]+)"', (ROOT / 'app/build.gradle.kts').read_text())[1]
+langs = {'.kt':'kotlin', '.kts':'kotlin', '.java':'java', '.py':'python', '.xml':'xml',
+         '.yml':'yaml', '.yaml':'yaml', '.properties':'properties', '.ps1':'powershell',
+         '.bat':'batch', '.toml':'toml', '.json':'json'}
+source = [p for p in tracked if Path(p).suffix in langs or p == 'gradlew']
+book = [f'# TG Ledger {version} — complete file-by-file source', '',
+        f'{len(source)} implementation, configuration and test files, without truncation.', '',
+        'Generated from tracked files. Local keys and build outputs are excluded.', '']
+for name in source:
+    text = (ROOT / name).read_text().rstrip('\n')
+    # Fences must be longer than any backtick run inside the original file.
+    fence = '`' * max(3, max((len(m[0]) + 1 for m in re.finditer(r'`+', text)), default=3))
+    book.extend([f'## {name}', '', fence + langs.get(Path(name).suffix, 'bash'), text, fence, ''])
+(ROOT / 'SOURCE_CODE.md').write_text('\n'.join(book))
+files = sorted(set(tracked) | {'SOURCE_CODE.md', 'PROJECT_TREE.txt', 'MANIFEST.sha256'})
+(ROOT / 'PROJECT_TREE.txt').write_text(f'TG_Ledger-{version}/\n' + '\n'.join('  '+p for p in files)+'\n')
+(ROOT / 'MANIFEST.sha256').write_text(''.join(
+    f'{hashlib.sha256((ROOT/name).read_bytes()).hexdigest()}  {name}\n'
+    for name in files if name != 'MANIFEST.sha256'))
+print(f'Source book: {len(source)} files; manifest: {len(files)-1} files')
 ```
 
 ## tools/issue_activation_code.py
@@ -11140,4 +12850,2775 @@ with tempfile.TemporaryDirectory() as folder:
     if result.returncode: raise SystemExit(result.stdout+result.stderr)
     print(result.stdout.strip())
     (R/'verification/voice-regex-jvm.json').write_text(json.dumps({'kind':'exact-source-regex-on-JVM','passed':7,'compiled_kotlin':False,'compiled_android':False,'output':result.stdout.strip()},indent=2)+'\n')
+```
+
+## verification/bank-regex-jvm.json
+
+```json
+{
+  "kind": "actual-source-regex-on-JVM",
+  "passed_fixtures": 12,
+  "compiled_kotlin": false,
+  "executed_android": false
+}
+```
+
+## verification/bank-sql.json
+
+```json
+{
+  "kind": "exact-migration-and-Room-bank-SQL-in-SQLite",
+  "passed": 10,
+  "checks": [
+    "Migration preserves entries and does not invent cash/card attribution",
+    "All six metadata columns migrated",
+    "Source totals exclude income, deleted and other currencies",
+    "Mono is isolated from Privat and cash",
+    "Source category filter uses chosen bank",
+    "Custom categories retain their own identity",
+    "Unique fingerprint prevents repeated delivery imports",
+    "Near duplicates are detected for review",
+    "Different banks do not deduplicate each other",
+    "Clearing review history preserves ledger entries"
+  ],
+  "compiled_android": false
+}
+```
+
+## verification/cat-skin-assets.json
+
+```json
+{
+  "dimensions": [
+    1024,
+    1024
+  ],
+  "changed_pixels": 440799,
+  "eye_nose_pixels_preserved": true,
+  "dark_background_preserved": true,
+  "android_render_verified": false
+}
+```
+
+## verification/navigation-recovery.json
+
+```json
+{
+  "kind": "source-regression-guards",
+  "passed": 10,
+  "checks": [
+    "Explicit real Activity owners are provided above localized content",
+    "Registry owner is installed before the localized Context replacement",
+    "History button no longer invokes dashboard back action",
+    "History has an independent navigation destination",
+    "Analytics selected month is passed to history",
+    "System settings launched safely from localized non-Activity Context",
+    "Local text recovery has a preview and explicit submit action",
+    "Manual recovery works without automation and never bypasses confirmation",
+    "Live import diagnostics are visible in the banking screen",
+    "Reconnect and bank package configuration are provided"
+  ],
+  "compiled_android": false,
+  "device_crash_fixed_verified": false
+}
+```
+
+## verification/release-3.3.3.json
+
+```json
+{
+  "version": "3.3.3",
+  "version_code": 17,
+  "tested_code_commit": "56f60e981437e389e992d2901b3cf7adbd63cb36",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38578995362",
+  "jobs": [
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:24:14Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:23:49Z"
+    },
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-14T14:16:12Z",
+      "completed_at": "2026-10-14T14:25:18Z"
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 25,
+    "data_play": 18,
+    "data_legacy_v7": 18
+  },
+  "instrumented": {
+    "api26": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 14,
+      "data": 6,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "packaging_changes_after_tests": "Documentation, generated source book, manifest and test artifacts only; application code unchanged."
+}
+```
+
+## verification/source-audit.json
+
+```json
+{
+  "kind": "offline-structural-resource-and-sql-audit",
+  "passed_assertions": 2581,
+  "failures": [],
+  "kotlin_source_files": 135,
+  "localized_string_pairs": 397,
+  "compiled_android": false,
+  "executed_android_or_junit_tests": false,
+  "checks": [
+    "Well-formed XML: bank-fixture/src/main/AndroidManifest.xml",
+    "Well-formed XML: data/src/main/AndroidManifest.xml",
+    "Well-formed XML: app/src/main/AndroidManifest.xml",
+    "Well-formed XML: app/src/main/res/drawable/brand_sky.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_launcher_background.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_launcher_foreground.xml",
+    "Well-formed XML: app/src/main/res/drawable/ic_splash.xml",
+    "Well-formed XML: app/src/main/res/drawable/mascot_gray.xml",
+    "Well-formed XML: app/src/main/res/drawable/mascot_sky.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml",
+    "Well-formed XML: app/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml",
+    "Well-formed XML: app/src/main/res/values-night/themes.xml",
+    "Well-formed XML: app/src/main/res/values-uk/strings.xml",
+    "Well-formed XML: app/src/main/res/values/branding.xml",
+    "Well-formed XML: app/src/main/res/values/colors.xml",
+    "Well-formed XML: app/src/main/res/values/strings.xml",
+    "Well-formed XML: app/src/main/res/values/themes.xml",
+    "Well-formed XML: app/src/main/res/xml/backup_rules.xml",
+    "Well-formed XML: app/src/main/res/xml/data_extraction_rules.xml",
+    "Well-formed XML: app/src/main/res/xml/network_security_config.xml",
+    "No duplicate string: values/brand_author_signature",
+    "No duplicate string: values/brand_copyright",
+    "No duplicate string: values/app_name",
+    "No duplicate string: values/overview",
+    "No duplicate string: values/settings",
+    "No duplicate string: values/help",
+    "No duplicate string: values/back",
+    "No duplicate string: values/close",
+    "No duplicate string: values/retry",
+    "No duplicate string: values/next",
+    "No duplicate string: values/skip",
+    "No duplicate string: values/get_started",
+    "No duplicate string: values/page_of",
+    "No duplicate string: values/onboard_title_one",
+    "No duplicate string: values/onboard_body_one",
+    "No duplicate string: values/onboard_title_two",
+    "No duplicate string: values/onboard_body_two",
+    "No duplicate string: values/onboard_title_three",
+    "No duplicate string: values/onboard_body_three",
+    "No duplicate string: values/unlock_title",
+    "No duplicate string: values/confirm_pin",
+    "No duplicate string: values/create_pin",
+    "No duplicate string: values/pin_setup_subtitle",
+    "No duplicate string: values/pin_unlock_subtitle",
+    "No duplicate string: values/pin_digit_count",
+    "No duplicate string: values/pin_locked",
+    "No duplicate string: values/pin_incorrect",
+    "No duplicate string: values/pin_mismatch",
+    "No duplicate string: values/pin_recovery_notice",
+    "No duplicate string: values/erase_digit",
+    "No duplicate string: values/start_over",
+    "No duplicate string: values/need_help",
+    "No duplicate string: values/security_error",
+    "No duplicate string: values/biometric_failed",
+    "No duplicate string: values/unlock_biometric",
+    "No duplicate string: values/biometric_title",
+    "No duplicate string: values/biometric_subtitle",
+    "No duplicate string: values/use_pin",
+    "No duplicate string: values/load_error_title",
+    "No duplicate string: values/storage_error",
+    "No duplicate string: values/saved",
+    "No duplicate string: values/entry_deleted",
+    "No duplicate string: values/undo",
+    "No duplicate string: values/undo_expired",
+    "No duplicate string: values/dashboard_heading",
+    "No duplicate string: values/greeting",
+    "No duplicate string: values/dashboard_subtitle",
+    "No duplicate string: values/total_balance",
+    "No duplicate string: values/currency_scope",
+    "No duplicate string: values/income",
+    "No duplicate string: values/expenses",
+    "No duplicate string: values/expense",
+    "No duplicate string: values/cash_flow",
+    "No duplicate string: values/last_7_days",
+    "No duplicate string: values/last_30_days",
+    "No duplicate string: values/last_30_days_plus",
+    "No duplicate string: values/chart_description",
+    "No duplicate string: values/chart_empty",
+    "No duplicate string: values/legend_income",
+    "No duplicate string: values/legend_expense",
+    "No duplicate string: values/activity",
+    "No duplicate string: values/search_entries",
+    "No duplicate string: values/clear_search",
+    "No duplicate string: values/all",
+    "No duplicate string: values/search_scope",
+    "No duplicate string: values/no_matches",
+    "No duplicate string: values/no_matches_body",
+    "No duplicate string: values/clear_filters",
+    "No duplicate string: values/empty_ledger_title",
+    "No duplicate string: values/empty_ledger_body",
+    "No duplicate string: values/add_first_entry",
+    "No duplicate string: values/add_entry",
+    "No duplicate string: values/edit_entry",
+    "No duplicate string: values/delete_entry",
+    "No duplicate string: values/delete_named_entry",
+    "No duplicate string: values/load_more",
+    "No duplicate string: values/positive_amount",
+    "No duplicate string: values/negative_amount",
+    "No duplicate string: values/category_food",
+    "No duplicate string: values/category_transport",
+    "No duplicate string: values/category_home",
+    "No duplicate string: values/category_health",
+    "No duplicate string: values/category_leisure",
+    "No duplicate string: values/category_salary",
+    "No duplicate string: values/category_other",
+    "No duplicate string: values/entry_currency_notice",
+    "No duplicate string: values/amount",
+    "No duplicate string: values/amount_invalid",
+    "No duplicate string: values/title_optional_hint",
+    "No duplicate string: values/entry_title",
+    "No duplicate string: values/title_invalid",
+    "No duplicate string: values/title_hint",
+    "No duplicate string: values/category",
+    "No duplicate string: values/date_invalid",
+    "No duplicate string: values/note_optional",
+    "No duplicate string: values/character_count",
+    "No duplicate string: values/save_entry",
+    "No duplicate string: values/entry_not_found",
+    "No duplicate string: values/done",
+    "No duplicate string: values/cancel",
+    "No duplicate string: values/discard_title",
+    "No duplicate string: values/discard_body",
+    "No duplicate string: values/discard",
+    "No duplicate string: values/keep_editing",
+    "No duplicate string: values/profile",
+    "No duplicate string: values/local_profile",
+    "No duplicate string: values/display_name",
+    "No duplicate string: values/save_profile",
+    "No duplicate string: values/name_invalid",
+    "No duplicate string: values/language",
+    "No duplicate string: values/language_instant",
+    "No duplicate string: values/language_en",
+    "No duplicate string: values/language_uk",
+    "No duplicate string: values/appearance",
+    "No duplicate string: values/theme_system",
+    "No duplicate string: values/theme_light",
+    "No duplicate string: values/theme_dark",
+    "No duplicate string: values/default_currency",
+    "No duplicate string: values/currency_explanation",
+    "No duplicate string: values/security",
+    "No duplicate string: values/biometric_unlock",
+    "No duplicate string: values/biometric_explanation",
+    "No duplicate string: values/biometric_unavailable",
+    "No duplicate string: values/auto_lock_explanation",
+    "No duplicate string: values/lock_now",
+    "No duplicate string: values/premium_name",
+    "No duplicate string: values/premium_body",
+    "No duplicate string: values/premium_active",
+    "No duplicate string: values/premium_offline_notice",
+    "No duplicate string: values/premium_unlock",
+    "No duplicate string: values/premium_buy",
+    "No duplicate string: values/restore_purchases",
+    "No duplicate string: values/billing_configuration",
+    "No duplicate string: values/billing_unavailable",
+    "No duplicate string: values/billing_network",
+    "No duplicate string: values/billing_pending",
+    "No duplicate string: values/billing_verification",
+    "No duplicate string: values/billing_acknowledgement",
+    "No duplicate string: values/reference_rates",
+    "No duplicate string: values/rates_disclaimer",
+    "No duplicate string: values/rates_empty",
+    "No duplicate string: values/rate_value",
+    "No duplicate string: values/rates_as_of",
+    "No duplicate string: values/refresh_rates",
+    "No duplicate string: values/refreshing",
+    "No duplicate string: values/rate_offline",
+    "No duplicate string: values/support",
+    "No duplicate string: values/support_intro",
+    "No duplicate string: values/contact_telegram",
+    "No duplicate string: values/diagnostics_show_button",
+    "No duplicate string: values/diagnostics_none",
+    "No duplicate string: values/diagnostics_title",
+    "No duplicate string: values/diagnostics_hint",
+    "No duplicate string: values/diagnostics_copy",
+    "No duplicate string: values/diagnostics_copied",
+    "No duplicate string: values/diagnostics_clear",
+    "No duplicate string: values/diagnostics_close",
+    "No duplicate string: values/here_to_help",
+    "No duplicate string: values/lead_developer",
+    "No duplicate string: values/support_handle",
+    "No duplicate string: values/copy_handle",
+    "No duplicate string: values/handle_copied",
+    "No duplicate string: values/support_privacy",
+    "No duplicate string: values/telegram_support",
+    "No duplicate string: values/support_network_error",
+    "No duplicate string: values/help_heading",
+    "No duplicate string: values/help_intro",
+    "No duplicate string: values/help_entries_title",
+    "No duplicate string: values/help_entries_body",
+    "No duplicate string: values/help_privacy_title",
+    "No duplicate string: values/help_privacy_body",
+    "No duplicate string: values/help_security_title",
+    "No duplicate string: values/help_security_body",
+    "No duplicate string: values/help_premium_title",
+    "No duplicate string: values/help_premium_body",
+    "No duplicate string: values/app_version",
+    "No duplicate string: values/premium_feature_trends",
+    "No duplicate string: values/premium_feature_mascot",
+    "No duplicate string: values/premium_feature_support",
+    "No duplicate string: values/premium_source_play",
+    "No duplicate string: values/premium_source_developer",
+    "No duplicate string: values/premium_expires",
+    "No duplicate string: values/premium_assistant_toggle",
+    "No duplicate string: values/premium_assistant_toggle_hint",
+    "No duplicate string: values/developer_purchase_title",
+    "No duplicate string: values/developer_purchase_body",
+    "No duplicate string: values/developer_purchase_banner",
+    "No duplicate string: values/developer_purchase_note",
+    "No duplicate string: values/developer_purchase_button",
+    "No duplicate string: values/installation_id_label",
+    "No duplicate string: values/installation_id_copy",
+    "No duplicate string: values/installation_id_copied",
+    "No duplicate string: values/activation_code_label",
+    "No duplicate string: values/activation_code_hint",
+    "No duplicate string: values/activation_code_button",
+    "No duplicate string: values/billing_activation_code",
+    "No duplicate string: values/premium_activated",
+    "No duplicate string: values/activation_invalid",
+    "No duplicate string: values/mascot_card_title",
+    "No duplicate string: values/mascot_hear_again",
+    "No duplicate string: values/mascot_premium_note",
+    "No duplicate string: values/voice_assistant_button",
+    "No duplicate string: values/voice_assistant_hint",
+    "No duplicate string: values/voice_assistant_listening",
+    "No duplicate string: values/voice_entry_added",
+    "No duplicate string: values/voice_reply_balance",
+    "No duplicate string: values/voice_reply_spent_today",
+    "No duplicate string: values/voice_reply_opening_entry",
+    "No duplicate string: values/voice_reply_not_understood",
+    "No duplicate string: values/voice_smalltalk_greeting",
+    "No duplicate string: values/voice_smalltalk_how_are_you",
+    "No duplicate string: values/voice_smalltalk_thanks",
+    "No duplicate string: values/voice_smalltalk_who_are_you",
+    "No duplicate string: values/voice_smalltalk_bye",
+    "No duplicate string: values/voice_smalltalk_compliment",
+    "No duplicate string: values/voice_smalltalk_joke",
+    "No duplicate string: values/voice_permission_denied",
+    "No duplicate string: values/voice_recognizer_unavailable",
+    "No duplicate string: values/all_time",
+    "No duplicate string: values/categories",
+    "No duplicate string: values/all_categories",
+    "No duplicate string: values/category_transaction_count",
+    "No duplicate string: values/category_empty",
+    "No duplicate string: values/period_today",
+    "No duplicate string: values/period_month",
+    "No duplicate string: values/period_year",
+    "No duplicate string: values/voice_statistics",
+    "No duplicate string: values/assistant_text_hint",
+    "No duplicate string: values/assistant_send",
+    "No duplicate string: values/premium_source_trial",
+    "No duplicate string: values/premium_local_notice",
+    "No duplicate string: values/trial_explanation",
+    "No duplicate string: values/trial_14",
+    "No duplicate string: values/mascot_style",
+    "No duplicate string: values/mascot_gray",
+    "No duplicate string: values/mascot_sky",
+    "No duplicate string: values/mascot_animations",
+    "No duplicate string: values/brand_intro_title",
+    "No duplicate string: values/brand_intro_body",
+    "No duplicate string: values/brand_design_label",
+    "No duplicate string: values/analytics_title",
+    "No duplicate string: values/cinematic_history",
+    "No duplicate string: values/cinematic_period",
+    "No duplicate string: values/cinematic_apply",
+    "No duplicate string: values/cinematic_more",
+    "No duplicate string: values/cinematic_expenses_period",
+    "No duplicate string: values/cinematic_comparison",
+    "No duplicate string: values/cinematic_more_than_previous",
+    "No duplicate string: values/cinematic_less_than_previous",
+    "No duplicate string: values/cinematic_week_average",
+    "No duplicate string: values/cinematic_month_average",
+    "No duplicate string: values/cinematic_expense_categories",
+    "No duplicate string: values/cinematic_income_categories",
+    "No duplicate string: values/cinematic_transactions",
+    "No duplicate string: values/cinematic_tooltip",
+    "No duplicate string: values/cinematic_chart_accessibility",
+    "No duplicate string: values/cinematic_more_buckets",
+    "No duplicate string: values/cat_asset_status",
+    "No duplicate string: values/fps_title",
+    "No duplicate string: values/fps_explanation",
+    "No duplicate string: values/fps_auto",
+    "No duplicate string: values/fps_value",
+    "No duplicate string: values/fps_supported",
+    "No duplicate string: values/fps_fallback",
+    "No duplicate string: values/cat_tap_hint",
+    "No duplicate string: values/category_transfer",
+    "No duplicate string: values/category_dining",
+    "No duplicate string: values/category_cashback",
+    "No duplicate string: values/reference_total_for",
+    "No duplicate string: values/total_all_time",
+    "No duplicate string: values/total_thirty_days",
+    "No duplicate string: values/total_seven_days",
+    "No duplicate string: values/colors_title",
+    "No duplicate string: values/colors_explanation",
+    "No duplicate string: values/colors_edit",
+    "No duplicate string: values/colors_collapse",
+    "No duplicate string: values/colors_categories",
+    "No duplicate string: values/colors_reset_all",
+    "No duplicate string: values/color_accent",
+    "No duplicate string: values/color_background",
+    "No duplicate string: values/color_surface",
+    "No duplicate string: values/color_text",
+    "No duplicate string: values/color_muted",
+    "No duplicate string: values/color_chart_top",
+    "No duplicate string: values/color_chart_bottom",
+    "No duplicate string: values/color_grid",
+    "No duplicate string: values/color_icons",
+    "No duplicate string: values/color_hue",
+    "No duplicate string: values/color_saturation",
+    "No duplicate string: values/color_brightness",
+    "No duplicate string: values/color_apply",
+    "No duplicate string: values/color_reset",
+    "No duplicate string: values/color_invalid",
+    "No duplicate string: values/color_contrast_warning",
+    "No duplicate string: values/color_error",
+    "No duplicate string: values/bank_dashboard",
+    "No duplicate string: values/bank_import_title",
+    "No duplicate string: values/bank_consent",
+    "No duplicate string: values/bank_enabled",
+    "No duplicate string: values/bank_auto",
+    "No duplicate string: values/bank_access_yes",
+    "No duplicate string: values/bank_access_no",
+    "No duplicate string: values/bank_notification_permission",
+    "No duplicate string: values/bank_sms_yes",
+    "No duplicate string: values/bank_sms_no",
+    "No duplicate string: values/bank_sms_permission",
+    "No duplicate string: values/bank_play_sms",
+    "No duplicate string: values/bank_privacy",
+    "No duplicate string: values/bank_privacy_body",
+    "No duplicate string: values/bank_day",
+    "No duplicate string: values/bank_week",
+    "No duplicate string: values/bank_month",
+    "No duplicate string: values/bank_cash",
+    "No duplicate string: values/bank_card",
+    "No duplicate string: values/bank_unknown",
+    "No duplicate string: values/bank_source",
+    "No duplicate string: values/bank_category_stats",
+    "No duplicate string: values/bank_new_category",
+    "No duplicate string: values/bank_review_count",
+    "No duplicate string: values/bank_time_received",
+    "No duplicate string: values/bank_duplicate",
+    "No duplicate string: values/bank_transfer_review",
+    "No duplicate string: values/bank_ignore",
+    "No duplicate string: values/bank_recent",
+    "No duplicate string: values/bank_limit_recent",
+    "No duplicate string: values/bank_budget",
+    "No duplicate string: values/bank_budget_progress",
+    "No duplicate string: values/bank_export",
+    "No duplicate string: values/bank_clear_history",
+    "No duplicate string: values/bank_clear_warning",
+    "No duplicate string: values/bank_app_permissions",
+    "No duplicate string: values/bank_battery",
+    "No duplicate string: values/bank_budget_disable",
+    "No duplicate string: values/history_search",
+    "No duplicate string: values/import_diagnostics",
+    "No duplicate string: values/import_connected",
+    "No duplicate string: values/import_disconnected",
+    "No duplicate string: values/import_counts",
+    "No duplicate string: values/import_reconnect",
+    "No duplicate string: values/import_package_settings",
+    "No duplicate string: values/import_package_warning",
+    "No duplicate string: values/import_paste",
+    "No duplicate string: values/import_text",
+    "No duplicate string: values/import_manual_privacy",
+    "No duplicate string: values/import_to_queue",
+    "No duplicate string: values/import_queue_note",
+    "No duplicate string: values/import_disabled",
+    "No duplicate string: values/import_unsupported",
+    "No duplicate string: values/import_empty",
+    "No duplicate string: values/import_group",
+    "No duplicate string: values/import_unrecognized",
+    "No duplicate string: values/import_auto_done",
+    "No duplicate string: values/import_queued",
+    "No duplicate string: values/import_repeated",
+    "No duplicate string: values/import_waiting",
+    "No duplicate string: values/import_mode_title",
+    "No duplicate string: values/import_mode_api",
+    "No duplicate string: values/import_mode_sms",
+    "No duplicate string: values/import_mode_notify",
+    "No duplicate string: values/api_howto",
+    "No duplicate string: values/api_open_site",
+    "No duplicate string: values/api_token_label",
+    "No duplicate string: values/api_connect",
+    "No duplicate string: values/api_connecting",
+    "No duplicate string: values/api_connected",
+    "No duplicate string: values/api_last_sync",
+    "No duplicate string: values/api_imported_last",
+    "No duplicate string: values/api_syncing",
+    "No duplicate string: values/api_sync_now",
+    "No duplicate string: values/api_disconnect",
+    "No duplicate string: values/api_error_bad_token",
+    "No duplicate string: values/api_error_rate",
+    "No duplicate string: values/api_error_network",
+    "No duplicate string: values/api_error_no_accounts",
+    "No duplicate string: values/sms_howto",
+    "No duplicate string: values/sms_scan",
+    "No duplicate string: values/sms_scanning",
+    "No duplicate string: values/sms_scan_result",
+    "No duplicate string: values/sms_restricted_tip",
+    "No duplicate string: values/pay_source_title",
+    "No duplicate string: values/pay_source_required",
+    "No duplicate string: values/voice_ask_source",
+    "No duplicate string: values/cat_locked_hint",
+    "No duplicate string: values/bank_setup",
+    "No duplicate string: values/push_howto",
+    "No duplicate string: values/privat_api_title",
+    "No duplicate string: values/privat_api_howto",
+    "No duplicate string: values/privat_api_site",
+    "No duplicate string: values/privat_api_token",
+    "No duplicate string: values/privat_api_connected",
+    "No duplicate string: values/privat_api_error",
+    "No duplicate string: values/other_api_note",
+    "No duplicate string: values/help_banks_title",
+    "No duplicate string: values/help_banks_body",
+    "No duplicate string: values/import_confirm_permission",
+    "No duplicate string: values/import_confirm_enabled",
+    "No duplicate string: values/assistant_write_short",
+    "No duplicate string: values-uk/app_name",
+    "No duplicate string: values-uk/overview",
+    "No duplicate string: values-uk/settings",
+    "No duplicate string: values-uk/help",
+    "No duplicate string: values-uk/back",
+    "No duplicate string: values-uk/close",
+    "No duplicate string: values-uk/retry",
+    "No duplicate string: values-uk/next",
+    "No duplicate string: values-uk/skip",
+    "No duplicate string: values-uk/get_started",
+    "No duplicate string: values-uk/page_of",
+    "No duplicate string: values-uk/onboard_title_one",
+    "No duplicate string: values-uk/onboard_body_one",
+    "No duplicate string: values-uk/onboard_title_two",
+    "No duplicate string: values-uk/onboard_body_two",
+    "No duplicate string: values-uk/onboard_title_three",
+    "No duplicate string: values-uk/onboard_body_three",
+    "No duplicate string: values-uk/unlock_title",
+    "No duplicate string: values-uk/confirm_pin",
+    "No duplicate string: values-uk/create_pin",
+    "No duplicate string: values-uk/pin_setup_subtitle",
+    "No duplicate string: values-uk/pin_unlock_subtitle",
+    "No duplicate string: values-uk/pin_digit_count",
+    "No duplicate string: values-uk/pin_locked",
+    "No duplicate string: values-uk/pin_incorrect",
+    "No duplicate string: values-uk/pin_mismatch",
+    "No duplicate string: values-uk/pin_recovery_notice",
+    "No duplicate string: values-uk/erase_digit",
+    "No duplicate string: values-uk/start_over",
+    "No duplicate string: values-uk/need_help",
+    "No duplicate string: values-uk/security_error",
+    "No duplicate string: values-uk/biometric_failed",
+    "No duplicate string: values-uk/unlock_biometric",
+    "No duplicate string: values-uk/biometric_title",
+    "No duplicate string: values-uk/biometric_subtitle",
+    "No duplicate string: values-uk/use_pin",
+    "No duplicate string: values-uk/load_error_title",
+    "No duplicate string: values-uk/storage_error",
+    "No duplicate string: values-uk/saved",
+    "No duplicate string: values-uk/entry_deleted",
+    "No duplicate string: values-uk/undo",
+    "No duplicate string: values-uk/undo_expired",
+    "No duplicate string: values-uk/dashboard_heading",
+    "No duplicate string: values-uk/greeting",
+    "No duplicate string: values-uk/dashboard_subtitle",
+    "No duplicate string: values-uk/total_balance",
+    "No duplicate string: values-uk/currency_scope",
+    "No duplicate string: values-uk/income",
+    "No duplicate string: values-uk/expenses",
+    "No duplicate string: values-uk/expense",
+    "No duplicate string: values-uk/cash_flow",
+    "No duplicate string: values-uk/last_7_days",
+    "No duplicate string: values-uk/last_30_days",
+    "No duplicate string: values-uk/last_30_days_plus",
+    "No duplicate string: values-uk/chart_description",
+    "No duplicate string: values-uk/chart_empty",
+    "No duplicate string: values-uk/legend_income",
+    "No duplicate string: values-uk/legend_expense",
+    "No duplicate string: values-uk/activity",
+    "No duplicate string: values-uk/search_entries",
+    "No duplicate string: values-uk/clear_search",
+    "No duplicate string: values-uk/all",
+    "No duplicate string: values-uk/search_scope",
+    "No duplicate string: values-uk/no_matches",
+    "No duplicate string: values-uk/no_matches_body",
+    "No duplicate string: values-uk/clear_filters",
+    "No duplicate string: values-uk/empty_ledger_title",
+    "No duplicate string: values-uk/empty_ledger_body",
+    "No duplicate string: values-uk/add_first_entry",
+    "No duplicate string: values-uk/add_entry",
+    "No duplicate string: values-uk/edit_entry",
+    "No duplicate string: values-uk/delete_entry",
+    "No duplicate string: values-uk/delete_named_entry",
+    "No duplicate string: values-uk/load_more",
+    "No duplicate string: values-uk/positive_amount",
+    "No duplicate string: values-uk/negative_amount",
+    "No duplicate string: values-uk/category_food",
+    "No duplicate string: values-uk/category_transport",
+    "No duplicate string: values-uk/category_home",
+    "No duplicate string: values-uk/category_health",
+    "No duplicate string: values-uk/category_leisure",
+    "No duplicate string: values-uk/category_salary",
+    "No duplicate string: values-uk/category_other",
+    "No duplicate string: values-uk/entry_currency_notice",
+    "No duplicate string: values-uk/amount",
+    "No duplicate string: values-uk/amount_invalid",
+    "No duplicate string: values-uk/title_optional_hint",
+    "No duplicate string: values-uk/entry_title",
+    "No duplicate string: values-uk/title_invalid",
+    "No duplicate string: values-uk/title_hint",
+    "No duplicate string: values-uk/category",
+    "No duplicate string: values-uk/date_invalid",
+    "No duplicate string: values-uk/note_optional",
+    "No duplicate string: values-uk/character_count",
+    "No duplicate string: values-uk/save_entry",
+    "No duplicate string: values-uk/entry_not_found",
+    "No duplicate string: values-uk/done",
+    "No duplicate string: values-uk/cancel",
+    "No duplicate string: values-uk/discard_title",
+    "No duplicate string: values-uk/discard_body",
+    "No duplicate string: values-uk/discard",
+    "No duplicate string: values-uk/keep_editing",
+    "No duplicate string: values-uk/profile",
+    "No duplicate string: values-uk/local_profile",
+    "No duplicate string: values-uk/display_name",
+    "No duplicate string: values-uk/save_profile",
+    "No duplicate string: values-uk/name_invalid",
+    "No duplicate string: values-uk/language",
+    "No duplicate string: values-uk/language_instant",
+    "No duplicate string: values-uk/language_en",
+    "No duplicate string: values-uk/language_uk",
+    "No duplicate string: values-uk/appearance",
+    "No duplicate string: values-uk/theme_system",
+    "No duplicate string: values-uk/theme_light",
+    "No duplicate string: values-uk/theme_dark",
+    "No duplicate string: values-uk/default_currency",
+    "No duplicate string: values-uk/currency_explanation",
+    "No duplicate string: values-uk/security",
+    "No duplicate string: values-uk/biometric_unlock",
+    "No duplicate string: values-uk/biometric_explanation",
+    "No duplicate string: values-uk/biometric_unavailable",
+    "No duplicate string: values-uk/auto_lock_explanation",
+    "No duplicate string: values-uk/lock_now",
+    "No duplicate string: values-uk/premium_name",
+    "No duplicate string: values-uk/premium_body",
+    "No duplicate string: values-uk/premium_active",
+    "No duplicate string: values-uk/premium_offline_notice",
+    "No duplicate string: values-uk/premium_unlock",
+    "No duplicate string: values-uk/premium_buy",
+    "No duplicate string: values-uk/restore_purchases",
+    "No duplicate string: values-uk/billing_configuration",
+    "No duplicate string: values-uk/billing_unavailable",
+    "No duplicate string: values-uk/billing_network",
+    "No duplicate string: values-uk/billing_pending",
+    "No duplicate string: values-uk/billing_verification",
+    "No duplicate string: values-uk/billing_acknowledgement",
+    "No duplicate string: values-uk/reference_rates",
+    "No duplicate string: values-uk/rates_disclaimer",
+    "No duplicate string: values-uk/rates_empty",
+    "No duplicate string: values-uk/rate_value",
+    "No duplicate string: values-uk/rates_as_of",
+    "No duplicate string: values-uk/refresh_rates",
+    "No duplicate string: values-uk/refreshing",
+    "No duplicate string: values-uk/rate_offline",
+    "No duplicate string: values-uk/support",
+    "No duplicate string: values-uk/support_intro",
+    "No duplicate string: values-uk/contact_telegram",
+    "No duplicate string: values-uk/diagnostics_show_button",
+    "No duplicate string: values-uk/diagnostics_none",
+    "No duplicate string: values-uk/diagnostics_title",
+    "No duplicate string: values-uk/diagnostics_hint",
+    "No duplicate string: values-uk/diagnostics_copy",
+    "No duplicate string: values-uk/diagnostics_copied",
+    "No duplicate string: values-uk/diagnostics_clear",
+    "No duplicate string: values-uk/diagnostics_close",
+    "No duplicate string: values-uk/here_to_help",
+    "No duplicate string: values-uk/lead_developer",
+    "No duplicate string: values-uk/support_handle",
+    "No duplicate string: values-uk/copy_handle",
+    "No duplicate string: values-uk/handle_copied",
+    "No duplicate string: values-uk/support_privacy",
+    "No duplicate string: values-uk/telegram_support",
+    "No duplicate string: values-uk/support_network_error",
+    "No duplicate string: values-uk/help_heading",
+    "No duplicate string: values-uk/help_intro",
+    "No duplicate string: values-uk/help_entries_title",
+    "No duplicate string: values-uk/help_entries_body",
+    "No duplicate string: values-uk/help_privacy_title",
+    "No duplicate string: values-uk/help_privacy_body",
+    "No duplicate string: values-uk/help_security_title",
+    "No duplicate string: values-uk/help_security_body",
+    "No duplicate string: values-uk/help_premium_title",
+    "No duplicate string: values-uk/help_premium_body",
+    "No duplicate string: values-uk/app_version",
+    "No duplicate string: values-uk/premium_feature_trends",
+    "No duplicate string: values-uk/premium_feature_mascot",
+    "No duplicate string: values-uk/premium_feature_support",
+    "No duplicate string: values-uk/premium_source_play",
+    "No duplicate string: values-uk/premium_source_developer",
+    "No duplicate string: values-uk/premium_expires",
+    "No duplicate string: values-uk/premium_assistant_toggle",
+    "No duplicate string: values-uk/premium_assistant_toggle_hint",
+    "No duplicate string: values-uk/developer_purchase_title",
+    "No duplicate string: values-uk/developer_purchase_body",
+    "No duplicate string: values-uk/developer_purchase_banner",
+    "No duplicate string: values-uk/developer_purchase_note",
+    "No duplicate string: values-uk/developer_purchase_button",
+    "No duplicate string: values-uk/installation_id_label",
+    "No duplicate string: values-uk/installation_id_copy",
+    "No duplicate string: values-uk/installation_id_copied",
+    "No duplicate string: values-uk/activation_code_label",
+    "No duplicate string: values-uk/activation_code_hint",
+    "No duplicate string: values-uk/activation_code_button",
+    "No duplicate string: values-uk/billing_activation_code",
+    "No duplicate string: values-uk/premium_activated",
+    "No duplicate string: values-uk/activation_invalid",
+    "No duplicate string: values-uk/mascot_card_title",
+    "No duplicate string: values-uk/mascot_hear_again",
+    "No duplicate string: values-uk/mascot_premium_note",
+    "No duplicate string: values-uk/voice_assistant_button",
+    "No duplicate string: values-uk/voice_assistant_hint",
+    "No duplicate string: values-uk/voice_assistant_listening",
+    "No duplicate string: values-uk/voice_entry_added",
+    "No duplicate string: values-uk/voice_reply_balance",
+    "No duplicate string: values-uk/voice_reply_spent_today",
+    "No duplicate string: values-uk/voice_reply_opening_entry",
+    "No duplicate string: values-uk/voice_reply_not_understood",
+    "No duplicate string: values-uk/voice_smalltalk_greeting",
+    "No duplicate string: values-uk/voice_smalltalk_how_are_you",
+    "No duplicate string: values-uk/voice_smalltalk_thanks",
+    "No duplicate string: values-uk/voice_smalltalk_who_are_you",
+    "No duplicate string: values-uk/voice_smalltalk_bye",
+    "No duplicate string: values-uk/voice_smalltalk_compliment",
+    "No duplicate string: values-uk/voice_smalltalk_joke",
+    "No duplicate string: values-uk/voice_permission_denied",
+    "No duplicate string: values-uk/voice_recognizer_unavailable",
+    "No duplicate string: values-uk/all_time",
+    "No duplicate string: values-uk/categories",
+    "No duplicate string: values-uk/all_categories",
+    "No duplicate string: values-uk/category_transaction_count",
+    "No duplicate string: values-uk/category_empty",
+    "No duplicate string: values-uk/period_today",
+    "No duplicate string: values-uk/period_month",
+    "No duplicate string: values-uk/period_year",
+    "No duplicate string: values-uk/voice_statistics",
+    "No duplicate string: values-uk/assistant_text_hint",
+    "No duplicate string: values-uk/assistant_send",
+    "No duplicate string: values-uk/premium_source_trial",
+    "No duplicate string: values-uk/premium_local_notice",
+    "No duplicate string: values-uk/trial_explanation",
+    "No duplicate string: values-uk/trial_14",
+    "No duplicate string: values-uk/mascot_style",
+    "No duplicate string: values-uk/mascot_gray",
+    "No duplicate string: values-uk/mascot_sky",
+    "No duplicate string: values-uk/mascot_animations",
+    "No duplicate string: values-uk/brand_intro_title",
+    "No duplicate string: values-uk/brand_intro_body",
+    "No duplicate string: values-uk/brand_design_label",
+    "No duplicate string: values-uk/analytics_title",
+    "No duplicate string: values-uk/cinematic_history",
+    "No duplicate string: values-uk/cinematic_period",
+    "No duplicate string: values-uk/cinematic_apply",
+    "No duplicate string: values-uk/cinematic_more",
+    "No duplicate string: values-uk/cinematic_expenses_period",
+    "No duplicate string: values-uk/cinematic_comparison",
+    "No duplicate string: values-uk/cinematic_more_than_previous",
+    "No duplicate string: values-uk/cinematic_less_than_previous",
+    "No duplicate string: values-uk/cinematic_week_average",
+    "No duplicate string: values-uk/cinematic_month_average",
+    "No duplicate string: values-uk/cinematic_expense_categories",
+    "No duplicate string: values-uk/cinematic_income_categories",
+    "No duplicate string: values-uk/cinematic_transactions",
+    "No duplicate string: values-uk/cinematic_tooltip",
+    "No duplicate string: values-uk/cinematic_chart_accessibility",
+    "No duplicate string: values-uk/cinematic_more_buckets",
+    "No duplicate string: values-uk/cat_asset_status",
+    "No duplicate string: values-uk/fps_title",
+    "No duplicate string: values-uk/fps_explanation",
+    "No duplicate string: values-uk/fps_auto",
+    "No duplicate string: values-uk/fps_value",
+    "No duplicate string: values-uk/fps_supported",
+    "No duplicate string: values-uk/fps_fallback",
+    "No duplicate string: values-uk/cat_tap_hint",
+    "No duplicate string: values-uk/category_transfer",
+    "No duplicate string: values-uk/category_dining",
+    "No duplicate string: values-uk/category_cashback",
+    "No duplicate string: values-uk/reference_total_for",
+    "No duplicate string: values-uk/total_all_time",
+    "No duplicate string: values-uk/total_thirty_days",
+    "No duplicate string: values-uk/total_seven_days",
+    "No duplicate string: values-uk/colors_title",
+    "No duplicate string: values-uk/colors_explanation",
+    "No duplicate string: values-uk/colors_edit",
+    "No duplicate string: values-uk/colors_collapse",
+    "No duplicate string: values-uk/colors_categories",
+    "No duplicate string: values-uk/colors_reset_all",
+    "No duplicate string: values-uk/color_accent",
+    "No duplicate string: values-uk/color_background",
+    "No duplicate string: values-uk/color_surface",
+    "No duplicate string: values-uk/color_text",
+    "No duplicate string: values-uk/color_muted",
+    "No duplicate string: values-uk/color_chart_top",
+    "No duplicate string: values-uk/color_chart_bottom",
+    "No duplicate string: values-uk/color_grid",
+    "No duplicate string: values-uk/color_icons",
+    "No duplicate string: values-uk/color_hue",
+    "No duplicate string: values-uk/color_saturation",
+    "No duplicate string: values-uk/color_brightness",
+    "No duplicate string: values-uk/color_apply",
+    "No duplicate string: values-uk/color_reset",
+    "No duplicate string: values-uk/color_invalid",
+    "No duplicate string: values-uk/color_contrast_warning",
+    "No duplicate string: values-uk/color_error",
+    "No duplicate string: values-uk/bank_dashboard",
+    "No duplicate string: values-uk/bank_import_title",
+    "No duplicate string: values-uk/bank_consent",
+    "No duplicate string: values-uk/bank_enabled",
+    "No duplicate string: values-uk/bank_auto",
+    "No duplicate string: values-uk/bank_access_yes",
+    "No duplicate string: values-uk/bank_access_no",
+    "No duplicate string: values-uk/bank_notification_permission",
+    "No duplicate string: values-uk/bank_sms_yes",
+    "No duplicate string: values-uk/bank_sms_no",
+    "No duplicate string: values-uk/bank_sms_permission",
+    "No duplicate string: values-uk/bank_play_sms",
+    "No duplicate string: values-uk/bank_privacy",
+    "No duplicate string: values-uk/bank_privacy_body",
+    "No duplicate string: values-uk/bank_day",
+    "No duplicate string: values-uk/bank_week",
+    "No duplicate string: values-uk/bank_month",
+    "No duplicate string: values-uk/bank_cash",
+    "No duplicate string: values-uk/bank_card",
+    "No duplicate string: values-uk/bank_unknown",
+    "No duplicate string: values-uk/bank_source",
+    "No duplicate string: values-uk/bank_category_stats",
+    "No duplicate string: values-uk/bank_new_category",
+    "No duplicate string: values-uk/bank_review_count",
+    "No duplicate string: values-uk/bank_time_received",
+    "No duplicate string: values-uk/bank_duplicate",
+    "No duplicate string: values-uk/bank_transfer_review",
+    "No duplicate string: values-uk/bank_ignore",
+    "No duplicate string: values-uk/bank_recent",
+    "No duplicate string: values-uk/bank_limit_recent",
+    "No duplicate string: values-uk/bank_budget",
+    "No duplicate string: values-uk/bank_budget_progress",
+    "No duplicate string: values-uk/bank_export",
+    "No duplicate string: values-uk/bank_clear_history",
+    "No duplicate string: values-uk/bank_clear_warning",
+    "No duplicate string: values-uk/bank_app_permissions",
+    "No duplicate string: values-uk/bank_battery",
+    "No duplicate string: values-uk/bank_budget_disable",
+    "No duplicate string: values-uk/history_search",
+    "No duplicate string: values-uk/import_diagnostics",
+    "No duplicate string: values-uk/import_connected",
+    "No duplicate string: values-uk/import_disconnected",
+    "No duplicate string: values-uk/import_counts",
+    "No duplicate string: values-uk/import_reconnect",
+    "No duplicate string: values-uk/import_package_settings",
+    "No duplicate string: values-uk/import_package_warning",
+    "No duplicate string: values-uk/import_paste",
+    "No duplicate string: values-uk/import_text",
+    "No duplicate string: values-uk/import_manual_privacy",
+    "No duplicate string: values-uk/import_to_queue",
+    "No duplicate string: values-uk/import_queue_note",
+    "No duplicate string: values-uk/import_disabled",
+    "No duplicate string: values-uk/import_unsupported",
+    "No duplicate string: values-uk/import_empty",
+    "No duplicate string: values-uk/import_group",
+    "No duplicate string: values-uk/import_unrecognized",
+    "No duplicate string: values-uk/import_auto_done",
+    "No duplicate string: values-uk/import_queued",
+    "No duplicate string: values-uk/import_repeated",
+    "No duplicate string: values-uk/import_waiting",
+    "No duplicate string: values-uk/import_mode_title",
+    "No duplicate string: values-uk/import_mode_api",
+    "No duplicate string: values-uk/import_mode_sms",
+    "No duplicate string: values-uk/import_mode_notify",
+    "No duplicate string: values-uk/api_howto",
+    "No duplicate string: values-uk/api_open_site",
+    "No duplicate string: values-uk/api_token_label",
+    "No duplicate string: values-uk/api_connect",
+    "No duplicate string: values-uk/api_connecting",
+    "No duplicate string: values-uk/api_connected",
+    "No duplicate string: values-uk/api_last_sync",
+    "No duplicate string: values-uk/api_imported_last",
+    "No duplicate string: values-uk/api_syncing",
+    "No duplicate string: values-uk/api_sync_now",
+    "No duplicate string: values-uk/api_disconnect",
+    "No duplicate string: values-uk/api_error_bad_token",
+    "No duplicate string: values-uk/api_error_rate",
+    "No duplicate string: values-uk/api_error_network",
+    "No duplicate string: values-uk/api_error_no_accounts",
+    "No duplicate string: values-uk/sms_howto",
+    "No duplicate string: values-uk/sms_scan",
+    "No duplicate string: values-uk/sms_scanning",
+    "No duplicate string: values-uk/sms_scan_result",
+    "No duplicate string: values-uk/sms_restricted_tip",
+    "No duplicate string: values-uk/pay_source_title",
+    "No duplicate string: values-uk/pay_source_required",
+    "No duplicate string: values-uk/voice_ask_source",
+    "No duplicate string: values-uk/cat_locked_hint",
+    "No duplicate string: values-uk/bank_setup",
+    "No duplicate string: values-uk/push_howto",
+    "No duplicate string: values-uk/privat_api_title",
+    "No duplicate string: values-uk/privat_api_howto",
+    "No duplicate string: values-uk/privat_api_site",
+    "No duplicate string: values-uk/privat_api_token",
+    "No duplicate string: values-uk/privat_api_connected",
+    "No duplicate string: values-uk/privat_api_error",
+    "No duplicate string: values-uk/other_api_note",
+    "No duplicate string: values-uk/help_banks_title",
+    "No duplicate string: values-uk/help_banks_body",
+    "No duplicate string: values-uk/import_confirm_permission",
+    "No duplicate string: values-uk/import_confirm_enabled",
+    "No duplicate string: values-uk/assistant_write_short",
+    "English/Ukrainian key parity",
+    "Format-argument parity: all_time",
+    "Nonempty translations: all_time",
+    "Format-argument parity: undo_expired",
+    "Nonempty translations: undo_expired",
+    "Format-argument parity: total_seven_days",
+    "Nonempty translations: total_seven_days",
+    "Format-argument parity: add_entry",
+    "Nonempty translations: add_entry",
+    "Format-argument parity: api_connecting",
+    "Nonempty translations: api_connecting",
+    "Format-argument parity: categories",
+    "Nonempty translations: categories",
+    "Format-argument parity: import_connected",
+    "Nonempty translations: import_connected",
+    "Format-argument parity: bank_privacy",
+    "Nonempty translations: bank_privacy",
+    "Format-argument parity: display_name",
+    "Nonempty translations: display_name",
+    "Format-argument parity: sms_scan_result",
+    "Nonempty translations: sms_scan_result",
+    "Format-argument parity: voice_permission_denied",
+    "Nonempty translations: voice_permission_denied",
+    "Format-argument parity: name_invalid",
+    "Nonempty translations: name_invalid",
+    "Format-argument parity: delete_named_entry",
+    "Nonempty translations: delete_named_entry",
+    "Format-argument parity: theme_dark",
+    "Nonempty translations: theme_dark",
+    "Format-argument parity: api_sync_now",
+    "Nonempty translations: api_sync_now",
+    "Format-argument parity: voice_assistant_listening",
+    "Nonempty translations: voice_assistant_listening",
+    "Format-argument parity: import_reconnect",
+    "Nonempty translations: import_reconnect",
+    "Format-argument parity: activation_invalid",
+    "Nonempty translations: activation_invalid",
+    "Format-argument parity: discard",
+    "Nonempty translations: discard",
+    "Format-argument parity: bank_budget",
+    "Nonempty translations: bank_budget",
+    "Format-argument parity: diagnostics_title",
+    "Nonempty translations: diagnostics_title",
+    "Format-argument parity: bank_source",
+    "Nonempty translations: bank_source",
+    "Format-argument parity: color_background",
+    "Nonempty translations: color_background",
+    "Format-argument parity: import_repeated",
+    "Nonempty translations: import_repeated",
+    "Format-argument parity: cinematic_week_average",
+    "Nonempty translations: cinematic_week_average",
+    "Format-argument parity: voice_smalltalk_thanks",
+    "Nonempty translations: voice_smalltalk_thanks",
+    "Format-argument parity: api_error_network",
+    "Nonempty translations: api_error_network",
+    "Format-argument parity: bank_app_permissions",
+    "Nonempty translations: bank_app_permissions",
+    "Format-argument parity: back",
+    "Nonempty translations: back",
+    "Format-argument parity: bank_duplicate",
+    "Nonempty translations: bank_duplicate",
+    "Format-argument parity: installation_id_label",
+    "Nonempty translations: installation_id_label",
+    "Format-argument parity: profile",
+    "Nonempty translations: profile",
+    "Format-argument parity: help_banks_title",
+    "Nonempty translations: help_banks_title",
+    "Format-argument parity: colors_edit",
+    "Nonempty translations: colors_edit",
+    "Format-argument parity: onboard_body_two",
+    "Nonempty translations: onboard_body_two",
+    "Format-argument parity: voice_statistics",
+    "Nonempty translations: voice_statistics",
+    "Format-argument parity: add_first_entry",
+    "Nonempty translations: add_first_entry",
+    "Format-argument parity: mascot_premium_note",
+    "Nonempty translations: mascot_premium_note",
+    "Format-argument parity: color_chart_top",
+    "Nonempty translations: color_chart_top",
+    "Format-argument parity: search_entries",
+    "Nonempty translations: search_entries",
+    "Format-argument parity: voice_smalltalk_bye",
+    "Nonempty translations: voice_smalltalk_bye",
+    "Format-argument parity: category_home",
+    "Nonempty translations: category_home",
+    "Format-argument parity: fps_fallback",
+    "Nonempty translations: fps_fallback",
+    "Format-argument parity: edit_entry",
+    "Nonempty translations: edit_entry",
+    "Format-argument parity: language_en",
+    "Nonempty translations: language_en",
+    "Format-argument parity: diagnostics_copy",
+    "Nonempty translations: diagnostics_copy",
+    "Format-argument parity: legend_income",
+    "Nonempty translations: legend_income",
+    "Format-argument parity: api_disconnect",
+    "Nonempty translations: api_disconnect",
+    "Format-argument parity: import_package_warning",
+    "Nonempty translations: import_package_warning",
+    "Format-argument parity: onboard_title_one",
+    "Nonempty translations: onboard_title_one",
+    "Format-argument parity: dashboard_subtitle",
+    "Nonempty translations: dashboard_subtitle",
+    "Format-argument parity: refresh_rates",
+    "Nonempty translations: refresh_rates",
+    "Format-argument parity: premium_unlock",
+    "Nonempty translations: premium_unlock",
+    "Format-argument parity: bank_clear_warning",
+    "Nonempty translations: bank_clear_warning",
+    "Format-argument parity: billing_network",
+    "Nonempty translations: billing_network",
+    "Format-argument parity: color_text",
+    "Nonempty translations: color_text",
+    "Format-argument parity: local_profile",
+    "Nonempty translations: local_profile",
+    "Format-argument parity: bank_budget_disable",
+    "Nonempty translations: bank_budget_disable",
+    "Format-argument parity: colors_categories",
+    "Nonempty translations: colors_categories",
+    "Format-argument parity: retry",
+    "Nonempty translations: retry",
+    "Format-argument parity: voice_assistant_hint",
+    "Nonempty translations: voice_assistant_hint",
+    "Format-argument parity: create_pin",
+    "Nonempty translations: create_pin",
+    "Format-argument parity: sms_howto",
+    "Nonempty translations: sms_howto",
+    "Format-argument parity: bank_ignore",
+    "Nonempty translations: bank_ignore",
+    "Format-argument parity: developer_purchase_note",
+    "Nonempty translations: developer_purchase_note",
+    "Format-argument parity: note_optional",
+    "Nonempty translations: note_optional",
+    "Format-argument parity: need_help",
+    "Nonempty translations: need_help",
+    "Format-argument parity: category_cashback",
+    "Nonempty translations: category_cashback",
+    "Format-argument parity: billing_configuration",
+    "Nonempty translations: billing_configuration",
+    "Format-argument parity: privat_api_error",
+    "Nonempty translations: privat_api_error",
+    "Format-argument parity: language_instant",
+    "Nonempty translations: language_instant",
+    "Format-argument parity: mascot_card_title",
+    "Nonempty translations: mascot_card_title",
+    "Format-argument parity: category_transport",
+    "Nonempty translations: category_transport",
+    "Format-argument parity: empty_ledger_body",
+    "Nonempty translations: empty_ledger_body",
+    "Format-argument parity: color_brightness",
+    "Nonempty translations: color_brightness",
+    "Format-argument parity: activation_code_hint",
+    "Nonempty translations: activation_code_hint",
+    "Format-argument parity: all_categories",
+    "Nonempty translations: all_categories",
+    "Format-argument parity: premium_feature_support",
+    "Nonempty translations: premium_feature_support",
+    "Format-argument parity: sms_restricted_tip",
+    "Nonempty translations: sms_restricted_tip",
+    "Format-argument parity: api_open_site",
+    "Nonempty translations: api_open_site",
+    "Format-argument parity: premium_buy",
+    "Nonempty translations: premium_buy",
+    "Format-argument parity: color_icons",
+    "Nonempty translations: color_icons",
+    "Format-argument parity: color_grid",
+    "Nonempty translations: color_grid",
+    "Format-argument parity: erase_digit",
+    "Nonempty translations: erase_digit",
+    "Format-argument parity: discard_body",
+    "Nonempty translations: discard_body",
+    "Format-argument parity: privat_api_title",
+    "Nonempty translations: privat_api_title",
+    "Format-argument parity: biometric_failed",
+    "Nonempty translations: biometric_failed",
+    "Format-argument parity: total_all_time",
+    "Nonempty translations: total_all_time",
+    "Format-argument parity: cinematic_tooltip",
+    "Nonempty translations: cinematic_tooltip",
+    "Format-argument parity: category_dining",
+    "Nonempty translations: category_dining",
+    "Format-argument parity: premium_activated",
+    "Nonempty translations: premium_activated",
+    "Format-argument parity: import_queued",
+    "Nonempty translations: import_queued",
+    "Format-argument parity: last_30_days_plus",
+    "Nonempty translations: last_30_days_plus",
+    "Format-argument parity: dashboard_heading",
+    "Nonempty translations: dashboard_heading",
+    "Format-argument parity: entry_deleted",
+    "Nonempty translations: entry_deleted",
+    "Format-argument parity: other_api_note",
+    "Nonempty translations: other_api_note",
+    "Format-argument parity: premium_assistant_toggle",
+    "Nonempty translations: premium_assistant_toggle",
+    "Format-argument parity: cinematic_more_than_previous",
+    "Nonempty translations: cinematic_more_than_previous",
+    "Format-argument parity: entry_currency_notice",
+    "Nonempty translations: entry_currency_notice",
+    "Format-argument parity: diagnostics_copied",
+    "Nonempty translations: diagnostics_copied",
+    "Format-argument parity: premium_name",
+    "Nonempty translations: premium_name",
+    "Format-argument parity: restore_purchases",
+    "Nonempty translations: restore_purchases",
+    "Format-argument parity: import_mode_title",
+    "Nonempty translations: import_mode_title",
+    "Format-argument parity: import_diagnostics",
+    "Nonempty translations: import_diagnostics",
+    "Format-argument parity: cinematic_transactions",
+    "Nonempty translations: cinematic_transactions",
+    "Format-argument parity: color_error",
+    "Nonempty translations: color_error",
+    "Format-argument parity: bank_export",
+    "Nonempty translations: bank_export",
+    "Format-argument parity: period_year",
+    "Nonempty translations: period_year",
+    "Format-argument parity: last_30_days",
+    "Nonempty translations: last_30_days",
+    "Format-argument parity: colors_reset_all",
+    "Nonempty translations: colors_reset_all",
+    "Format-argument parity: chart_description",
+    "Nonempty translations: chart_description",
+    "Format-argument parity: colors_title",
+    "Nonempty translations: colors_title",
+    "Format-argument parity: help",
+    "Nonempty translations: help",
+    "Format-argument parity: bank_day",
+    "Nonempty translations: bank_day",
+    "Format-argument parity: import_manual_privacy",
+    "Nonempty translations: import_manual_privacy",
+    "Format-argument parity: color_contrast_warning",
+    "Nonempty translations: color_contrast_warning",
+    "Format-argument parity: import_group",
+    "Nonempty translations: import_group",
+    "Format-argument parity: voice_reply_not_understood",
+    "Nonempty translations: voice_reply_not_understood",
+    "Format-argument parity: sms_scanning",
+    "Nonempty translations: sms_scanning",
+    "Format-argument parity: settings",
+    "Nonempty translations: settings",
+    "Format-argument parity: activation_code_button",
+    "Nonempty translations: activation_code_button",
+    "Format-argument parity: cat_locked_hint",
+    "Nonempty translations: cat_locked_hint",
+    "Format-argument parity: import_to_queue",
+    "Nonempty translations: import_to_queue",
+    "Format-argument parity: import_counts",
+    "Nonempty translations: import_counts",
+    "Format-argument parity: cinematic_income_categories",
+    "Nonempty translations: cinematic_income_categories",
+    "Format-argument parity: color_reset",
+    "Nonempty translations: color_reset",
+    "Format-argument parity: billing_acknowledgement",
+    "Nonempty translations: billing_acknowledgement",
+    "Format-argument parity: api_howto",
+    "Nonempty translations: api_howto",
+    "Format-argument parity: onboard_body_one",
+    "Nonempty translations: onboard_body_one",
+    "Format-argument parity: colors_explanation",
+    "Nonempty translations: colors_explanation",
+    "Format-argument parity: category_salary",
+    "Nonempty translations: category_salary",
+    "Format-argument parity: voice_reply_opening_entry",
+    "Nonempty translations: voice_reply_opening_entry",
+    "Format-argument parity: app_name",
+    "Nonempty translations: app_name",
+    "Format-argument parity: import_disconnected",
+    "Nonempty translations: import_disconnected",
+    "Format-argument parity: import_queue_note",
+    "Nonempty translations: import_queue_note",
+    "Format-argument parity: category_empty",
+    "Nonempty translations: category_empty",
+    "Format-argument parity: here_to_help",
+    "Nonempty translations: here_to_help",
+    "Format-argument parity: help_premium_title",
+    "Nonempty translations: help_premium_title",
+    "Format-argument parity: api_error_no_accounts",
+    "Nonempty translations: api_error_no_accounts",
+    "Format-argument parity: bank_auto",
+    "Nonempty translations: bank_auto",
+    "Format-argument parity: bank_consent",
+    "Nonempty translations: bank_consent",
+    "Format-argument parity: saved",
+    "Nonempty translations: saved",
+    "Format-argument parity: voice_smalltalk_joke",
+    "Nonempty translations: voice_smalltalk_joke",
+    "Format-argument parity: color_invalid",
+    "Nonempty translations: color_invalid",
+    "Format-argument parity: premium_feature_trends",
+    "Nonempty translations: premium_feature_trends",
+    "Format-argument parity: cinematic_expense_categories",
+    "Nonempty translations: cinematic_expense_categories",
+    "Format-argument parity: period_month",
+    "Nonempty translations: period_month",
+    "Format-argument parity: discard_title",
+    "Nonempty translations: discard_title",
+    "Format-argument parity: import_waiting",
+    "Nonempty translations: import_waiting",
+    "Format-argument parity: expense",
+    "Nonempty translations: expense",
+    "Format-argument parity: sms_scan",
+    "Nonempty translations: sms_scan",
+    "Format-argument parity: income",
+    "Nonempty translations: income",
+    "Format-argument parity: language_uk",
+    "Nonempty translations: language_uk",
+    "Format-argument parity: diagnostics_none",
+    "Nonempty translations: diagnostics_none",
+    "Format-argument parity: api_last_sync",
+    "Nonempty translations: api_last_sync",
+    "Format-argument parity: title_hint",
+    "Nonempty translations: title_hint",
+    "Format-argument parity: installation_id_copy",
+    "Nonempty translations: installation_id_copy",
+    "Format-argument parity: voice_recognizer_unavailable",
+    "Nonempty translations: voice_recognizer_unavailable",
+    "Format-argument parity: bank_cash",
+    "Nonempty translations: bank_cash",
+    "Format-argument parity: bank_setup",
+    "Nonempty translations: bank_setup",
+    "Format-argument parity: pin_unlock_subtitle",
+    "Nonempty translations: pin_unlock_subtitle",
+    "Format-argument parity: privat_api_connected",
+    "Nonempty translations: privat_api_connected",
+    "Format-argument parity: api_error_bad_token",
+    "Nonempty translations: api_error_bad_token",
+    "Format-argument parity: expenses",
+    "Nonempty translations: expenses",
+    "Format-argument parity: api_token_label",
+    "Nonempty translations: api_token_label",
+    "Format-argument parity: rates_disclaimer",
+    "Nonempty translations: rates_disclaimer",
+    "Format-argument parity: copy_handle",
+    "Nonempty translations: copy_handle",
+    "Format-argument parity: bank_review_count",
+    "Nonempty translations: bank_review_count",
+    "Format-argument parity: pin_setup_subtitle",
+    "Nonempty translations: pin_setup_subtitle",
+    "Format-argument parity: bank_access_no",
+    "Nonempty translations: bank_access_no",
+    "Format-argument parity: entry_not_found",
+    "Nonempty translations: entry_not_found",
+    "Format-argument parity: support",
+    "Nonempty translations: support",
+    "Format-argument parity: bank_sms_no",
+    "Nonempty translations: bank_sms_no",
+    "Format-argument parity: fps_value",
+    "Nonempty translations: fps_value",
+    "Format-argument parity: bank_transfer_review",
+    "Nonempty translations: bank_transfer_review",
+    "Format-argument parity: lock_now",
+    "Nonempty translations: lock_now",
+    "Format-argument parity: category_food",
+    "Nonempty translations: category_food",
+    "Format-argument parity: voice_smalltalk_who_are_you",
+    "Nonempty translations: voice_smalltalk_who_are_you",
+    "Format-argument parity: bank_import_title",
+    "Nonempty translations: bank_import_title",
+    "Format-argument parity: confirm_pin",
+    "Nonempty translations: confirm_pin",
+    "Format-argument parity: undo",
+    "Nonempty translations: undo",
+    "Format-argument parity: greeting",
+    "Nonempty translations: greeting",
+    "Format-argument parity: developer_purchase_body",
+    "Nonempty translations: developer_purchase_body",
+    "Format-argument parity: refreshing",
+    "Nonempty translations: refreshing",
+    "Format-argument parity: premium_local_notice",
+    "Nonempty translations: premium_local_notice",
+    "Format-argument parity: help_privacy_title",
+    "Nonempty translations: help_privacy_title",
+    "Format-argument parity: pin_recovery_notice",
+    "Nonempty translations: pin_recovery_notice",
+    "Format-argument parity: help_entries_title",
+    "Nonempty translations: help_entries_title",
+    "Format-argument parity: assistant_send",
+    "Nonempty translations: assistant_send",
+    "Format-argument parity: premium_source_play",
+    "Nonempty translations: premium_source_play",
+    "Format-argument parity: premium_source_trial",
+    "Nonempty translations: premium_source_trial",
+    "Format-argument parity: history_search",
+    "Nonempty translations: history_search",
+    "Format-argument parity: privat_api_token",
+    "Nonempty translations: privat_api_token",
+    "Format-argument parity: fps_supported",
+    "Nonempty translations: fps_supported",
+    "Format-argument parity: voice_assistant_button",
+    "Nonempty translations: voice_assistant_button",
+    "Format-argument parity: diagnostics_clear",
+    "Nonempty translations: diagnostics_clear",
+    "Format-argument parity: pay_source_title",
+    "Nonempty translations: pay_source_title",
+    "Format-argument parity: telegram_support",
+    "Nonempty translations: telegram_support",
+    "Format-argument parity: voice_reply_spent_today",
+    "Nonempty translations: voice_reply_spent_today",
+    "Format-argument parity: positive_amount",
+    "Nonempty translations: positive_amount",
+    "Format-argument parity: color_accent",
+    "Nonempty translations: color_accent",
+    "Format-argument parity: save_entry",
+    "Nonempty translations: save_entry",
+    "Format-argument parity: diagnostics_hint",
+    "Nonempty translations: diagnostics_hint",
+    "Format-argument parity: load_error_title",
+    "Nonempty translations: load_error_title",
+    "Format-argument parity: cat_asset_status",
+    "Nonempty translations: cat_asset_status",
+    "Format-argument parity: clear_search",
+    "Nonempty translations: clear_search",
+    "Format-argument parity: support_intro",
+    "Nonempty translations: support_intro",
+    "Format-argument parity: diagnostics_close",
+    "Nonempty translations: diagnostics_close",
+    "Format-argument parity: developer_purchase_title",
+    "Nonempty translations: developer_purchase_title",
+    "Format-argument parity: color_saturation",
+    "Nonempty translations: color_saturation",
+    "Format-argument parity: rate_offline",
+    "Nonempty translations: rate_offline",
+    "Format-argument parity: import_mode_api",
+    "Nonempty translations: import_mode_api",
+    "Format-argument parity: page_of",
+    "Nonempty translations: page_of",
+    "Format-argument parity: mascot_hear_again",
+    "Nonempty translations: mascot_hear_again",
+    "Format-argument parity: lead_developer",
+    "Nonempty translations: lead_developer",
+    "Format-argument parity: legend_expense",
+    "Nonempty translations: legend_expense",
+    "Format-argument parity: reference_rates",
+    "Nonempty translations: reference_rates",
+    "Format-argument parity: bank_card",
+    "Nonempty translations: bank_card",
+    "Format-argument parity: privat_api_site",
+    "Nonempty translations: privat_api_site",
+    "Format-argument parity: category_transaction_count",
+    "Nonempty translations: category_transaction_count",
+    "Format-argument parity: app_version",
+    "Nonempty translations: app_version",
+    "Format-argument parity: next",
+    "Nonempty translations: next",
+    "Format-argument parity: help_intro",
+    "Nonempty translations: help_intro",
+    "Format-argument parity: cat_tap_hint",
+    "Nonempty translations: cat_tap_hint",
+    "Format-argument parity: bank_week",
+    "Nonempty translations: bank_week",
+    "Format-argument parity: activity",
+    "Nonempty translations: activity",
+    "Format-argument parity: currency_scope",
+    "Nonempty translations: currency_scope",
+    "Format-argument parity: amount",
+    "Nonempty translations: amount",
+    "Format-argument parity: brand_design_label",
+    "Nonempty translations: brand_design_label",
+    "Format-argument parity: cinematic_chart_accessibility",
+    "Nonempty translations: cinematic_chart_accessibility",
+    "Format-argument parity: currency_explanation",
+    "Nonempty translations: currency_explanation",
+    "Format-argument parity: help_heading",
+    "Nonempty translations: help_heading",
+    "Format-argument parity: bank_unknown",
+    "Nonempty translations: bank_unknown",
+    "Format-argument parity: onboard_body_three",
+    "Nonempty translations: onboard_body_three",
+    "Format-argument parity: voice_smalltalk_how_are_you",
+    "Nonempty translations: voice_smalltalk_how_are_you",
+    "Format-argument parity: support_privacy",
+    "Nonempty translations: support_privacy",
+    "Format-argument parity: title_invalid",
+    "Nonempty translations: title_invalid",
+    "Format-argument parity: import_unrecognized",
+    "Nonempty translations: import_unrecognized",
+    "Format-argument parity: category",
+    "Nonempty translations: category",
+    "Format-argument parity: bank_new_category",
+    "Nonempty translations: bank_new_category",
+    "Format-argument parity: rate_value",
+    "Nonempty translations: rate_value",
+    "Format-argument parity: developer_purchase_banner",
+    "Nonempty translations: developer_purchase_banner",
+    "Format-argument parity: import_auto_done",
+    "Nonempty translations: import_auto_done",
+    "Format-argument parity: keep_editing",
+    "Nonempty translations: keep_editing",
+    "Format-argument parity: period_today",
+    "Nonempty translations: period_today",
+    "Format-argument parity: trial_14",
+    "Nonempty translations: trial_14",
+    "Format-argument parity: premium_assistant_toggle_hint",
+    "Nonempty translations: premium_assistant_toggle_hint",
+    "Format-argument parity: trial_explanation",
+    "Nonempty translations: trial_explanation",
+    "Format-argument parity: delete_entry",
+    "Nonempty translations: delete_entry",
+    "Format-argument parity: mascot_sky",
+    "Nonempty translations: mascot_sky",
+    "Format-argument parity: api_syncing",
+    "Nonempty translations: api_syncing",
+    "Format-argument parity: last_7_days",
+    "Nonempty translations: last_7_days",
+    "Format-argument parity: get_started",
+    "Nonempty translations: get_started",
+    "Format-argument parity: biometric_unavailable",
+    "Nonempty translations: biometric_unavailable",
+    "Format-argument parity: support_network_error",
+    "Nonempty translations: support_network_error",
+    "Format-argument parity: cinematic_more_buckets",
+    "Nonempty translations: cinematic_more_buckets",
+    "Format-argument parity: help_privacy_body",
+    "Nonempty translations: help_privacy_body",
+    "Format-argument parity: import_confirm_permission",
+    "Nonempty translations: import_confirm_permission",
+    "Format-argument parity: no_matches_body",
+    "Nonempty translations: no_matches_body",
+    "Format-argument parity: bank_play_sms",
+    "Nonempty translations: bank_play_sms",
+    "Format-argument parity: negative_amount",
+    "Nonempty translations: negative_amount",
+    "Format-argument parity: bank_clear_history",
+    "Nonempty translations: bank_clear_history",
+    "Format-argument parity: cinematic_comparison",
+    "Nonempty translations: cinematic_comparison",
+    "Format-argument parity: biometric_unlock",
+    "Nonempty translations: biometric_unlock",
+    "Format-argument parity: language",
+    "Nonempty translations: language",
+    "Format-argument parity: fps_title",
+    "Nonempty translations: fps_title",
+    "Format-argument parity: bank_budget_progress",
+    "Nonempty translations: bank_budget_progress",
+    "Format-argument parity: help_security_body",
+    "Nonempty translations: help_security_body",
+    "Format-argument parity: billing_verification",
+    "Nonempty translations: billing_verification",
+    "Format-argument parity: done",
+    "Nonempty translations: done",
+    "Format-argument parity: unlock_title",
+    "Nonempty translations: unlock_title",
+    "Format-argument parity: premium_body",
+    "Nonempty translations: premium_body",
+    "Format-argument parity: chart_empty",
+    "Nonempty translations: chart_empty",
+    "Format-argument parity: premium_active",
+    "Nonempty translations: premium_active",
+    "Format-argument parity: api_connected",
+    "Nonempty translations: api_connected",
+    "Format-argument parity: contact_telegram",
+    "Nonempty translations: contact_telegram",
+    "Format-argument parity: load_more",
+    "Nonempty translations: load_more",
+    "Format-argument parity: default_currency",
+    "Nonempty translations: default_currency",
+    "Format-argument parity: fps_explanation",
+    "Nonempty translations: fps_explanation",
+    "Format-argument parity: fps_auto",
+    "Nonempty translations: fps_auto",
+    "Format-argument parity: biometric_title",
+    "Nonempty translations: biometric_title",
+    "Format-argument parity: assistant_text_hint",
+    "Nonempty translations: assistant_text_hint",
+    "Format-argument parity: voice_entry_added",
+    "Nonempty translations: voice_entry_added",
+    "Format-argument parity: storage_error",
+    "Nonempty translations: storage_error",
+    "Format-argument parity: date_invalid",
+    "Nonempty translations: date_invalid",
+    "Format-argument parity: cash_flow",
+    "Nonempty translations: cash_flow",
+    "Format-argument parity: category_health",
+    "Nonempty translations: category_health",
+    "Format-argument parity: bank_enabled",
+    "Nonempty translations: bank_enabled",
+    "Format-argument parity: import_package_settings",
+    "Nonempty translations: import_package_settings",
+    "Format-argument parity: support_handle",
+    "Nonempty translations: support_handle",
+    "Format-argument parity: biometric_subtitle",
+    "Nonempty translations: biometric_subtitle",
+    "Format-argument parity: assistant_write_short",
+    "Nonempty translations: assistant_write_short",
+    "Format-argument parity: bank_recent",
+    "Nonempty translations: bank_recent",
+    "Format-argument parity: colors_collapse",
+    "Nonempty translations: colors_collapse",
+    "Format-argument parity: amount_invalid",
+    "Nonempty translations: amount_invalid",
+    "Format-argument parity: title_optional_hint",
+    "Nonempty translations: title_optional_hint",
+    "Format-argument parity: all",
+    "Nonempty translations: all",
+    "Format-argument parity: developer_purchase_button",
+    "Nonempty translations: developer_purchase_button",
+    "Format-argument parity: billing_activation_code",
+    "Nonempty translations: billing_activation_code",
+    "Format-argument parity: category_leisure",
+    "Nonempty translations: category_leisure",
+    "Format-argument parity: theme_light",
+    "Nonempty translations: theme_light",
+    "Format-argument parity: analytics_title",
+    "Nonempty translations: analytics_title",
+    "Format-argument parity: close",
+    "Nonempty translations: close",
+    "Format-argument parity: empty_ledger_title",
+    "Nonempty translations: empty_ledger_title",
+    "Format-argument parity: appearance",
+    "Nonempty translations: appearance",
+    "Format-argument parity: cancel",
+    "Nonempty translations: cancel",
+    "Format-argument parity: import_disabled",
+    "Nonempty translations: import_disabled",
+    "Format-argument parity: cinematic_history",
+    "Nonempty translations: cinematic_history",
+    "Format-argument parity: import_paste",
+    "Nonempty translations: import_paste",
+    "Format-argument parity: bank_month",
+    "Nonempty translations: bank_month",
+    "Format-argument parity: security",
+    "Nonempty translations: security",
+    "Format-argument parity: pin_mismatch",
+    "Nonempty translations: pin_mismatch",
+    "Format-argument parity: import_text",
+    "Nonempty translations: import_text",
+    "Format-argument parity: pin_digit_count",
+    "Nonempty translations: pin_digit_count",
+    "Format-argument parity: no_matches",
+    "Nonempty translations: no_matches",
+    "Format-argument parity: diagnostics_show_button",
+    "Nonempty translations: diagnostics_show_button",
+    "Format-argument parity: clear_filters",
+    "Nonempty translations: clear_filters",
+    "Format-argument parity: cinematic_month_average",
+    "Nonempty translations: cinematic_month_average",
+    "Format-argument parity: installation_id_copied",
+    "Nonempty translations: installation_id_copied",
+    "Format-argument parity: pay_source_required",
+    "Nonempty translations: pay_source_required",
+    "Format-argument parity: overview",
+    "Nonempty translations: overview",
+    "Format-argument parity: bank_access_yes",
+    "Nonempty translations: bank_access_yes",
+    "Format-argument parity: import_mode_notify",
+    "Nonempty translations: import_mode_notify",
+    "Format-argument parity: help_premium_body",
+    "Nonempty translations: help_premium_body",
+    "Format-argument parity: category_other",
+    "Nonempty translations: category_other",
+    "Format-argument parity: use_pin",
+    "Nonempty translations: use_pin",
+    "Format-argument parity: mascot_animations",
+    "Nonempty translations: mascot_animations",
+    "Format-argument parity: color_hue",
+    "Nonempty translations: color_hue",
+    "Format-argument parity: pin_incorrect",
+    "Nonempty translations: pin_incorrect",
+    "Format-argument parity: brand_copyright",
+    "Nonempty translations: brand_copyright",
+    "Format-argument parity: total_balance",
+    "Nonempty translations: total_balance",
+    "Format-argument parity: cinematic_apply",
+    "Nonempty translations: cinematic_apply",
+    "Format-argument parity: character_count",
+    "Nonempty translations: character_count",
+    "Format-argument parity: import_empty",
+    "Nonempty translations: import_empty",
+    "Format-argument parity: cinematic_expenses_period",
+    "Nonempty translations: cinematic_expenses_period",
+    "Format-argument parity: voice_smalltalk_greeting",
+    "Nonempty translations: voice_smalltalk_greeting",
+    "Format-argument parity: premium_feature_mascot",
+    "Nonempty translations: premium_feature_mascot",
+    "Format-argument parity: cinematic_less_than_previous",
+    "Nonempty translations: cinematic_less_than_previous",
+    "Format-argument parity: onboard_title_two",
+    "Nonempty translations: onboard_title_two",
+    "Format-argument parity: brand_intro_body",
+    "Nonempty translations: brand_intro_body",
+    "Format-argument parity: color_surface",
+    "Nonempty translations: color_surface",
+    "Format-argument parity: premium_source_developer",
+    "Nonempty translations: premium_source_developer",
+    "Format-argument parity: voice_smalltalk_compliment",
+    "Nonempty translations: voice_smalltalk_compliment",
+    "Format-argument parity: rates_empty",
+    "Nonempty translations: rates_empty",
+    "Format-argument parity: import_confirm_enabled",
+    "Nonempty translations: import_confirm_enabled",
+    "Format-argument parity: help_security_title",
+    "Nonempty translations: help_security_title",
+    "Format-argument parity: api_imported_last",
+    "Nonempty translations: api_imported_last",
+    "Format-argument parity: push_howto",
+    "Nonempty translations: push_howto",
+    "Format-argument parity: billing_unavailable",
+    "Nonempty translations: billing_unavailable",
+    "Format-argument parity: bank_battery",
+    "Nonempty translations: bank_battery",
+    "Format-argument parity: entry_title",
+    "Nonempty translations: entry_title",
+    "Format-argument parity: cinematic_more",
+    "Nonempty translations: cinematic_more",
+    "Format-argument parity: bank_time_received",
+    "Nonempty translations: bank_time_received",
+    "Format-argument parity: help_banks_body",
+    "Nonempty translations: help_banks_body",
+    "Format-argument parity: color_muted",
+    "Nonempty translations: color_muted",
+    "Format-argument parity: security_error",
+    "Nonempty translations: security_error",
+    "Format-argument parity: bank_sms_permission",
+    "Nonempty translations: bank_sms_permission",
+    "Format-argument parity: privat_api_howto",
+    "Nonempty translations: privat_api_howto",
+    "Format-argument parity: search_scope",
+    "Nonempty translations: search_scope",
+    "Format-argument parity: bank_dashboard",
+    "Nonempty translations: bank_dashboard",
+    "Format-argument parity: premium_expires",
+    "Nonempty translations: premium_expires",
+    "Format-argument parity: bank_category_stats",
+    "Nonempty translations: bank_category_stats",
+    "Format-argument parity: bank_sms_yes",
+    "Nonempty translations: bank_sms_yes",
+    "Format-argument parity: handle_copied",
+    "Nonempty translations: handle_copied",
+    "Format-argument parity: total_thirty_days",
+    "Nonempty translations: total_thirty_days",
+    "Format-argument parity: voice_ask_source",
+    "Nonempty translations: voice_ask_source",
+    "Format-argument parity: api_error_rate",
+    "Nonempty translations: api_error_rate",
+    "Format-argument parity: mascot_gray",
+    "Nonempty translations: mascot_gray",
+    "Format-argument parity: category_transfer",
+    "Nonempty translations: category_transfer",
+    "Format-argument parity: import_unsupported",
+    "Nonempty translations: import_unsupported",
+    "Format-argument parity: start_over",
+    "Nonempty translations: start_over",
+    "Format-argument parity: activation_code_label",
+    "Nonempty translations: activation_code_label",
+    "Format-argument parity: save_profile",
+    "Nonempty translations: save_profile",
+    "Format-argument parity: skip",
+    "Nonempty translations: skip",
+    "Format-argument parity: color_apply",
+    "Nonempty translations: color_apply",
+    "Format-argument parity: unlock_biometric",
+    "Nonempty translations: unlock_biometric",
+    "Format-argument parity: voice_reply_balance",
+    "Nonempty translations: voice_reply_balance",
+    "Format-argument parity: biometric_explanation",
+    "Nonempty translations: biometric_explanation",
+    "Format-argument parity: billing_pending",
+    "Nonempty translations: billing_pending",
+    "Format-argument parity: cinematic_period",
+    "Nonempty translations: cinematic_period",
+    "Format-argument parity: bank_notification_permission",
+    "Nonempty translations: bank_notification_permission",
+    "Format-argument parity: theme_system",
+    "Nonempty translations: theme_system",
+    "Format-argument parity: mascot_style",
+    "Nonempty translations: mascot_style",
+    "Format-argument parity: auto_lock_explanation",
+    "Nonempty translations: auto_lock_explanation",
+    "Format-argument parity: brand_author_signature",
+    "Nonempty translations: brand_author_signature",
+    "Format-argument parity: api_connect",
+    "Nonempty translations: api_connect",
+    "Format-argument parity: help_entries_body",
+    "Nonempty translations: help_entries_body",
+    "Format-argument parity: premium_offline_notice",
+    "Nonempty translations: premium_offline_notice",
+    "Format-argument parity: brand_intro_title",
+    "Nonempty translations: brand_intro_title",
+    "Format-argument parity: color_chart_bottom",
+    "Nonempty translations: color_chart_bottom",
+    "Format-argument parity: bank_privacy_body",
+    "Nonempty translations: bank_privacy_body",
+    "Format-argument parity: onboard_title_three",
+    "Nonempty translations: onboard_title_three",
+    "Format-argument parity: rates_as_of",
+    "Nonempty translations: rates_as_of",
+    "Format-argument parity: reference_total_for",
+    "Nonempty translations: reference_total_for",
+    "Format-argument parity: import_mode_sms",
+    "Nonempty translations: import_mode_sms",
+    "Format-argument parity: pin_locked",
+    "Nonempty translations: pin_locked",
+    "Format-argument parity: bank_limit_recent",
+    "Nonempty translations: bank_limit_recent",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt",
+    "No NUL bytes: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "No implementation markers: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt",
+    "No NUL bytes: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "No implementation markers: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "Pure domain boundary: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "Lexically balanced Kotlin delimiters: domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt",
+    "No NUL bytes: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playRelease/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/legacyV7Debug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/kspCaches/playDebug/backups/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playRelease/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/legacyV7Debug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/RateDao_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/local/LedgerDatabase_Impl.kt",
+    "No NUL bytes: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No implementation markers: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "Lexically balanced Kotlin delimiters: data/build/generated/ksp/playDebug/kotlin/com/semmyx/ledger/data/bank/BankDao_Impl.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt",
+    "No NUL bytes: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No implementation markers: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "Lexically balanced Kotlin delimiters: data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt",
+    "No NUL bytes: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "No implementation markers: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "Lexically balanced Kotlin delimiters: data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt",
+    "No NUL bytes: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No implementation markers: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "Lexically balanced Kotlin delimiters: data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt",
+    "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt",
+    "No NUL bytes: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "No implementation markers: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/java/com/example/myapplication/ExampleUnitTest.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "Resolved app string: bank_dashboard",
+    "Resolved app string: close",
+    "Resolved app string: add_entry",
+    "Resolved app string: storage_error",
+    "Resolved app string: bank_setup",
+    "Resolved app string: bank_import_title",
+    "Resolved app string: bank_consent",
+    "Resolved app string: bank_enabled",
+    "Resolved app string: bank_auto",
+    "Resolved app string: import_mode_title",
+    "Resolved app string: import_mode_notify",
+    "Resolved app string: import_mode_api",
+    "Resolved app string: import_mode_sms",
+    "Resolved app string: api_howto",
+    "Resolved app string: api_open_site",
+    "Resolved app string: api_token_label",
+    "Resolved app string: api_connecting",
+    "Resolved app string: api_connect",
+    "Resolved app string: api_connected",
+    "Resolved app string: api_last_sync",
+    "Resolved app string: api_imported_last",
+    "Resolved app string: api_syncing",
+    "Resolved app string: api_sync_now",
+    "Resolved app string: api_disconnect",
+    "Resolved app string: api_error_bad_token",
+    "Resolved app string: api_error_rate",
+    "Resolved app string: api_error_no_accounts",
+    "Resolved app string: api_error_network",
+    "Resolved app string: privat_api_title",
+    "Resolved app string: privat_api_howto",
+    "Resolved app string: privat_api_site",
+    "Resolved app string: privat_api_token",
+    "Resolved app string: api_connecting",
+    "Resolved app string: api_connect",
+    "Resolved app string: privat_api_connected",
+    "Resolved app string: api_last_sync",
+    "Resolved app string: api_sync_now",
+    "Resolved app string: api_disconnect",
+    "Resolved app string: privat_api_error",
+    "Resolved app string: other_api_note",
+    "Resolved app string: sms_howto",
+    "Resolved app string: bank_sms_yes",
+    "Resolved app string: bank_sms_no",
+    "Resolved app string: bank_sms_permission",
+    "Resolved app string: sms_scanning",
+    "Resolved app string: sms_scan",
+    "Resolved app string: bank_sms_no",
+    "Resolved app string: sms_scan_result",
+    "Resolved app string: sms_restricted_tip",
+    "Resolved app string: push_howto",
+    "Resolved app string: bank_access_yes",
+    "Resolved app string: bank_access_no",
+    "Resolved app string: bank_notification_permission",
+    "Resolved app string: bank_app_permissions",
+    "Resolved app string: bank_battery",
+    "Resolved app string: import_confirm_permission",
+    "Resolved app string: import_confirm_enabled",
+    "Resolved app string: bank_privacy",
+    "Resolved app string: import_diagnostics",
+    "Resolved app string: import_connected",
+    "Resolved app string: import_disconnected",
+    "Resolved app string: import_counts",
+    "Resolved app string: import_reconnect",
+    "Resolved app string: import_package_settings",
+    "Resolved app string: import_paste",
+    "Resolved app string: import_queue_note",
+    "Resolved app string: bank_day",
+    "Resolved app string: bank_week",
+    "Resolved app string: bank_month",
+    "Resolved app string: all_time",
+    "Resolved app string: expenses",
+    "Resolved app string: all",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_unknown",
+    "Resolved app string: bank_budget_progress",
+    "Resolved app string: bank_category_stats",
+    "Resolved app string: bank_new_category",
+    "Resolved app string: bank_review_count",
+    "Resolved app string: bank_time_received",
+    "Resolved app string: bank_transfer_review",
+    "Resolved app string: bank_duplicate",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: bank_ignore",
+    "Resolved app string: bank_recent",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_limit_recent",
+    "Resolved app string: bank_budget",
+    "Resolved app string: save_entry",
+    "Resolved app string: bank_budget_disable",
+    "Resolved app string: bank_export",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: import_paste",
+    "Resolved app string: import_text",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: import_unrecognized",
+    "Resolved app string: import_manual_privacy",
+    "Resolved app string: import_to_queue",
+    "Resolved app string: cancel",
+    "Resolved app string: import_package_settings",
+    "Resolved app string: import_package_warning",
+    "Resolved app string: save_entry",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_new_category",
+    "Resolved app string: category",
+    "Resolved app string: save_entry",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: bank_clear_warning",
+    "Resolved app string: bank_clear_history",
+    "Resolved app string: cancel",
+    "Resolved app string: bank_privacy",
+    "Resolved app string: bank_privacy_body",
+    "Resolved app string: done",
+    "Resolved app string: import_disabled",
+    "Resolved app string: import_unsupported",
+    "Resolved app string: import_empty",
+    "Resolved app string: import_group",
+    "Resolved app string: import_unrecognized",
+    "Resolved app string: import_auto_done",
+    "Resolved app string: import_queued",
+    "Resolved app string: bank_duplicate",
+    "Resolved app string: import_repeated",
+    "Resolved app string: storage_error",
+    "Resolved app string: import_waiting",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "Resolved app string: telegram_support",
+    "Resolved app string: back",
+    "Resolved app string: support_network_error",
+    "Resolved app string: retry",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "Resolved app string: help",
+    "Resolved app string: close",
+    "Resolved app string: help_heading",
+    "Resolved app string: help_intro",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: help_entries_title",
+    "Resolved app string: help_entries_body",
+    "Resolved app string: help_banks_title",
+    "Resolved app string: help_banks_body",
+    "Resolved app string: help_privacy_title",
+    "Resolved app string: help_privacy_body",
+    "Resolved app string: help_security_title",
+    "Resolved app string: help_security_body",
+    "Resolved app string: help_premium_title",
+    "Resolved app string: help_premium_body",
+    "Resolved app string: app_version",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "Resolved app string: here_to_help",
+    "Resolved app string: support_intro",
+    "Resolved app string: lead_developer",
+    "Resolved app string: support_handle",
+    "Resolved app string: support",
+    "Resolved app string: copy_handle",
+    "Resolved app string: handle_copied",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: support_privacy",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "Resolved app string: load_error_title",
+    "Resolved app string: security_error",
+    "Resolved app string: retry",
+    "Resolved app string: need_help",
+    "Resolved app string: biometric_title",
+    "Resolved app string: biometric_subtitle",
+    "Resolved app string: use_pin",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "Resolved app string: all_time",
+    "Resolved app string: cinematic_period",
+    "Resolved app string: all_time",
+    "Resolved app string: cinematic_apply",
+    "Resolved app string: back",
+    "Resolved app string: back",
+    "Resolved app string: cinematic_history",
+    "Resolved app string: analytics_title",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: retry",
+    "Resolved app string: cinematic_expenses_period",
+    "Resolved app string: cinematic_comparison",
+    "Resolved app string: cinematic_more_than_previous",
+    "Resolved app string: cinematic_less_than_previous",
+    "Resolved app string: cinematic_month_average",
+    "Resolved app string: cinematic_week_average",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_more",
+    "Resolved app string: category_empty",
+    "Resolved app string: back",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: reference_total_for",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: all_categories",
+    "Resolved app string: cinematic_transactions",
+    "Resolved app string: category_empty",
+    "Resolved app string: load_more",
+    "Resolved app string: category_transaction_count",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "Resolved app string: cinematic_chart_accessibility",
+    "Resolved app string: cinematic_tooltip",
+    "Resolved app string: cinematic_more_buckets",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: category_empty",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "Resolved app string: unlock_title",
+    "Resolved app string: confirm_pin",
+    "Resolved app string: create_pin",
+    "Resolved app string: pin_digit_count",
+    "Resolved app string: pin_setup_subtitle",
+    "Resolved app string: pin_unlock_subtitle",
+    "Resolved app string: pin_locked",
+    "Resolved app string: pin_incorrect",
+    "Resolved app string: pin_mismatch",
+    "Resolved app string: security_error",
+    "Resolved app string: biometric_failed",
+    "Resolved app string: unlock_biometric",
+    "Resolved app string: erase_digit",
+    "Resolved app string: start_over",
+    "Resolved app string: need_help",
+    "Resolved app string: pin_recovery_notice",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "Resolved app string: category_food",
+    "Resolved app string: category_transport",
+    "Resolved app string: category_home",
+    "Resolved app string: category_health",
+    "Resolved app string: category_leisure",
+    "Resolved app string: category_salary",
+    "Resolved app string: category_other",
+    "Resolved app string: category_transfer",
+    "Resolved app string: category_dining",
+    "Resolved app string: category_cashback",
+    "Resolved app string: storage_error",
+    "Resolved app string: saved",
+    "Resolved app string: entry_deleted",
+    "Resolved app string: undo_expired",
+    "Resolved app string: rate_offline",
+    "Resolved app string: biometric_unavailable",
+    "Resolved app string: name_invalid",
+    "Resolved app string: entry_not_found",
+    "Resolved app string: premium_activated",
+    "Resolved app string: activation_invalid",
+    "Resolved app string: billing_unavailable",
+    "Resolved app string: billing_configuration",
+    "Resolved app string: billing_network",
+    "Resolved app string: billing_pending",
+    "Resolved app string: billing_verification",
+    "Resolved app string: billing_acknowledgement",
+    "Resolved app string: billing_activation_code",
+    "Resolved app string: overview",
+    "Resolved app string: settings",
+    "Resolved app string: help",
+    "Resolved app string: analytics_title",
+    "Resolved app string: bank_dashboard",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "Resolved app string: all_time",
+    "Resolved app string: chart_description",
+    "Resolved app string: cash_flow",
+    "Resolved app string: last_7_days",
+    "Resolved app string: last_30_days",
+    "Resolved app string: last_30_days_plus",
+    "Resolved app string: all_time",
+    "Resolved app string: chart_empty",
+    "Resolved app string: legend_income",
+    "Resolved app string: legend_expense",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: cinematic_more",
+    "Resolved app string: category_empty",
+    "Resolved app string: all_time",
+    "Resolved app string: last_30_days",
+    "Resolved app string: last_7_days",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: back",
+    "Resolved app string: last_7_days",
+    "Resolved app string: last_30_days",
+    "Resolved app string: all_time",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: total_all_time",
+    "Resolved app string: total_thirty_days",
+    "Resolved app string: total_seven_days",
+    "Resolved app string: cinematic_expense_categories",
+    "Resolved app string: cinematic_income_categories",
+    "Resolved app string: category_transaction_count",
+    "Resolved app string: category_transaction_count",
+    "Resolved app string: load_more",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "Resolved app string: entry_deleted",
+    "Resolved app string: undo",
+    "Resolved app string: storage_error",
+    "Resolved app string: app_name",
+    "Resolved app string: add_entry",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: income",
+    "Resolved app string: expense",
+    "Resolved app string: voice_entry_added",
+    "Resolved app string: voice_ask_source",
+    "Resolved app string: bank_card",
+    "Resolved app string: bank_cash",
+    "Resolved app string: cancel",
+    "Resolved app string: voice_reply_balance",
+    "Resolved app string: period_today",
+    "Resolved app string: last_7_days",
+    "Resolved app string: period_month",
+    "Resolved app string: period_year",
+    "Resolved app string: all_time",
+    "Resolved app string: all_categories",
+    "Resolved app string: expenses",
+    "Resolved app string: income",
+    "Resolved app string: voice_statistics",
+    "Resolved app string: voice_ask_source",
+    "Resolved app string: voice_reply_balance",
+    "Resolved app string: voice_reply_spent_today",
+    "Resolved app string: voice_reply_opening_entry",
+    "Resolved app string: voice_reply_not_understood",
+    "Resolved app string: voice_reply_not_understood",
+    "Resolved app string: voice_permission_denied",
+    "Resolved app string: voice_recognizer_unavailable",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: retry",
+    "Resolved app string: dashboard_heading",
+    "Resolved app string: greeting",
+    "Resolved app string: dashboard_subtitle",
+    "Resolved app string: activity",
+    "Resolved app string: search_entries",
+    "Resolved app string: clear_search",
+    "Resolved app string: all",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: search_scope",
+    "Resolved app string: no_matches",
+    "Resolved app string: empty_ledger_title",
+    "Resolved app string: no_matches_body",
+    "Resolved app string: empty_ledger_body",
+    "Resolved app string: clear_filters",
+    "Resolved app string: add_first_entry",
+    "Resolved app string: delete_entry",
+    "Resolved app string: load_more",
+    "Resolved app string: voice_smalltalk_greeting",
+    "Resolved app string: voice_smalltalk_how_are_you",
+    "Resolved app string: voice_smalltalk_thanks",
+    "Resolved app string: voice_smalltalk_who_are_you",
+    "Resolved app string: voice_smalltalk_bye",
+    "Resolved app string: voice_smalltalk_compliment",
+    "Resolved app string: voice_smalltalk_joke",
+    "Resolved app string: total_balance",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: total_balance",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: positive_amount",
+    "Resolved app string: negative_amount",
+    "Resolved app string: delete_named_entry",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "Resolved app string: edit_entry",
+    "Resolved app string: add_entry",
+    "Resolved app string: back",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: back",
+    "Resolved app string: expense",
+    "Resolved app string: income",
+    "Resolved app string: amount",
+    "Resolved app string: amount_invalid",
+    "Resolved app string: pay_source_title",
+    "Resolved app string: bank_card",
+    "Resolved app string: bank_cash",
+    "Resolved app string: pay_source_required",
+    "Resolved app string: entry_title",
+    "Resolved app string: title_optional_hint",
+    "Resolved app string: date_invalid",
+    "Resolved app string: save_entry",
+    "Resolved app string: discard_title",
+    "Resolved app string: discard_body",
+    "Resolved app string: discard",
+    "Resolved app string: keep_editing",
+    "Resolved app string: done",
+    "Resolved app string: cancel",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "Resolved app string: cinematic_history",
+    "Resolved app string: back",
+    "Resolved app string: all_time",
+    "Resolved app string: history_search",
+    "Resolved app string: all",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: storage_error",
+    "Resolved app string: category_empty",
+    "Resolved app string: bank_cash",
+    "Resolved app string: bank_unknown",
+    "Resolved app string: load_more",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "Resolved app string: brand_intro_title",
+    "Resolved app string: onboard_title_one",
+    "Resolved app string: onboard_title_two",
+    "Resolved app string: onboard_title_three",
+    "Resolved app string: brand_intro_body",
+    "Resolved app string: onboard_body_one",
+    "Resolved app string: onboard_body_two",
+    "Resolved app string: onboard_body_three",
+    "Resolved app string: app_name",
+    "Resolved app string: skip",
+    "Resolved app string: brand_author_signature",
+    "Resolved app string: brand_design_label",
+    "Resolved app string: brand_copyright",
+    "Resolved app string: page_of",
+    "Resolved app string: get_started",
+    "Resolved app string: next",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "Resolved app string: voice_assistant_button",
+    "Resolved app string: mascot_card_title",
+    "Resolved app string: cat_locked_hint",
+    "Resolved app string: voice_assistant_listening",
+    "Resolved app string: cat_tap_hint",
+    "Resolved app string: assistant_write_short",
+    "Resolved app string: assistant_text_hint",
+    "Resolved app string: assistant_send",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "Resolved app string: colors_title",
+    "Resolved app string: colors_explanation",
+    "Resolved app string: colors_collapse",
+    "Resolved app string: colors_edit",
+    "Resolved app string: colors_categories",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: colors_reset_all",
+    "Resolved app string: color_hue",
+    "Resolved app string: color_saturation",
+    "Resolved app string: color_brightness",
+    "Resolved app string: color_invalid",
+    "Resolved app string: color_contrast_warning",
+    "Resolved app string: color_reset",
+    "Resolved app string: color_apply",
+    "Resolved app string: cancel",
+    "Resolved app string: color_accent",
+    "Resolved app string: color_background",
+    "Resolved app string: color_surface",
+    "Resolved app string: color_text",
+    "Resolved app string: color_muted",
+    "Resolved app string: income",
+    "Resolved app string: expenses",
+    "Resolved app string: color_chart_top",
+    "Resolved app string: color_chart_bottom",
+    "Resolved app string: color_error",
+    "Resolved app string: color_grid",
+    "Resolved app string: color_icons",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "Resolved app string: load_error_title",
+    "Resolved app string: storage_error",
+    "Resolved app string: back",
+    "Resolved app string: settings",
+    "Resolved app string: close",
+    "Resolved app string: lock_now",
+    "Resolved app string: profile",
+    "Resolved app string: local_profile",
+    "Resolved app string: display_name",
+    "Resolved app string: save_profile",
+    "Resolved app string: language",
+    "Resolved app string: language_instant",
+    "Resolved app string: language_en",
+    "Resolved app string: language_uk",
+    "Resolved app string: bank_import_title",
+    "Resolved app string: bank_consent",
+    "Resolved app string: bank_dashboard",
+    "Resolved app string: appearance",
+    "Resolved app string: theme_system",
+    "Resolved app string: theme_light",
+    "Resolved app string: theme_dark",
+    "Resolved app string: fps_title",
+    "Resolved app string: fps_explanation",
+    "Resolved app string: fps_auto",
+    "Resolved app string: fps_value",
+    "Resolved app string: fps_supported",
+    "Resolved app string: fps_fallback",
+    "Resolved app string: default_currency",
+    "Resolved app string: currency_explanation",
+    "Resolved app string: security",
+    "Resolved app string: biometric_unlock",
+    "Resolved app string: biometric_explanation",
+    "Resolved app string: biometric_unavailable",
+    "Resolved app string: auto_lock_explanation",
+    "Resolved app string: lock_now",
+    "Resolved app string: premium_name",
+    "Resolved app string: premium_body",
+    "Resolved app string: premium_feature_trends",
+    "Resolved app string: premium_feature_mascot",
+    "Resolved app string: premium_feature_support",
+    "Resolved app string: premium_active",
+    "Resolved app string: premium_source_developer",
+    "Resolved app string: premium_source_trial",
+    "Resolved app string: premium_source_play",
+    "Resolved app string: premium_expires",
+    "Resolved app string: premium_offline_notice",
+    "Resolved app string: premium_local_notice",
+    "Resolved app string: premium_assistant_toggle",
+    "Resolved app string: premium_assistant_toggle_hint",
+    "Resolved app string: premium_unlock",
+    "Resolved app string: premium_buy",
+    "Resolved app string: billing_configuration",
+    "Resolved app string: trial_explanation",
+    "Resolved app string: trial_14",
+    "Resolved app string: mascot_style",
+    "Resolved app string: mascot_gray",
+    "Resolved app string: mascot_sky",
+    "Resolved app string: mascot_animations",
+    "Resolved app string: developer_purchase_title",
+    "Resolved app string: developer_purchase_body",
+    "Resolved app string: developer_purchase_banner",
+    "Resolved app string: developer_purchase_note",
+    "Resolved app string: developer_purchase_button",
+    "Resolved app string: installation_id_label",
+    "Resolved app string: installation_id_copied",
+    "Resolved app string: installation_id_copy",
+    "Resolved app string: activation_code_label",
+    "Resolved app string: activation_code_hint",
+    "Resolved app string: activation_code_button",
+    "Resolved app string: reference_rates",
+    "Resolved app string: rates_disclaimer",
+    "Resolved app string: rates_empty",
+    "Resolved app string: rate_value",
+    "Resolved app string: rates_as_of",
+    "Resolved app string: refreshing",
+    "Resolved app string: refresh_rates",
+    "Resolved app string: support",
+    "Resolved app string: support_intro",
+    "Resolved app string: contact_telegram",
+    "Resolved app string: diagnostics_none",
+    "Resolved app string: diagnostics_show_button",
+    "Resolved app string: diagnostics_title",
+    "Resolved app string: diagnostics_hint",
+    "Resolved app string: diagnostics_copied",
+    "Resolved app string: diagnostics_copy",
+    "Resolved app string: diagnostics_clear",
+    "Resolved app string: diagnostics_close",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "Resolved app string: restore_purchases",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt",
+    "Actual SQL: sums keep currencies separate",
+    "Actual SQL: normalized Ukrainian search",
+    "Actual SQL: literal percent search",
+    "Actual SQL: bound input cannot change query structure",
+    "Actual SQL: type filter",
+    "Actual SQL: stable creation ordering and limit",
+    "Actual SQL: first delete succeeds",
+    "Actual SQL: repeated delete is idempotent",
+    "Actual SQL: deleted entries are hidden",
+    "Actual SQL: stale undo token is rejected",
+    "Actual SQL: exact undo token restores entry",
+    "Actual SQL: old tombstone is purged",
+    "Actual SQL: date-window aggregation excludes deletions",
+    "Android cloud backup disabled",
+    "Cleartext traffic disabled",
+    "Support WebView is non-exported",
+    "Unicode normalization implemented in repository",
+    "Requested v7 flavor included",
+    "Current-submission v8 flavor included",
+    "Android 16 target configured",
+    "No destructive migration fallback"
+  ]
+}
+```
+
+## verification/upgrade-sql.json
+
+```json
+{
+  "kind": "exact-Room-SQL-in-SQLite",
+  "passed": 14,
+  "checks": [
+    "Calendar month: exact food sum across more than 50 records",
+    "Calendar month: all expense categories",
+    "Income excludes expenses",
+    "All-time includes earlier years and excludes deleted/future/currency",
+    "Empty category returns zero",
+    "Category pagination initial window plus sentinel",
+    "Load more obtains every category transaction",
+    "Transaction details retained",
+    "Seven-day details share exact seven-day bounds",
+    "Category header uses full dataset rather than current page",
+    "Assistant statistics exclude newly deleted entries",
+    "Undo restores aggregate",
+    "Income/expense counts remain separate inside one category",
+    "Combined category detail count remains backwards compatible"
+  ],
+  "compiled_android": false,
+  "executed_junit": false
+}
+```
+
+## verification/voice-regex-jvm.json
+
+```json
+{
+  "kind": "exact-source-regex-on-JVM",
+  "passed": 7,
+  "compiled_kotlin": false,
+  "compiled_android": false,
+  "output": "JVM monetary-regex checks passed: 7"
+}
 ```

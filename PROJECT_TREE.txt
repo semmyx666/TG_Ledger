@@ -1,322 +1,263 @@
-TGLedger-3.3.2/
-├── .github/
-│   └── workflows/
-│       └── android.yml
-├── app/
-│   ├── src/
-│   │   ├── androidTest/
-│   │   │   └── kotlin/
-│   │   │       └── com/
-│   │   │           └── semmyx/
-│   │   │               └── ledger/
-│   │   │                   ├── BankBackgroundImportTest.kt
-│   │   │                   └── ComposeScreensTest.kt
-│   │   ├── main/
-│   │   │   ├── keepRules/
-│   │   │   │   └── rules.keep
-│   │   │   ├── kotlin/
-│   │   │   │   └── com/
-│   │   │   │       └── semmyx/
-│   │   │   │           └── ledger/
-│   │   │   │               ├── analytics/
-│   │   │   │               │   ├── AnalyticsCharts.kt
-│   │   │   │               │   ├── AnalyticsScreen.kt
-│   │   │   │               │   └── AnalyticsViewModel.kt
-│   │   │   │               ├── auth/
-│   │   │   │               │   ├── AuthenticationScreen.kt
-│   │   │   │               │   └── AuthViewModel.kt
-│   │   │   │               ├── bank/
-│   │   │   │               │   ├── BankImportWorker.kt
-│   │   │   │               │   ├── BankNotificationListener.kt
-│   │   │   │               │   ├── BankScreen.kt
-│   │   │   │               │   ├── BankSmsCatchUp.kt
-│   │   │   │               │   ├── BankSmsReceiver.kt
-│   │   │   │               │   └── BankViewModel.kt
-│   │   │   │               ├── cat/
-│   │   │   │               │   ├── CatAnimation.kt
-│   │   │   │               │   ├── CatAssistantCard.kt
-│   │   │   │               │   ├── CatFaceMesh.kt
-│   │   │   │               │   └── CatMeshRenderer.kt
-│   │   │   │               ├── common/
-│   │   │   │               │   ├── CommonComponents.kt
-│   │   │   │               │   └── ViewModelSupport.kt
-│   │   │   │               ├── dashboard/
-│   │   │   │               │   ├── ActivityChart.kt
-│   │   │   │               │   ├── CategoryDetails.kt
-│   │   │   │               │   ├── DashboardScreen.kt
-│   │   │   │               │   └── DashboardViewModel.kt
-│   │   │   │               ├── diagnostics/
-│   │   │   │               │   └── CrashLogger.kt
-│   │   │   │               ├── editor/
-│   │   │   │               │   ├── EntryScreen.kt
-│   │   │   │               │   └── EntryViewModel.kt
-│   │   │   │               ├── history/
-│   │   │   │               │   ├── HistoryScreen.kt
-│   │   │   │               │   └── HistoryViewModel.kt
-│   │   │   │               ├── navigation/
-│   │   │   │               │   ├── AppRoot.kt
-│   │   │   │               │   └── AppViewModel.kt
-│   │   │   │               ├── onboarding/
-│   │   │   │               │   └── OnboardingScreen.kt
-│   │   │   │               ├── platform/
-│   │   │   │               │   ├── BiometricUnlocker.kt
-│   │   │   │               │   ├── HighRefreshRate.kt
-│   │   │   │               │   ├── OwnershipSeal.kt
-│   │   │   │               │   └── RateRefreshWorker.kt
-│   │   │   │               ├── settings/
-│   │   │   │               │   ├── ColorSettings.kt
-│   │   │   │               │   ├── SettingsScreen.kt
-│   │   │   │               │   └── SettingsViewModel.kt
-│   │   │   │               ├── support/
-│   │   │   │               │   ├── HelpScreen.kt
-│   │   │   │               │   ├── SupportNavigator.kt
-│   │   │   │               │   ├── SupportSheet.kt
-│   │   │   │               │   └── SupportWebActivity.kt
-│   │   │   │               ├── theme/
-│   │   │   │               │   ├── AppearancePalette.kt
-│   │   │   │               │   └── Theme.kt
-│   │   │   │               ├── voice/
-│   │   │   │               │   ├── OptionalVoiceAssistant.kt
-│   │   │   │               │   ├── SpokenMoneyFormatter.kt
-│   │   │   │               │   ├── VoiceEntryParser.kt
-│   │   │   │               │   ├── VoiceFinanceQuery.kt
-│   │   │   │               │   └── VoiceSmallTalk.kt
-│   │   │   │               ├── AppContainer.kt
-│   │   │   │               ├── LedgerApplication.kt
-│   │   │   │               └── MainActivity.kt
-│   │   │   ├── res/
-│   │   │   │   ├── drawable-nodpi/
-│   │   │   │   │   ├── cat_amber_base.webp
-│   │   │   │   │   └── cat_amber_sky.webp
-│   │   │   │   ├── drawable/
-│   │   │   │   │   ├── brand_sky.xml
-│   │   │   │   │   ├── ic_launcher_background.xml
-│   │   │   │   │   ├── ic_launcher_foreground.xml
-│   │   │   │   │   ├── ic_splash.xml
-│   │   │   │   │   ├── mascot_gray.xml
-│   │   │   │   │   └── mascot_sky.xml
-│   │   │   │   ├── mipmap-anydpi-v26/
-│   │   │   │   │   ├── ic_launcher.xml
-│   │   │   │   │   └── ic_launcher_round.xml
-│   │   │   │   ├── mipmap-anydpi-v33/
-│   │   │   │   │   ├── ic_launcher.xml
-│   │   │   │   │   └── ic_launcher_round.xml
-│   │   │   │   ├── mipmap-hdpi/
-│   │   │   │   │   ├── ic_launcher.webp
-│   │   │   │   │   └── ic_launcher_round.webp
-│   │   │   │   ├── mipmap-mdpi/
-│   │   │   │   │   ├── ic_launcher.webp
-│   │   │   │   │   └── ic_launcher_round.webp
-│   │   │   │   ├── mipmap-xhdpi/
-│   │   │   │   │   ├── ic_launcher.webp
-│   │   │   │   │   └── ic_launcher_round.webp
-│   │   │   │   ├── mipmap-xxhdpi/
-│   │   │   │   │   ├── ic_launcher.webp
-│   │   │   │   │   └── ic_launcher_round.webp
-│   │   │   │   ├── mipmap-xxxhdpi/
-│   │   │   │   │   ├── ic_launcher.webp
-│   │   │   │   │   └── ic_launcher_round.webp
-│   │   │   │   ├── values-night/
-│   │   │   │   │   └── themes.xml
-│   │   │   │   ├── values-uk/
-│   │   │   │   │   └── strings.xml
-│   │   │   │   ├── values/
-│   │   │   │   │   ├── branding.xml
-│   │   │   │   │   ├── colors.xml
-│   │   │   │   │   ├── strings.xml
-│   │   │   │   │   └── themes.xml
-│   │   │   │   └── xml/
-│   │   │   │       ├── backup_rules.xml
-│   │   │   │       ├── data_extraction_rules.xml
-│   │   │   │       └── network_security_config.xml
-│   │   │   └── AndroidManifest.xml
-│   │   └── test/
-│   │       ├── java/
-│   │       │   └── com/
-│   │       │       └── example/
-│   │       │           └── myapplication/
-│   │       │               └── ExampleUnitTest.kt
-│   │       └── kotlin/
-│   │           └── com/
-│   │               └── semmyx/
-│   │                   └── ledger/
-│   │                       ├── cat/
-│   │                       │   └── CatFaceMeshTest.kt
-│   │                       ├── voice/
-│   │                       │   ├── FinanceUpgradeTest.kt
-│   │                       │   ├── OptionalVoiceAssistantParserTest.kt
-│   │                       │   └── VoiceSourceTest.kt
-│   │                       ├── MainDispatcherRule.kt
-│   │                       └── ViewModelTest.kt
-│   ├── .gitignore
-│   ├── build.gradle.kts
-│   └── proguard-rules.pro
-├── data/
-│   ├── schemas/
-│   │   ├── com.semmyx.ledger.data.local.LedgerDatabase/
-│   │   │   ├── 2.json
-│   │   │   └── 3.json
-│   │   └── README.md
-│   ├── src/
-│   │   ├── androidTest/
-│   │   │   └── kotlin/
-│   │   │       └── com/
-│   │   │           └── semmyx/
-│   │   │               └── ledger/
-│   │   │                   └── data/
-│   │   │                       ├── KeystoreSecurityTest.kt
-│   │   │                       └── RoomRepositoryTest.kt
-│   │   ├── legacyV7/
-│   │   │   └── kotlin/
-│   │   │       └── com/
-│   │   │           └── semmyx/
-│   │   │               └── ledger/
-│   │   │                   └── data/
-│   │   │                       └── billing/
-│   │   │                           └── BillingVersionAdapter.kt
-│   │   ├── main/
-│   │   │   ├── kotlin/
-│   │   │   │   └── com/
-│   │   │   │       └── semmyx/
-│   │   │   │           └── ledger/
-│   │   │   │               └── data/
-│   │   │   │                   ├── bank/
-│   │   │   │                   │   ├── BankEntities.kt
-│   │   │   │                   │   ├── BankImportRepository.kt
-│   │   │   │                   │   └── MonobankClient.kt
-│   │   │   │                   ├── billing/
-│   │   │   │                   │   ├── DeveloperSubscriptionVerifier.kt
-│   │   │   │                   │   ├── PlayPremiumRepository.kt
-│   │   │   │                   │   └── PurchaseSignatureVerifier.kt
-│   │   │   │                   ├── local/
-│   │   │   │                   │   ├── LedgerDao.kt
-│   │   │   │                   │   ├── LedgerDatabase.kt
-│   │   │   │                   │   └── LedgerEntities.kt
-│   │   │   │                   ├── remote/
-│   │   │   │                   │   └── RateApi.kt
-│   │   │   │                   ├── repository/
-│   │   │   │                   │   ├── DataStorePreferences.kt
-│   │   │   │                   │   ├── OfflineRateRepository.kt
-│   │   │   │                   │   └── RoomEntryRepository.kt
-│   │   │   │                   └── security/
-│   │   │   │                       ├── BiometricKeys.kt
-│   │   │   │                       ├── KeystoreSecurityRepository.kt
-│   │   │   │                       └── KeystoreVault.kt
-│   │   │   └── AndroidManifest.xml
-│   │   ├── play/
-│   │   │   └── kotlin/
-│   │   │       └── com/
-│   │   │           └── semmyx/
-│   │   │               └── ledger/
-│   │   │                   └── data/
-│   │   │                       └── billing/
-│   │   │                           └── BillingVersionAdapter.kt
-│   │   └── test/
-│   │       └── kotlin/
-│   │           └── com/
-│   │               └── semmyx/
-│   │                   └── ledger/
-│   │                       └── data/
-│   │                           ├── bank/
-│   │                           │   └── MonobankClientTest.kt
-│   │                           ├── billing/
-│   │                           │   └── DeveloperSubscriptionVerifierTest.kt
-│   │                           ├── PurchaseSignatureVerifierTest.kt
-│   │                           └── SearchPatternTest.kt
-│   ├── build.gradle.kts
-│   └── consumer-rules.pro
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── BANK_IMPORT_3_RU.md
-│   ├── CINEMATIC_REDESIGN_UK.md
-│   ├── COLORS_2_4.md
-│   ├── CRASH_AND_IMPORT_3_1_RU.md
-│   ├── design-reference.html
-│   ├── design-reference.png
-│   ├── DEVELOPER_ACTIVATION_CODES.md
-│   ├── OLED_2_2.md
-│   ├── OPTIONAL_VOICE_ASSISTANT.md
-│   ├── OWNERSHIP.md
-│   ├── PROJECT_STRUCTURE.md
-│   ├── RELEASE_CHECKLIST.md
-│   ├── RESPONSIVE_2_4_1.md
-│   ├── SECURITY.md
-│   ├── TEST_MATRIX.md
-│   └── UPDATE_2_UK.md
-├── domain/
-│   ├── src/
-│   │   ├── main/
-│   │   │   └── kotlin/
-│   │   │       └── com/
-│   │   │           └── semmyx/
-│   │   │               └── ledger/
-│   │   │                   └── domain/
-│   │   │                       ├── bank/
-│   │   │                       │   ├── BankParser.kt
-│   │   │                       │   ├── BankRepository.kt
-│   │   │                       │   └── MonobankMapper.kt
-│   │   │                       ├── Analytics.kt
-│   │   │                       ├── CinematicAnalytics.kt
-│   │   │                       ├── ColorPreferences.kt
-│   │   │                       ├── Models.kt
-│   │   │                       ├── Repositories.kt
-│   │   │                       └── UseCases.kt
-│   │   └── test/
-│   │       └── kotlin/
-│   │           └── com/
-│   │               └── semmyx/
-│   │                   └── ledger/
-│   │                       └── domain/
-│   │                           ├── bank/
-│   │                           │   ├── BankParserTest.kt
-│   │                           │   └── MonobankMapperTest.kt
-│   │                           ├── CinematicAnalyticsTest.kt
-│   │                           ├── ColorPreferencesTest.kt
-│   │                           ├── LedgerUseCasesTest.kt
-│   │                           ├── MemoryEntryRepository.kt
-│   │                           ├── MoneyAndPolicyTest.kt
-│   │                           └── UpgradePolicyTest.kt
-│   └── build.gradle.kts
-├── gradle/
-│   ├── wrapper/
-│   │   └── gradle-wrapper.properties
-│   ├── bootstrap.ps1
-│   ├── gradle-daemon-jvm.properties
-│   └── libs.versions.toml
-├── proof/
-│   ├── MANIFEST-3.3.1.sha256
-│   ├── MANIFEST-3.3.1.sha256.ots
-│   ├── MANIFEST-3.3.2.sha256
-│   └── MANIFEST-3.3.2.sha256.ots
-├── tools/
-│   ├── audit_project.py
-│   ├── issue_activation_code.py
-│   ├── verify_bank_regex.py
-│   ├── verify_bank_sql.py
-│   ├── verify_navigation_recovery.py
-│   ├── verify_upgrade_sql.py
-│   └── verify_voice_regex.py
-├── verification/
-│   ├── android-build-3.1.log
-│   ├── android-build-attempt.log
-│   ├── bank-regex-jvm.json
-│   ├── bank-sql.json
-│   ├── cat-skin-assets.json
-│   ├── gradle-attempt.txt
-│   ├── navigation-recovery.json
-│   ├── source-audit.json
-│   ├── STATUS.md
-│   ├── upgrade-sql.json
-│   └── voice-regex-jvm.json
-├── .gitignore
-├── build.gradle.kts
-├── gradle.properties
-├── gradlew
-├── gradlew.bat
-├── LICENSE
-├── MANIFEST.sha256
-├── NOTICE.md
-├── PROJECT_TREE.txt
-├── README.md
-├── settings.gradle.kts
-└── SOURCE_CODE.md
+TG_Ledger-3.3.3/
+  .github/workflows/android.yml
+  .gitignore
+  LICENSE
+  MANIFEST.sha256
+  NOTICE.md
+  PROJECT_TREE.txt
+  README.md
+  SOURCE_CODE.md
+  app/.gitignore
+  app/build.gradle.kts
+  app/proguard-rules.pro
+  app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt
+  app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt
+  app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt
+  app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt
+  app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt
+  app/src/main/AndroidManifest.xml
+  app/src/main/keepRules/rules.keep
+  app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt
+  app/src/main/kotlin/com/semmyx/ledger/LedgerApplication.kt
+  app/src/main/kotlin/com/semmyx/ledger/MainActivity.kt
+  app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsCharts.kt
+  app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/analytics/AnalyticsViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/auth/AuthViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/auth/AuthenticationScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankAmountRow.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankImportWorker.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationDecoder.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankNotificationListener.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsCatchUp.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankSmsReceiver.kt
+  app/src/main/kotlin/com/semmyx/ledger/bank/BankViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/cat/CatAnimation.kt
+  app/src/main/kotlin/com/semmyx/ledger/cat/CatAssistantCard.kt
+  app/src/main/kotlin/com/semmyx/ledger/cat/CatFaceMesh.kt
+  app/src/main/kotlin/com/semmyx/ledger/cat/CatMeshRenderer.kt
+  app/src/main/kotlin/com/semmyx/ledger/common/CommonComponents.kt
+  app/src/main/kotlin/com/semmyx/ledger/common/ViewModelSupport.kt
+  app/src/main/kotlin/com/semmyx/ledger/dashboard/ActivityChart.kt
+  app/src/main/kotlin/com/semmyx/ledger/dashboard/CategoryDetails.kt
+  app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/dashboard/DashboardViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/diagnostics/CrashLogger.kt
+  app/src/main/kotlin/com/semmyx/ledger/editor/EntryScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/editor/EntryViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/history/HistoryScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/history/HistoryViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/navigation/AppRoot.kt
+  app/src/main/kotlin/com/semmyx/ledger/navigation/AppViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/onboarding/OnboardingScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/platform/BiometricUnlocker.kt
+  app/src/main/kotlin/com/semmyx/ledger/platform/HighRefreshRate.kt
+  app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt
+  app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
+  app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt
+  app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt
+  app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt
+  app/src/main/kotlin/com/semmyx/ledger/support/HelpScreen.kt
+  app/src/main/kotlin/com/semmyx/ledger/support/SupportNavigator.kt
+  app/src/main/kotlin/com/semmyx/ledger/support/SupportSheet.kt
+  app/src/main/kotlin/com/semmyx/ledger/support/SupportWebActivity.kt
+  app/src/main/kotlin/com/semmyx/ledger/theme/AppearancePalette.kt
+  app/src/main/kotlin/com/semmyx/ledger/theme/Theme.kt
+  app/src/main/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistant.kt
+  app/src/main/kotlin/com/semmyx/ledger/voice/SpokenMoneyFormatter.kt
+  app/src/main/kotlin/com/semmyx/ledger/voice/VoiceEntryParser.kt
+  app/src/main/kotlin/com/semmyx/ledger/voice/VoiceFinanceQuery.kt
+  app/src/main/kotlin/com/semmyx/ledger/voice/VoiceSmallTalk.kt
+  app/src/main/res/drawable-nodpi/cat_amber_base.webp
+  app/src/main/res/drawable-nodpi/cat_amber_sky.webp
+  app/src/main/res/drawable/brand_sky.xml
+  app/src/main/res/drawable/ic_launcher_background.xml
+  app/src/main/res/drawable/ic_launcher_foreground.xml
+  app/src/main/res/drawable/ic_splash.xml
+  app/src/main/res/drawable/mascot_gray.xml
+  app/src/main/res/drawable/mascot_sky.xml
+  app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+  app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+  app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml
+  app/src/main/res/mipmap-anydpi-v33/ic_launcher_round.xml
+  app/src/main/res/mipmap-hdpi/ic_launcher.webp
+  app/src/main/res/mipmap-hdpi/ic_launcher_round.webp
+  app/src/main/res/mipmap-mdpi/ic_launcher.webp
+  app/src/main/res/mipmap-mdpi/ic_launcher_round.webp
+  app/src/main/res/mipmap-xhdpi/ic_launcher.webp
+  app/src/main/res/mipmap-xhdpi/ic_launcher_round.webp
+  app/src/main/res/mipmap-xxhdpi/ic_launcher.webp
+  app/src/main/res/mipmap-xxhdpi/ic_launcher_round.webp
+  app/src/main/res/mipmap-xxxhdpi/ic_launcher.webp
+  app/src/main/res/mipmap-xxxhdpi/ic_launcher_round.webp
+  app/src/main/res/values-night/themes.xml
+  app/src/main/res/values-uk/strings.xml
+  app/src/main/res/values/branding.xml
+  app/src/main/res/values/colors.xml
+  app/src/main/res/values/strings.xml
+  app/src/main/res/values/themes.xml
+  app/src/main/res/xml/backup_rules.xml
+  app/src/main/res/xml/data_extraction_rules.xml
+  app/src/main/res/xml/network_security_config.xml
+  app/src/test/java/com/example/myapplication/ExampleUnitTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt
+  app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/voice/OptionalVoiceAssistantParserTest.kt
+  app/src/test/kotlin/com/semmyx/ledger/voice/VoiceSourceTest.kt
+  bank-fixture/build.gradle.kts
+  bank-fixture/src/main/AndroidManifest.xml
+  bank-fixture/src/main/java/com/semmyx/ledger/bankfixture/FixtureReceiver.java
+  build.gradle.kts
+  data/build.gradle.kts
+  data/consumer-rules.pro
+  data/schemas/README.md
+  data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/2.json
+  data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/3.json
+  data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt
+  data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt
+  data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt
+  data/src/main/AndroidManifest.xml
+  data/src/main/kotlin/com/semmyx/ledger/data/bank/BankEntities.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/bank/BankImportRepository.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/bank/MonobankClient.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/bank/PrivatBankClient.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifier.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/billing/PlayPremiumRepository.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/billing/PurchaseSignatureVerifier.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDao.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerDatabase.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/local/LedgerEntities.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/remote/RateApi.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/repository/DataStorePreferences.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/repository/OfflineRateRepository.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/repository/RoomEntryRepository.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/security/BiometricKeys.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreSecurityRepository.kt
+  data/src/main/kotlin/com/semmyx/ledger/data/security/KeystoreVault.kt
+  data/src/play/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
+  docs/ARCHITECTURE.md
+  docs/BANKS_3.3.3_RU.md
+  docs/BANK_IMPORT_3_RU.md
+  docs/CINEMATIC_REDESIGN_UK.md
+  docs/COLORS_2_4.md
+  docs/CRASH_AND_IMPORT_3_1_RU.md
+  docs/DEVELOPER_ACTIVATION_CODES.md
+  docs/OLED_2_2.md
+  docs/OPTIONAL_VOICE_ASSISTANT.md
+  docs/OWNERSHIP.md
+  docs/PROJECT_STRUCTURE.md
+  docs/RELEASE_CHECKLIST.md
+  docs/RESPONSIVE_2_4_1.md
+  docs/SECURITY.md
+  docs/TEST_MATRIX.md
+  docs/UPDATE_2_UK.md
+  docs/UPDATE_FROM_3.3.2_RU.md
+  docs/design-reference.html
+  docs/design-reference.png
+  domain/build.gradle.kts
+  domain/src/main/kotlin/com/semmyx/ledger/domain/Analytics.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/CinematicAnalytics.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/ColorPreferences.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/Models.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/Repositories.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/UseCases.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankParser.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccess.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/bank/BankRepository.kt
+  domain/src/main/kotlin/com/semmyx/ledger/domain/bank/MonobankMapper.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/CinematicAnalyticsTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/ColorPreferencesTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/LedgerUseCasesTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/MemoryEntryRepository.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/MoneyAndPolicyTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/UpgradePolicyTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankParserTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/bank/BankPeriodAccessTest.kt
+  domain/src/test/kotlin/com/semmyx/ledger/domain/bank/MonobankMapperTest.kt
+  gradle.properties
+  gradle/bootstrap.ps1
+  gradle/gradle-daemon-jvm.properties
+  gradle/libs.versions.toml
+  gradle/wrapper/gradle-wrapper.properties
+  gradlew
+  gradlew.bat
+  proof/MANIFEST-3.3.1.sha256
+  proof/MANIFEST-3.3.1.sha256.ots
+  proof/MANIFEST-3.3.2.sha256
+  proof/MANIFEST-3.3.2.sha256.ots
+  settings.gradle.kts
+  tools/audit_project.py
+  tools/export_sources.py
+  tools/issue_activation_code.py
+  tools/run_device_tests.sh
+  tools/verify_bank_regex.py
+  tools/verify_bank_sql.py
+  tools/verify_navigation_recovery.py
+  tools/verify_upgrade_sql.py
+  tools/verify_voice_regex.py
+  verification/RELEASE_3.3.3.md
+  verification/STATUS.md
+  verification/android-build-3.1.log
+  verification/android-build-attempt.log
+  verification/bank-regex-jvm.json
+  verification/bank-sql.json
+  verification/cat-skin-assets.json
+  verification/device-reports/android-26/app/com.semmyx.ledger.BankBackgroundImportTest.html
+  verification/device-reports/android-26/app/com.semmyx.ledger.BankScreenLayoutTest.html
+  verification/device-reports/android-26/app/com.semmyx.ledger.CompactLayoutTest.html
+  verification/device-reports/android-26/app/com.semmyx.ledger.ComposeScreensTest.html
+  verification/device-reports/android-26/app/com.semmyx.ledger.html
+  verification/device-reports/android-26/app/css/base-style.css
+  verification/device-reports/android-26/app/css/style.css
+  verification/device-reports/android-26/app/index.html
+  verification/device-reports/android-26/app/js/report.js
+  verification/device-reports/android-26/data/com.semmyx.ledger.data.KeystoreSecurityTest.html
+  verification/device-reports/android-26/data/com.semmyx.ledger.data.RoomRepositoryTest.html
+  verification/device-reports/android-26/data/com.semmyx.ledger.data.html
+  verification/device-reports/android-26/data/css/base-style.css
+  verification/device-reports/android-26/data/css/style.css
+  verification/device-reports/android-26/data/index.html
+  verification/device-reports/android-26/data/js/report.js
+  verification/device-reports/android-36/app/com.semmyx.ledger.BankBackgroundImportTest.html
+  verification/device-reports/android-36/app/com.semmyx.ledger.BankScreenLayoutTest.html
+  verification/device-reports/android-36/app/com.semmyx.ledger.CompactLayoutTest.html
+  verification/device-reports/android-36/app/com.semmyx.ledger.ComposeScreensTest.html
+  verification/device-reports/android-36/app/com.semmyx.ledger.html
+  verification/device-reports/android-36/app/css/base-style.css
+  verification/device-reports/android-36/app/css/style.css
+  verification/device-reports/android-36/app/index.html
+  verification/device-reports/android-36/app/js/report.js
+  verification/device-reports/android-36/data/com.semmyx.ledger.data.KeystoreSecurityTest.html
+  verification/device-reports/android-36/data/com.semmyx.ledger.data.RoomRepositoryTest.html
+  verification/device-reports/android-36/data/com.semmyx.ledger.data.html
+  verification/device-reports/android-36/data/css/base-style.css
+  verification/device-reports/android-36/data/css/style.css
+  verification/device-reports/android-36/data/index.html
+  verification/device-reports/android-36/data/js/report.js
+  verification/gradle-attempt.txt
+  verification/navigation-recovery.json
+  verification/release-3.3.3.json
+  verification/screenshots/README.md
+  verification/screenshots/android-26/bank-320dp-font140-uk.png
+  verification/screenshots/android-26/category-320dp-font140-uk.png
+  verification/screenshots/android-26/compact-288dp-uk.png
+  verification/screenshots/android-26/compact-320dp-font170-uk.png
+  verification/screenshots/android-26/compact-360dp-uk.png
+  verification/screenshots/android-36/bank-320dp-font140-uk.png
+  verification/screenshots/android-36/category-320dp-font140-uk.png
+  verification/screenshots/android-36/compact-288dp-uk.png
+  verification/screenshots/android-36/compact-320dp-font170-uk.png
+  verification/screenshots/android-36/compact-360dp-uk.png
+  verification/source-audit.json
+  verification/upgrade-sql.json
+  verification/voice-regex-jvm.json
