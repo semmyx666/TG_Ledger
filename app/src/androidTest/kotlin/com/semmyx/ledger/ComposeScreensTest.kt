@@ -66,4 +66,13 @@ class ComposeScreensTest {
         compose.onNodeWithTag("contactTelegram").performClick()
         compose.runOnIdle { assertTrue(contacted) }
     }
+    @Test fun helpShowsMajorReleaseAndExplicitlyKeepsBankApi() {
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            com.semmyx.ledger.support.HelpScreen({}, {})
+        } } }
+        compose.onNodeWithTag("releaseHighlights").assertTextEquals("Що нового у " + BuildConfig.VERSION_NAME)
+        compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API monobank збережено",substring=true)
+        compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API ПриватБанку",substring=true)
+    }
+
 }

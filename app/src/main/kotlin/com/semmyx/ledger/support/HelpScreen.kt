@@ -8,6 +8,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.semmyx.ledger.BuildConfig
 import com.semmyx.ledger.R
@@ -24,6 +25,11 @@ fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
                 Text(stringResource(R.string.help_heading), style = MaterialTheme.typography.headlineMedium)
                 Text(stringResource(R.string.help_intro))
                 Button(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.contact_telegram)) }
+            } }
+            item { ContentCard {
+                Text(stringResource(R.string.major_release_title, BuildConfig.VERSION_NAME), style = MaterialTheme.typography.titleLarge,
+                    modifier = Modifier.testTag("releaseHighlights"))
+                Text(stringResource(R.string.major_release_body), modifier = Modifier.testTag("releaseHighlightsBody"))
             } }
             item { ContentCard {
                 Text(stringResource(R.string.help_entries_title), style = MaterialTheme.typography.titleLarge)

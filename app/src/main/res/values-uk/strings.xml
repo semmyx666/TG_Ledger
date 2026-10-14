@@ -395,4 +395,6 @@
     <string name="import_confirm_permission">Дозволити сповіщення про збережені платежі</string>
     <string name="import_confirm_enabled">Сповіщення про збережені платежі ввімкнено</string>
     <string name="assistant_write_short">Написати</string>
+    <string name="major_release_title">Що нового у %1$s</string>
+    <string name="major_release_body">• API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
 </resources>

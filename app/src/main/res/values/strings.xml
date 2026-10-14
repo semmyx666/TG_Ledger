@@ -395,4 +395,6 @@
     <string name="import_confirm_permission">Allow saved-payment notifications</string>
     <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
     <string name="assistant_write_short">Write</string>
+    <string name="major_release_title">What is new in %1$s</string>
+    <string name="major_release_body">• monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
 </resources>
