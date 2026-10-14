@@ -66,6 +66,10 @@ class CompactLayoutTest {
     }
     @Test fun normalPhoneUsesThreeCompactMetrics() {
         content(360.dp, 1f)
+        val positions = listOf("totalBalance","totalIncome","totalExpenses")
+            .map { compose.onNodeWithTag(it).fetchSemanticsNode().boundsInRoot.left }
+        assertTrue("Expected three horizontal metrics, viewport may be too narrow: $positions",
+            positions[0] < positions[1] && positions[1] < positions[2])
         screenshot("layout-precheck-${System.currentTimeMillis()}")
         listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
         screenshot("compact-360dp-uk")
