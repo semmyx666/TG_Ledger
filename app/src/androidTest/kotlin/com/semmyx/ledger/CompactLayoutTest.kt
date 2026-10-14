@@ -45,12 +45,13 @@ class CompactLayoutTest {
         val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
         compose.onNodeWithTag(tag, useUnmergedTree = true).performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
         assertTrue("Missing text layout: $tag", layouts.isNotEmpty())
-        assertFalse("Text overflow: $tag", layouts.any { it.hasVisualOverflow })
+        assertFalse("Text overflow: $tag: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}", layouts.any { it.hasVisualOverflow })
         if (tag == "restorePurchases") assertTrue("Restore label squeezed into letters", layouts.all { it.lineCount <= 2 })
     }
     @Test fun smallPhoneHasOneBalanceCardAndReadableRestore() {
         content(288.dp, 1f)
         compose.onAllNodesWithTag("balanceSummary").assertCountEquals(1)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
         listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
         // Button merges its text semantics; use the descendant Text to inspect actual line breaks.
         compose.onNodeWithText("Відновити покупки",useUnmergedTree=true).assertIsDisplayed()
@@ -58,6 +59,7 @@ class CompactLayoutTest {
     }
     @Test fun enlargedSystemFontRemainsWithinPhoneBounds() {
         content(320.dp, 1.7f)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
         listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
         val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
         compose.onNodeWithText("Відновити покупки",useUnmergedTree=true)
@@ -68,6 +70,7 @@ class CompactLayoutTest {
     }
     @Test fun normalPhoneUsesThreeCompactMetrics() {
         content(360.dp, 1f)
+        screenshot("layout-precheck-${System.currentTimeMillis()}")
         listOf("totalBalance","totalIncome","totalExpenses").forEach(::checkTextFits)
         screenshot("compact-360dp-uk")
     }

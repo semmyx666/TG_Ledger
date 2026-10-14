@@ -6,6 +6,8 @@ import android.content.pm.PackageManager
 import androidx.activity.result.ActivityResultLauncher
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.BasicText
+import androidx.compose.foundation.text.TextAutoSize
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -24,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -369,8 +372,10 @@ fun CompactBalanceSummary(state: DashboardState) {
             @Composable fun Metric(label: Int, amount: Long, color: Color, tag: String, modifier: Modifier = Modifier) {
                 Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(formatMoney(amount, state.preferences.currency, state.preferences.language),
-                        style = MaterialTheme.typography.titleMedium, color = color, modifier = Modifier.testTag(tag))
+                    BasicText(formatMoney(amount, state.preferences.currency, state.preferences.language),
+                        style = MaterialTheme.typography.titleMedium.copy(color = color),
+                        maxLines = 1, autoSize = TextAutoSize.StepBased(minFontSize = 12.sp, maxFontSize = 16.sp, stepSize = 1.sp),
+                        modifier = Modifier.fillMaxWidth().testTag(tag))
                 }
             }
             if (compact) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {

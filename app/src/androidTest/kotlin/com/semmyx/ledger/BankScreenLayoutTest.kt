@@ -1,6 +1,8 @@
 package com.semmyx.ledger
 
 import androidx.compose.foundation.layout.*
+import androidx.activity.compose.LocalActivityResultRegistryOwner
+import androidx.activity.compose.LocalOnBackPressedDispatcherOwner
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.asAndroidBitmap
@@ -37,14 +39,18 @@ class BankScreenLayoutTest {
         val model = BankViewModel(app.container.bankImport,app.container.preferences,access,app.container.clock)
         owner.put("bank",model)
         var requests = 0
-        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+        compose.setContent {
+            val registryOwner = LocalActivityResultRegistryOwner.current
+            val backOwner = LocalOnBackPressedDispatcherOwner.current
+            CompositionLocalProvider(LocalActivityResultRegistryOwner provides registryOwner, LocalOnBackPressedDispatcherOwner provides backOwner) {
+            LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
             val density = LocalDensity.current
             CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
                 Box(Modifier.width(320.dp).fillMaxHeight()) {
                     BankScreen(model,app.container.bankImport, {}, {}, {}, { requests++ })
                 }
             }
-        } } }
+        } } } }
         compose.onNodeWithTag("bankPeriod:WEEK").performClick()
         compose.runOnIdle { assertEquals(1,requests); assertEquals("DAY",model.state.value.filter.period) }
         compose.onNodeWithTag("bankPeriod:MONTH").performClick()

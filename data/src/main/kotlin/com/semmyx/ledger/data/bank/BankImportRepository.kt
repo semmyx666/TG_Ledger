@@ -220,7 +220,7 @@ class BankImportRepository(
         } catch (e: java.io.IOException) {
             monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
         } catch (e: Exception) {
-            if (e is CancellationException) throw e
+            if (e is CancellationException) { monoState.update { it.copy(syncing = false) }; throw e }
             monoState.update { it.copy(syncing = false, error = "NETWORK") }; 0
         } finally { syncLock.unlock() }
     }
@@ -247,6 +247,7 @@ class BankImportRepository(
         parsed: ParsedBankOperation, eventKey: String, at: Long, origin: String,
         manual: Boolean = false, authoritative: Boolean = false,
     ): String {
+        if (!enabled && !manual) { note("DISABLED"); return "DISABLED" }
         var result = "QUEUED"
         db.withTransaction {
             // --- Tier 1: same-bank re-delivery guard ---

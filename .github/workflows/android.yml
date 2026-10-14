@@ -65,15 +65,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: |
-            chmod +x gradlew
-            ./gradlew :bank-fixture:assembleDebug
-            adb install -r bank-fixture/build/outputs/apk/debug/bank-fixture-debug.apk
-            adb shell pm grant com.semmyx.ledger.bankfixture android.permission.POST_NOTIFICATIONS || true
-            ./gradlew :data:connectedPlayDebugAndroidTest :app:connectedPlayDebugAndroidTest --stacktrace; RESULT=$?
-            mkdir -p verification/device-screenshots
-            adb pull /sdcard/Android/data/com.semmyx.ledger.debug/files/screenshots/. verification/device-screenshots/ || true
-            exit $RESULT
+          script: bash tools/run_device_tests.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
