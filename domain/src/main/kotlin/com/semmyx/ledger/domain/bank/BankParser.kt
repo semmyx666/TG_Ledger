@@ -32,6 +32,7 @@ object Banks {
         Bank("wise", "Wise", setOf("com.transferwise.android"), setOf("wise", "transferwise"), setOf("transferwise")),
         Bank("n26", "N26", setOf("de.number26.android"), setOf("n26"), setOf("number26")),
         // Wallet apps announce the same tap as the issuing bank; the pair is collapsed by cross-source deduplication.
+        Bank("other", "Інший банк / Other bank", emptySet(), emptySet()),
         Bank(WALLET_ID, "Google Wallet", setOf("com.google.android.apps.walletnfcrel", "com.samsung.android.spay"), emptySet(), setOf("walletnfcrel")),
     )
     fun byPackage(value: String): Bank? =
@@ -69,7 +70,7 @@ object BankParser {
         RegexOption.IGNORE_CASE)
     private val refund = Regex("(?:повернен|возврат|refund|reversal|скасуванн|відміна оплати)", RegexOption.IGNORE_CASE)
     private val expense = Regex(
-        "(?:списан|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
+        "(?:списан|потрат|потрач|сплачен|розрахува|знят[оті]|зняття|снят|витрат|видатк|оплат|покупк|купівл|куплен|платіж|платеж|purchase|paid|payment|spent|debit|withdraw|charged|відправлен|sent|spysan|spisan|snyat|znyat|oplat|splat|pokupk|kupivl|platizh)",
         RegexOption.IGNORE_CASE)
     private val income = Regex(
         "(?:зарахован|зарахув|поповнен|пополнен|надходжен|зачислен|отримано|получен|received|credited|top[ -]?up|deposit|salary|зарплат|zarahov|zarakhov|zarahuv|zarakhuv|zachisl|popovnen|popolnen|nadkhodzh|nadhodzh)",

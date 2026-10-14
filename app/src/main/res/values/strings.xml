@@ -174,7 +174,7 @@
     <string name="help_premium_title">Purchases &amp; offline access</string>
     <string name="help_premium_body">TG Plus on Google Play is a non-consumable lifetime purchase, not an auto-renewing subscription. Pending payments never unlock access. Restore with the same Google Play account. Signed Play purchases require periodic ownership verification and allow up to 7 days offline. Developer codes may be lifetime or time-limited. A local trial is available once for 7 OR 14 days, without payment details or charges.</string>
     <string name="app_version">Version %1$s</string>
-    <string name="premium_feature_trends">30-day and all-time cash flow with category details</string>
+    <string name="premium_feature_trends">Extended trends and bank statistics: 7 days, 30 days and all time</string>
     <string name="premium_feature_mascot">Your own assistant character on the dashboard</string>
     <string name="premium_feature_support">Priority attention from the developer on Telegram</string>
     <string name="premium_source_play">Active via Google Play</string>
@@ -295,7 +295,7 @@
     <string name="color_error">Errors and alerts</string>
     <string name="bank_dashboard">Banks</string>
     <string name="bank_import_title">Offline bank import</string>
-    <string name="bank_consent">Only enabled bank apps and bank SMS senders are examined. Import runs in the background, even when the app is closed: it records new payments, and picks up ones that arrived while the app was off. Just grant access once.</string>
+    <string name="bank_consent">Bank push notifications are parsed on this phone. Enable notification access once. Unambiguous payments are saved automatically; uncertain messages wait for review. SMS is optional, not required for push.</string>
     <string name="bank_enabled">Enable bank import</string>
     <string name="bank_auto">Auto-import confident operations</string>
     <string name="bank_access_yes">Notification access granted</string>
@@ -309,7 +309,7 @@
     <string name="bank_privacy_body">Bank parsing happens on this device. Raw message texts, OTPs and full card numbers are not saved or sent to servers. Room stores extracted operations and review records in private app storage; system backup is disabled. Only the final four card digits are retained. Turning import off stops new ingestion; revoke notification/SMS access in Android settings to remove system access. CSV export is explicit and saves to the location you choose, which may be a cloud provider. PIN is an app lock, not database encryption. Optional exchange-rate, Play and system speech services are separate and may use the network. Imported statements are not bank-verified and must be reviewed.</string>
     <string name="bank_day">Today</string>
     <string name="bank_week">Last 7 days</string>
-    <string name="bank_month">This month</string>
+    <string name="bank_month">Last 30 days</string>
     <string name="bank_cash">Cash</string>
     <string name="bank_card">Bank card</string>
     <string name="bank_unknown">Unspecified source (older entries)</string>
@@ -323,14 +323,14 @@
     <string name="bank_ignore">Ignore / own-account transfer</string>
     <string name="bank_recent">Recent operations · tap to edit</string>
     <string name="bank_limit_recent">This view shows up to 100 recent operations. Totals include every matching entry; the main ledger has search and paging.</string>
-    <string name="bank_budget">Monthly expense limit</string>
-    <string name="bank_budget_progress">Monthly spending: %1$s / %2$s</string>
+    <string name="bank_budget">30-day spending limit</string>
+    <string name="bank_budget_progress">Spending over 30 days: %1$s / %2$s</string>
     <string name="bank_export">Export all transactions to CSV</string>
     <string name="bank_clear_history">Clear recognition history</string>
     <string name="bank_clear_warning">Pending reviews and duplicate fingerprints will be deleted. Saved transactions are kept. Old notifications could be recognized again after clearing.</string>
     <string name="bank_app_permissions">Android app permissions</string>
     <string name="bank_battery">Allow background work (battery)</string>
-    <string name="bank_budget_disable">Disable monthly limit</string>
+    <string name="bank_budget_disable">Disable spending limit</string>
     <string name="history_search">Search operations</string>
     <string name="import_diagnostics">Import diagnostics</string>
     <string name="import_connected">Notification service is connected</string>
@@ -352,11 +352,11 @@
     <string name="import_auto_done">Operation saved automatically.</string>
     <string name="import_queued">Operation awaits confirmation below.</string>
     <string name="import_repeated">Repeated delivery ignored; no duplicate was saved.</string>
-    <string name="import_waiting">Waiting for a new bank notification. Past notification history is not scanned.</string>
+    <string name="import_waiting">Waiting for bank push. Reconnect scans notifications still in the shade.</string>
     <string name="import_mode_title">Import method</string>
-    <string name="import_mode_api">API key (monobank)</string>
+    <string name="import_mode_api">Bank API</string>
     <string name="import_mode_sms">SMS</string>
-    <string name="import_mode_notify">Notifications</string>
+    <string name="import_mode_notify">Bank push (recommended)</string>
     <string name="api_howto">1) Open api.monobank.ua and sign in with the monobank app. 2) Copy your personal token. 3) Paste it here. The app only reads your statement (read-only) and checks for new payments every ~15 minutes, even when closed. The token is stored encrypted on this phone.</string>
     <string name="api_open_site">Open api.monobank.ua</string>
     <string name="api_token_label">monobank API token</string>
@@ -381,4 +381,17 @@
     <string name="pay_source_required">Choose card or cash</string>
     <string name="voice_ask_source">Card or cash?</string>
     <string name="cat_locked_hint">The cat assistant is part of Premium. Tap to unlock (14-day trial is free).</string>
+    <string name="bank_setup">Import settings</string>
+    <string name="push_howto">Enable access to notifications, turn on auto-import and allow background activity. New bank push is read without an open screen. Reconnect also reads bank notifications still visible in the shade, including recent ones. Android does not expose dismissed notification history to this app. After Force stop, open TG Ledger again. Some phones require Allow restricted settings before notification access.</string>
+    <string name="privat_api_title">PrivatBank · Business / sole proprietor</string>
+    <string name="privat_api_howto">For Privat24 Business AutoClient accounts, not ordinary retail Privat24 cards. In Privat24 Business → Integration (AutoClient) → API, create a token restricted to balances and transactions. Only statements are requested. The token is encrypted on this phone. First sync imports 30 days; later syncs run approximately every 15 minutes.</string>
+    <string name="privat_api_site">PrivatBank API instructions</string>
+    <string name="privat_api_token">AutoClient token</string>
+    <string name="privat_api_connected">Privat24 Business connected</string>
+    <string name="privat_api_error">Could not read the statement. Check internet, AutoClient token and its read permissions. This token must belong to Privat24 Business.</string>
+    <string name="other_api_note">Other banks: there is no universal API key. Open Banking needs a bank-supported consent flow and an authorised provider. For retail Privat24 and other banks, use push. Add the bank app package under App mapping → Other bank if it is missing. Never enter your bank password, PIN or CVV here.</string>
+    <string name="help_banks_title">Banks and automatic import</string>
+    <string name="help_banks_body">Banks shows card, cash and bank spending. Free access: today. TG Plus or an active trial: 7 days, 30 days and all time. A period changes statistics, not whether operations are captured.\n\nRecommended: Bank push → grant notification access → keep auto-import enabled. Recognition runs locally, without SMS or an API token, and writes clear payments into the ledger while its screen is closed. It supports plain, expanded, inbox and messaging notifications. OTPs, declines and balance-only messages are not operations. Ambiguous messages, transfers and possible duplicates need review.\n\nReconnect / opening the app reads bank notifications still in the notification shade. Dismissed messages cannot be recovered through notification access. Force-stop disables background work until you open the app again. Battery restrictions can delay or stop it.\n\nAPI: monobank personal token and Privat24 Business AutoClient token are supported. PrivatBank AutoClient is for business/sole proprietor accounts, not ordinary retail cards. API sync is periodic, not instant. Other banks need a bank-specific authorised Open Banking integration; use push where available. A missing bank app can be mapped under Other bank.\n\nOptional confirmations need Android notification permission. They do not affect saving. Import is not a certified bank statement: reconcile against your bank and check the review queue.</string>
+    <string name="import_confirm_permission">Allow saved-payment notifications</string>
+    <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
 </resources>

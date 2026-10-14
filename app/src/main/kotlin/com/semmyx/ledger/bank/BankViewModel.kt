@@ -8,12 +8,12 @@ import java.time.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
-data class BankFilter(val period: String = "MONTH", val source: String? = null, val bank: String? = null)
+data class BankFilter(val period: String = "DAY", val source: String? = null, val bank: String? = null)
 data class BankDashboardState(val preferences: UserPreferences = UserPreferences(), val filter: BankFilter = BankFilter(),
     val sources: List<BankSourceSpend> = emptyList(), val categories: List<BankCategorySpend> = emptyList(),
-    val entries: List<LedgerEntry> = emptyList(), val failed: Boolean = false)
+    val entries: List<LedgerEntry> = emptyList(), val premium: Boolean = false, val failed: Boolean = false)
 @OptIn(ExperimentalCoroutinesApi::class)
-class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, private val clock: Clock) : ViewModel() {
+class BankViewModel(private val repo: BankRepository, preferences: PreferencesRepository, premium: PremiumRepository, private val clock: Clock) : ViewModel() {
     private val filter = MutableStateFlow(BankFilter())
     private val today = MutableStateFlow(LocalDate.now(clock))
     init { viewModelScope.launch {
@@ -29,17 +29,20 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
     val reviews = repo.reviews().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     val enabled = MutableStateFlow(repo.enabled)
     val mode = MutableStateFlow(repo.importMode)
+    val privat = repo.privatStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
     val mono = repo.monobankStatus.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), MonobankStatus())
     fun mode(value: String) { repo.importMode = value; mode.value = value }
     val auto = MutableStateFlow(repo.autoImport)
     val error = MutableStateFlow(false)
     val revision = MutableStateFlow(0)
-    val state = combine(preferences.preferences, filter, today) { prefs, selected, date -> Triple(prefs, selected, date) }.flatMapLatest { (prefs, selected, through) ->
-        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.withDayOfMonth(1) }
+    val state = combine(preferences.preferences, premium.state, filter, today) { prefs, access, selected, date ->
+        Request(prefs, access.entitled, selected.copy(period = BankPeriodAccess.effective(selected.period, access.entitled)), date)
+    }.flatMapLatest { (prefs, entitled, selected, through) ->
+        val from = when (selected.period) { "DAY" -> through; "WEEK" -> through.minusDays(6); "ALL" -> LocalDate.of(2000, 1, 1); else -> through.minusDays(29) }
         combine(repo.sources(prefs.currency, from, through), repo.categorySpending(prefs.currency, from, through, selected.source, selected.bank),
-            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries) }
+            repo.recent(prefs.currency, from, through, selected.source, selected.bank)) { sources, cats, entries -> BankDashboardState(prefs, selected, sources, cats, entries, premium = entitled) }
     }.catch { emit(BankDashboardState(failed = true)) }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), BankDashboardState())
-    fun period(value: String) { filter.update { it.copy(period = value) } }
+    fun period(value: String) { if (value in BankPeriodAccess.periods) filter.update { it.copy(period = value) } }
     fun source(value: String?, bank: String? = null) { filter.update { it.copy(source = value, bank = bank) } }
     fun enabled(value: Boolean) { repo.enabled = value; enabled.value = value }
     fun auto(value: Boolean) { repo.autoImport = value; auto.value = value }
@@ -53,6 +56,7 @@ class BankViewModel(private val repo: BankRepository, preferences: PreferencesRe
         val parsed = Money.parseMinor(amount) ?: kotlin.error("Invalid amount")
         repo.setBudget(currency, parsed); revision.value++
     }
+    private data class Request(val prefs: UserPreferences, val entitled: Boolean, val selected: BankFilter, val through: LocalDate)
     private fun task(block: suspend () -> Unit) { viewModelScope.launch { try { block(); error.value = false }
         catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { error.value = true } } }
 }

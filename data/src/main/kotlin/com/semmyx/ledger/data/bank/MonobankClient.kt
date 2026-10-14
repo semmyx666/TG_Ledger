@@ -13,7 +13,8 @@ import okhttp3.Request
  * sent only to this host in the `X-Token` header. Blocking calls: run on a background dispatcher.
  */
 class MonobankClient(
-    private val http: OkHttpClient = OkHttpClient(),
+    private val http: OkHttpClient = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false)
+        .callTimeout(45, java.util.concurrent.TimeUnit.SECONDS).build(),
     private val baseUrl: String = "https://api.monobank.ua",
 ) {
     data class Account(val id: String, val currency: LedgerCurrency, val type: String, val cardLast4: String?)

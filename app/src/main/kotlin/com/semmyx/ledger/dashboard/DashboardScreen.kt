@@ -74,7 +74,7 @@ fun DashboardRoute(model: DashboardViewModel, host: FragmentActivity, onNavigate
         } })
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: FragmentActivity, onNavigate: (Int) -> Unit,
     onAdd: () -> Unit, onEdit: (String) -> Unit, onDelete: (String) -> Unit, onSearch: (String) -> Unit,
@@ -264,7 +264,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
             else if (state.failed) EmptyState(stringResource(R.string.load_error_title), stringResource(R.string.storage_error), stringResource(R.string.retry), onRetry)
             else LazyColumn(Modifier.widthIn(max = 720.dp).fillMaxSize().testTag("ledgerList"),
                 contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 100.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 item(key = "greeting", contentType = "heading") {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(if (state.preferences.displayName.isBlank()) stringResource(R.string.dashboard_heading)
@@ -272,6 +272,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                         Text(stringResource(R.string.dashboard_subtitle), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
+                item(key = "balance", contentType = "summary") { CompactBalanceSummary(state) }
                 // The cat is always on the home screen; without Premium it is shown locked and opens the Premium card.
                 if (!state.premium || state.preferences.premiumAssistantEnabled) {
                     item(key = "assistant", contentType = "assistant") {
@@ -281,8 +282,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                             onText = { processInput(it) }, balanceMinor = state.snapshot.balance.netMinor, locked = !state.premium)
                     }
                 }
-                item(key = "balance", contentType = "summary") { BalanceCard(state) }
-                item(key = "totals", contentType = "summary") { BalanceBreakdown(state) }
+
                 item(key = "chart", contentType = "chart") {
                     ActivityChart(state.snapshot.activity, state.preferences.currency, state.preferences.language, state.premium,
                         state.days, onDays, onPremium = { onNavigate(1) })
@@ -298,7 +298,7 @@ fun DashboardScreen(state: DashboardState, snackbar: SnackbarHostState, host: Fr
                             singleLine = true, label = { Text(stringResource(R.string.search_entries)) },
                             leadingIcon = { Icon(Icons.Default.Search, null) },
                             trailingIcon = { if (state.query.isNotEmpty()) IconButton(onClick = { onSearch("") }) { Icon(Icons.Default.Close, stringResource(R.string.clear_search)) } })
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             FilterChip(selected = state.type == null, onClick = { onFilter(null) }, label = { Text(stringResource(R.string.all)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.secondary, selectedLabelColor = MaterialTheme.colorScheme.secondary, selectedContainerColor = MaterialTheme.colorScheme.secondary.copy(alpha = .18f)), selected = state.type == EntryType.INCOME, onClick = { onFilter(EntryType.INCOME) }, label = { Text(stringResource(R.string.income)) })
                             FilterChip(colors = FilterChipDefaults.filterChipColors(labelColor = MaterialTheme.colorScheme.tertiary, selectedLabelColor = MaterialTheme.colorScheme.tertiary, selectedContainerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = .18f)), selected = state.type == EntryType.EXPENSE, onClick = { onFilter(EntryType.EXPENSE) }, label = { Text(stringResource(R.string.expenses)) })
@@ -356,70 +356,33 @@ private fun smallTalkReply(context: android.content.Context, heard: String): Str
         null -> null
     }
 
+/** One compact card instead of a tall balance card and two separate totals. */
 @Composable
-private fun BalanceCard(state: DashboardState) {
-    Card(
-        modifier  = Modifier.fillMaxWidth(),
-        shape     = MaterialTheme.shapes.extraLarge,
-        colors    = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primary,
-            contentColor   = MaterialTheme.colorScheme.onPrimary,
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(28.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment     = Alignment.CenterVertically,
-            ) {
-                Text(
-                    stringResource(R.string.total_balance),
-                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .75f),
-                    style = MaterialTheme.typography.labelLarge,
-                )
-                Surface(
-                    shape = MaterialTheme.shapes.medium,
-                    color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .15f),
-                ) {
-                    Icon(Icons.Default.AccountBalanceWallet, null, Modifier.padding(8.dp).size(20.dp),
-                        tint = MaterialTheme.colorScheme.onPrimary)
+fun CompactBalanceSummary(state: DashboardState) {
+    ContentCard(Modifier.testTag("balanceSummary")) {
+        val balance = state.snapshot.balance
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val compact = maxWidth >= 300.dp && LocalDensity.current.fontScale <= 1.3f &&
+                listOf(balance.netMinor, balance.incomeMinor, balance.expenseMinor).all {
+                    formatMoney(it, state.preferences.currency, state.preferences.language).length <= 14
+                }
+            @Composable fun Metric(label: Int, amount: Long, color: Color, tag: String, modifier: Modifier = Modifier) {
+                Column(modifier, verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(stringResource(label), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(formatMoney(amount, state.preferences.currency, state.preferences.language),
+                        style = MaterialTheme.typography.titleMedium, color = color, modifier = Modifier.testTag(tag))
                 }
             }
-            Text(
-                formatMoney(state.snapshot.balance.netMinor, state.preferences.currency, state.preferences.language),
-                style    = MaterialTheme.typography.headlineLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.testTag("totalBalance"),
-            )
-            Text(
-                stringResource(R.string.currency_scope, state.preferences.currency.name),
-                color = MaterialTheme.colorScheme.onPrimary.copy(alpha = .65f),
-                style = MaterialTheme.typography.bodySmall,
-            )
-        }
-    }
-}
-
-
-@Composable
-private fun BalanceBreakdown(state: DashboardState) {
-    val language = state.preferences.language
-    val currency = state.preferences.currency
-    @Composable fun Metric(income: Boolean, modifier: Modifier) {
-        ContentCard(modifier) {
-            Text(stringResource(if (income) R.string.income else R.string.expenses), style = MaterialTheme.typography.bodyMedium,
-                color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-            Text(formatMoney(if (income) state.snapshot.balance.incomeMinor else state.snapshot.balance.expenseMinor, currency, language),
-                style = MaterialTheme.typography.titleMedium, color = if (income) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.tertiary)
-        }
-    }
-    BoxWithConstraints {
-        if (maxWidth < 340.dp || LocalDensity.current.fontScale > 1.3f) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) { Metric(true, Modifier); Metric(false, Modifier) }
-        } else Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Metric(true, Modifier.weight(1f)); Metric(false, Modifier.weight(1f))
+            if (compact) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance", Modifier.weight(1f))
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome", Modifier.weight(1f))
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses", Modifier.weight(1f))
+            } else Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Metric(R.string.total_balance, balance.netMinor, MaterialTheme.colorScheme.primary, "totalBalance")
+                // Each metric gets the entire line at large system font sizes.
+                Metric(R.string.income, balance.incomeMinor, MaterialTheme.colorScheme.secondary, "totalIncome")
+                Metric(R.string.expenses, balance.expenseMinor, MaterialTheme.colorScheme.tertiary, "totalExpenses")
+            }
         }
     }
 }

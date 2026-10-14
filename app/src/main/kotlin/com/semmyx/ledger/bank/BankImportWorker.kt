@@ -21,7 +21,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
             val repository = (applicationContext as LedgerApplication).container.bankImport
             if (!repository.enabled) return Result.success()
             when (repository.importMode) {
-                "API" -> repository.syncMonobank()
+                "API" -> { repository.syncMonobank(); repository.syncPrivat() }
                 "SMS" -> BankSmsCatchUp.run(applicationContext, repository)
                 else -> if (applicationContext.packageName in NotificationManagerCompat.getEnabledListenerPackages(applicationContext)) {
                     ensureListenerBound(applicationContext, repository)
@@ -41,6 +41,7 @@ class BankImportWorker(context: Context, params: WorkerParameters) : CoroutineWo
          * Android bind it again (and it then replays the notifications still in the shade).
          */
         suspend fun ensureListenerBound(context: Context, repository: com.semmyx.ledger.data.bank.BankImportRepository) {
+            if (repository.diagnostics.value.connected && BankNotificationListener.replayIfConnected()) return
             val component = ComponentName(context, BankNotificationListener::class.java)
             runCatching { NotificationListenerService.requestRebind(component) }
             kotlinx.coroutines.delay(3_000)

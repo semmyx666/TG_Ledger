@@ -184,7 +184,7 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                 state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION }?.let {
                     Text(stringResource(it.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
-                TextButton(onClick = model::restorePurchases, enabled = !state.premium.busy) { Text(stringResource(R.string.restore_purchases)) }
+                RestorePurchasesAction(enabled = !state.premium.busy, onClick = model::restorePurchases)
             } }
             if (state.premium.developerPurchaseEnabled && (!state.premium.entitled || state.premium.expiresAtMillis != null)) item(key = "developerPurchase") { ContentCard {
                 Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)

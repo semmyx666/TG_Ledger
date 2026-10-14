@@ -175,10 +175,10 @@ private fun UnlockedGraph(host: FragmentActivity, container: AppContainer, appSt
         }
         composable("banks") {
             val bankModel: BankViewModel = viewModel(factory = LedgerViewModelFactory(BankViewModel::class.java) {
-                BankViewModel(container.bankImport, container.preferences, container.clock)
+                BankViewModel(container.bankImport, container.preferences, container.premium, container.clock)
             })
             BankScreen(bankModel, container.bankImport, onBack = { onNavigate(0) }, onAdd = { nav.navigate("entry/new") },
-                onEdit = { nav.navigate("entry/$it") })
+                onEdit = { nav.navigate("entry/$it") }, onPremium = { onNavigate(1) })
         }
         composable("entry/{id}", arguments = listOf(navArgument("id") { type = NavType.StringType })) { entry ->
             val id = entry.arguments?.getString("id")?.takeUnless { it == "new" }

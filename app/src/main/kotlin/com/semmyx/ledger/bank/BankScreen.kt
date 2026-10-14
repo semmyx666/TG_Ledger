@@ -22,6 +22,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
@@ -44,7 +45,7 @@ import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit) {
+fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.BankImportRepository, onBack: () -> Unit, onAdd: () -> Unit, onEdit: (String) -> Unit, onPremium: () -> Unit) {
     val state by model.state.collectAsStateWithLifecycle()
     val diagnostics by model.diagnostics.collectAsStateWithLifecycle()
     val reviews by model.reviews.collectAsStateWithLifecycle()
@@ -55,10 +56,12 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     val revision by model.revision.collectAsStateWithLifecycle()
     val mode by model.mode.collectAsStateWithLifecycle()
     val mono by model.mono.collectAsStateWithLifecycle()
+    val privat by model.privat.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val palette = LocalAppearance.current
     var notificationAccess by remember { mutableStateOf(false) }
+    var confirmationAccess by remember { mutableStateOf(false) }
     var smsAccess by remember { mutableStateOf(false) }
     var exportFailed by remember { mutableStateOf(false) }
     var pasteDialog by remember { mutableStateOf(false) }
@@ -67,14 +70,18 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     var privacy by remember { mutableStateOf(false) }
     var clearDialog by remember { mutableStateOf(false) }
     var token by remember { mutableStateOf("") }
+    var privatToken by remember { mutableStateOf("") }
+    var connectingPrivat by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
     var smsScan by remember { mutableStateOf<BankSmsCatchUp.Result?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    var setupExpanded by remember { mutableStateOf(false) }
     
     fun openSettings(action: String, data: Uri? = null) {
         try { context.startActivity(Intent(action, data).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         catch (_: Exception) { exportFailed = true }
     }
+    val confirmationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { confirmationAccess = it }
     val smsPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         smsAccess = result[Manifest.permission.RECEIVE_SMS] == true
         if (smsAccess) BankImportWorker.schedule(context)
@@ -98,7 +105,9 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     }
     LifecycleResumeEffect(Unit) {
         notificationAccess = context.packageName in NotificationManagerCompat.getEnabledListenerPackages(context)
+        confirmationAccess = android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         smsAccess = ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
+        if (repository.importMode == "NOTIFY") BankImportWorker.runNow(context)
         onPauseOrDispose { }
     }
     val currency = state.preferences.currency
@@ -109,7 +118,16 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.bank_dashboard)) }, navigationIcon = {
         IconButton(onClick = onBack) { Icon(Icons.Default.Close, stringResource(R.string.close)) }
     }, actions = { IconButton(onClick = onAdd) { Icon(Icons.Default.Add, stringResource(R.string.add_entry)) } }) }) { padding ->
-        LazyColumn(Modifier.fillMaxSize().padding(padding), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        LazyColumn(Modifier.fillMaxSize().padding(padding).testTag("bankList"), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            item {
+                OutlinedButton(onClick = { setupExpanded = !setupExpanded }, modifier = Modifier.fillMaxWidth().testTag("bankSetup")) {
+                    Icon(if (setupExpanded) Icons.Default.ExpandLess else Icons.Default.Settings, null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.bank_setup))
+                }
+            }
+            if (setupExpanded) {
             item { ContentCard {
                 Text(stringResource(R.string.bank_import_title), style = MaterialTheme.typography.titleMedium)
                 Text(stringResource(R.string.bank_consent), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -117,7 +135,7 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Row(verticalAlignment = Alignment.CenterVertically) { Text(stringResource(R.string.bank_auto), Modifier.weight(1f)); Switch(automatic, model::auto, enabled = enabled) }
                 Text(stringResource(R.string.import_mode_title), style = MaterialTheme.typography.titleSmall)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms, "NOTIFY" to R.string.import_mode_notify).forEach { (value, title) ->
+                    listOf("NOTIFY" to R.string.import_mode_notify, "API" to R.string.import_mode_api, "SMS" to R.string.import_mode_sms).forEach { (value, title) ->
                         FilterChip(selected = mode == value, onClick = { model.mode(value); BankImportWorker.runNow(context) }, label = { Text(stringResource(title)) })
                     }
                 }
@@ -143,7 +161,7 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                                 Instant.ofEpochMilli(mono.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))) + " · " +
                                 stringResource(R.string.api_imported_last, mono.lastImported), style = MaterialTheme.typography.bodySmall)
                             if (mono.syncing) Text(stringResource(R.string.api_syncing), style = MaterialTheme.typography.bodySmall)
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 OutlinedButton(enabled = !mono.syncing, onClick = { BankImportWorker.runNow(context) }) { Text(stringResource(R.string.api_sync_now)) }
                                 TextButton(onClick = { scope.launch { repository.disconnectMonobank() } }) { Text(stringResource(R.string.api_disconnect)) }
                             }
@@ -154,6 +172,30 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                                 "NO_ACCOUNTS" -> R.string.api_error_no_accounts; else -> R.string.api_error_network
                             }), color = MaterialTheme.colorScheme.error)
                         }
+                        HorizontalDivider()
+                        Text(stringResource(R.string.privat_api_title), style = MaterialTheme.typography.titleMedium)
+                        Text(stringResource(R.string.privat_api_howto), style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = { openSettings(Intent.ACTION_VIEW, Uri.parse("https://privatbank.ua/business/intehratsiya")) }) { Text(stringResource(R.string.privat_api_site)) }
+                        if (!privat.connected) {
+                            OutlinedTextField(privatToken, { privatToken = it.trim().take(2048) }, Modifier.fillMaxWidth(), singleLine = true,
+                                label = { Text(stringResource(R.string.privat_api_token)) },
+                                visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                            Button(enabled = privatToken.length >= 20 && !connectingPrivat, onClick = {
+                                connectingPrivat = true
+                                scope.launch {
+                                    try { if (repository.connectPrivat(privatToken)) { privatToken = ""; BankImportWorker.runNow(context) } }
+                                    finally { connectingPrivat = false }
+                                }
+                            }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(if (connectingPrivat) R.string.api_connecting else R.string.api_connect)) }
+                        } else {
+                            Text(stringResource(R.string.privat_api_connected))
+                            if (privat.lastSyncMillis > 0) Text(stringResource(R.string.api_last_sync,
+                                Instant.ofEpochMilli(privat.lastSyncMillis).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("dd.MM HH:mm"))), style = MaterialTheme.typography.bodySmall)
+                            OutlinedButton(enabled = !privat.syncing, onClick = { BankImportWorker.runNow(context) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_sync_now)) }
+                            TextButton(onClick = { scope.launch { repository.disconnectPrivat() } }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.api_disconnect)) }
+                        }
+                        privat.error?.let { Text(stringResource(R.string.privat_api_error), color = MaterialTheme.colorScheme.error) }
+                        Text(stringResource(R.string.other_api_note), style = MaterialTheme.typography.bodySmall)
                     }
                     "SMS" -> {
                         Text(stringResource(R.string.sms_howto), color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -170,12 +212,15 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                         Text(stringResource(R.string.sms_restricted_tip), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     else -> {
+                        Text(stringResource(R.string.push_howto), style = MaterialTheme.typography.bodySmall)
                         Text(stringResource(if (notificationAccess) R.string.bank_access_yes else R.string.bank_access_no))
                         OutlinedButton(onClick = { openSettings(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS) }) { Text(stringResource(R.string.bank_notification_permission)) }
                     }
                 }
                 TextButton(onClick = { openSettings(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:" + context.packageName)) }) { Text(stringResource(R.string.bank_app_permissions)) }
                 TextButton(onClick = { openSettings(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS) }) { Text(stringResource(R.string.bank_battery)) }
+                if (!confirmationAccess && android.os.Build.VERSION.SDK_INT >= 33) OutlinedButton(onClick = { confirmationPermission.launch(Manifest.permission.POST_NOTIFICATIONS) }, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.import_confirm_permission)) }
+                else Text(stringResource(R.string.import_confirm_enabled), style = MaterialTheme.typography.bodySmall)
                 TextButton(onClick = { privacy = true }) { Text(stringResource(R.string.bank_privacy)) }
             } }
             item { ContentCard {
@@ -195,10 +240,12 @@ fun BankScreen(model: BankViewModel, repository: com.semmyx.ledger.data.bank.Ban
                 Button(onClick = { pasteDialog = true }) { Text(stringResource(R.string.import_paste)) }
                 Text(stringResource(R.string.import_queue_note), color = MaterialTheme.colorScheme.onSurfaceVariant)
             } }
-            if (failed || exportFailed || state.failed) item { Text(stringResource(R.string.storage_error), color = MaterialTheme.colorScheme.error) }
+            }
             item { FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("DAY" to R.string.bank_day, "WEEK" to R.string.bank_week, "MONTH" to R.string.bank_month, "ALL" to R.string.all_time).forEach { (period, title) ->
-                    FilterChip(selected = state.filter.period == period, onClick = { model.period(period) }, label = { Text(stringResource(title)) })
+                    FilterChip(modifier = Modifier.testTag("bankPeriod:$period"), selected = state.filter.period == period, onClick = { if (period == "DAY" || state.premium) model.period(period) else onPremium() }, label = {
+                        Text(stringResource(title) + if (period != "DAY" && !state.premium) " · Plus" else "")
+                    })
                 }
             } }
             item { ContentCard {
@@ -368,7 +415,7 @@ private fun importReason(code: String): Int = when (code) {
     "GROUP_SUMMARY" -> R.string.import_group
     "UNRECOGNIZED" -> R.string.import_unrecognized
     "AUTO_IMPORTED" -> R.string.import_auto_done
-    "QUEUED" -> R.string.import_queued
+    "QUEUED", "REVIEW", "CROSS_DUPLICATE_REVIEW" -> R.string.import_queued
     "DUPLICATE_REVIEW" -> R.string.bank_duplicate
     "REDELIVERED" -> R.string.import_repeated
     "ERROR" -> R.string.storage_error

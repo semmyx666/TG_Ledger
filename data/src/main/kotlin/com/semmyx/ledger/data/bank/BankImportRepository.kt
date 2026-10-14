@@ -24,7 +24,7 @@ import kotlinx.coroutines.flow.update
 
 /**
  * Imports and acknowledgements are atomic with the existing ledger.
- * No HTTP, no raw text storage, no PAN storage.
+ * Push parsing is offline. API clients only read statements; no raw text or PAN storage.
  *
  * ## Cross-source deduplication
  *
@@ -47,6 +47,7 @@ class BankImportRepository(
     private val db: LedgerDatabase, context: Context,
     private val vault: com.semmyx.ledger.data.security.KeystoreVault? = null,
     private val monobank: MonobankClient = MonobankClient(),
+    private val privat: PrivatBankClient = PrivatBankClient(),
 ) : BankRepository {
 
     private val ctx = context.applicationContext
@@ -130,7 +131,7 @@ class BankImportRepository(
         set(value) { config.edit().putBoolean("auto", value).apply() }
 
     override var importMode: String
-        get() = config.getString("mode", "SMS") ?: "SMS"
+        get() = config.getString("mode", "NOTIFY") ?: "NOTIFY"
         set(value) { require(value in listOf("API", "SMS", "NOTIFY")); config.edit().putString("mode", value).apply() }
 
     // -------------------------------------------------------------------------
@@ -264,7 +265,7 @@ class BankImportRepository(
             // app and the issuing bank announcing the same tap. Otherwise they wait in the review queue.
             val walletInvolved = Banks.WALLET_ID == parsed.bankId || crossSourceDup && dao.walletTwin(
                 parsed.amountMinor, parsed.currency.name, parsed.type.name, parsed.happenedAtMillis) > 0
-            val silentDrop = !manual && autoImport && (sameBankDup || (crossSourceDup && walletInvolved))
+            val silentDrop = !manual && autoImport && crossSourceDup && walletInvolved
             val status = when {
                 silentDrop -> "DUPLICATE_IGNORED"
                 sameBankDup   -> "DUPLICATE_REVIEW"
@@ -300,14 +301,81 @@ class BankImportRepository(
 
             // Auto-import: only for confident single-source entries.
             // Cross-source duplicates are NEVER auto-imported — the user must review.
-            if (!manual && autoImport && parsed.confident && status == "REVIEW") {
+            if (!manual && autoImport && parsed.confident && !parsed.transfer && status == "REVIEW") {
                 acceptInside(item, parsed.type)
                 result = "AUTO_IMPORTED"
-                if (System.currentTimeMillis() - parsed.happenedAtMillis < 15 * 60_000L) postImportNotification(parsed)
+                
             }
         }
+        // Notify only AFTER commit. A denied notification permission must never undo the entry.
+        if (result == "AUTO_IMPORTED" && System.currentTimeMillis() - parsed.happenedAtMillis in 0 until 15 * 60_000L) postImportNotification(parsed)
         note(result)
         return result
+    }
+
+    private val privatState = MutableStateFlow(MonobankStatus(
+        connected = config.getBoolean("privat_connected", false),
+        lastSyncMillis = config.getLong("privat_last_sync", 0L)))
+    override val privatStatus = privatState.asStateFlow()
+    private val privatLock = kotlinx.coroutines.sync.Mutex()
+
+    override suspend fun connectPrivat(token: String): Boolean = withContext(Dispatchers.IO) {
+        val clean = token.trim()
+        if (clean.length !in 20..2048 || clean.any { it.code !in 33..126 }) {
+            privatState.update { it.copy(error = "BAD_TOKEN") }; return@withContext false
+        }
+        try {
+            val today = LocalDate.now(ZoneId.of("Europe/Kyiv"))
+            // Validate access before storing credentials. No payment endpoints are called.
+            privat.statement(clean, today, today)
+            val store = vault ?: error("Secure storage unavailable")
+            store.update { it.put("privatToken", clean); Unit }
+            config.edit().putBoolean("privat_connected", true).remove("privat_last_sync").putString("mode", "API").apply()
+            privatState.value = MonobankStatus(connected = true)
+            true
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { privatState.update { it.copy(error = privatError(e)) }; false }
+    }
+
+    override suspend fun disconnectPrivat() = withContext(Dispatchers.IO) {
+        vault?.update { it.remove("privatToken"); Unit }
+        config.edit().remove("privat_connected").remove("privat_last_sync").apply()
+        privatState.value = MonobankStatus()
+    }
+
+    override suspend fun syncPrivat(): Int = withContext(Dispatchers.IO) {
+        if (!privatLock.tryLock()) return@withContext 0
+        try {
+            if (!enabled || !config.getBoolean("privat_connected", false)) return@withContext 0
+            val token = vault?.read { it.optString("privatToken", "") }.orEmpty()
+            if (token.isBlank()) { privatState.update { it.copy(connected = false) }; return@withContext 0 }
+            privatState.update { it.copy(syncing = true, error = null) }
+            val now = System.currentTimeMillis()
+            val zone = ZoneId.of("Europe/Kyiv")
+            val through = Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+            val last = config.getLong("privat_last_sync", 0L)
+            val from = if (last > 0) Instant.ofEpochMilli(last).atZone(zone).toLocalDate().minusDays(1).coerceAtLeast(through.minusDays(29)) else through.minusDays(29)
+            var imported = 0
+            // Short bounded windows also accommodate banks with restrictive statement date limits.
+            var begin = from
+            while (!begin.isAfter(through)) {
+                val end = begin.plusDays(6).coerceAtMost(through)
+                privat.statement(token, begin, end).forEach { row ->
+                    val key = "PRIVAT:${row.key}"
+                    if (store(row.parsed, key, row.parsed.happenedAtMillis, "API", authoritative = true) == "AUTO_IMPORTED") imported++
+                }
+                begin = end.plusDays(1)
+            }
+            config.edit().putLong("privat_last_sync", now).apply()
+            privatState.update { it.copy(connected = true, syncing = false, lastSyncMillis = now, lastImported = imported, error = null) }
+            imported
+        } catch (e: CancellationException) { privatState.update { it.copy(syncing = false) }; throw e }
+        catch (e: Exception) { privatState.update { it.copy(syncing = false, error = privatError(e)) }; 0 }
+        finally { privatLock.unlock() }
+    }
+
+    private fun privatError(e: Exception): String = when ((e as? PrivatBankClient.ApiException)?.code) {
+        401, 403 -> "BAD_TOKEN"; 429 -> "RATE_LIMIT"; else -> "NETWORK"
     }
 
     // -------------------------------------------------------------------------
@@ -368,10 +436,10 @@ class BankImportRepository(
     private fun postImportNotification(parsed: ParsedBankOperation) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-        val channelId = "ledger_import"
+        val channelId = "ledger_import_v2"
         if (nm.getNotificationChannel(channelId) == null) {
             nm.createNotificationChannel(
-                NotificationChannel(channelId, "Ledger Import", NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationChannel(channelId, "Saved bank payments", NotificationManager.IMPORTANCE_DEFAULT).apply {
                     description = "Background bank import events"
                     setShowBadge(false)
                 },
@@ -384,6 +452,10 @@ class BankImportRepository(
             .setSmallIcon(android.R.drawable.ic_menu_save)
             .setContentTitle(title)
             .setContentText(body)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(android.app.PendingIntent.getActivity(ctx, 0,
+                ctx.packageManager.getLaunchIntentForPackage(ctx.packageName) ?: android.content.Intent(),
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()

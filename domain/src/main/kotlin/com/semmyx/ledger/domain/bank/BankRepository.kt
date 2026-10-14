@@ -18,6 +18,10 @@ data class MonobankStatus(val connected: Boolean = false, val syncing: Boolean =
 interface BankRepository {
     /** "API" (monobank token), "SMS" or "NOTIFY" (bank app notifications). */
     var importMode: String
+    val privatStatus: Flow<MonobankStatus>
+    suspend fun connectPrivat(token: String): Boolean
+    suspend fun disconnectPrivat()
+    suspend fun syncPrivat(): Int
     val monobankStatus: Flow<MonobankStatus>
     suspend fun connectMonobank(token: String): Boolean
     suspend fun disconnectMonobank()

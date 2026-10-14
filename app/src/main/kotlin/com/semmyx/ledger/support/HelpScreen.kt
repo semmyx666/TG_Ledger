@@ -30,6 +30,10 @@ fun HelpScreen(onClose: () -> Unit, onSupport: () -> Unit) {
                 Text(stringResource(R.string.help_entries_body))
             } }
             item { ContentCard {
+                Text(stringResource(R.string.help_banks_title), style = MaterialTheme.typography.titleLarge)
+                Text(stringResource(R.string.help_banks_body))
+            } }
+            item { ContentCard {
                 Text(stringResource(R.string.help_privacy_title), style = MaterialTheme.typography.titleLarge)
                 Text(stringResource(R.string.help_privacy_body))
             } }

@@ -7,4 +7,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TGLedger"
 include(":app", ":domain", ":data")
-include(":app")
+include(":bank-fixture")

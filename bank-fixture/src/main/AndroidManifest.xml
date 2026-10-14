@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <application android:label="QA Bank (test only)" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <receiver android:name=".FixtureReceiver" android:exported="true" />
+    </application>
+</manifest>
