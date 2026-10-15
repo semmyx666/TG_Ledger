@@ -182,10 +182,10 @@
     <string name="premium_expires">Activation valid until %1$s</string>
     <string name="premium_assistant_toggle">Show assistant character</string>
     <string name="premium_assistant_toggle_hint">Turn the dashboard mascot on or off. Only visible with an active Plus subscription.</string>
-    <string name="developer_purchase_title">Buy directly from the developer</string>
-    <string name="developer_purchase_body">Buy lifetime Plus directly: contact the developer on Telegram to confirm the price, pay and receive a signed lifetime code for your installation ID.</string>
-    <string name="developer_purchase_banner">Direct lifetime activation · official developer only</string>
-    <string name="developer_purchase_note">Note: mention TG Plus and your installation ID when you write to the developer about your purchase.</string>
+    <string name="developer_purchase_title">TG Plus activation</string>
+    <string name="developer_purchase_body">A code unlocks Plus for its issued duration or permanently. Agree on the price and confirm payment with the developer before requesting a code.</string>
+    <string name="developer_purchase_banner">Direct activation · official developer only</string>
+    <string name="developer_purchase_note">Send the activation request to the developer. It contains the installation and Key ID, not your private data or signing key.</string>
     <string name="developer_purchase_button">Message the developer on Telegram</string>
     <string name="installation_id_label">Your installation ID</string>
     <string name="installation_id_copy">Copy installation ID</string>

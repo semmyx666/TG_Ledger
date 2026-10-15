@@ -182,10 +182,10 @@
     <string name="premium_expires">Активація дійсна до %1$s</string>
     <string name="premium_assistant_toggle">Показувати персонажа-помічника</string>
     <string name="premium_assistant_toggle_hint">Увімкніть або вимкніть маскота на головному екрані. Доступно лише з активною підпискою Plus.</string>
-    <string name="developer_purchase_title">Купити безпосередньо в розробника</string>
-    <string name="developer_purchase_body">Купи довічний Plus напряму: зв’яжися з розробником у Telegram, узгодь ціну, сплати та отримай підписаний довічний код для свого ID встановлення.</string>
-    <string name="developer_purchase_banner">Пряма довічна активація · лише офіційний розробник</string>
-    <string name="developer_purchase_note">Примітка: згадайте TG Plus і свій ідентифікатор встановлення, коли пишете розробнику щодо покупки.</string>
+    <string name="developer_purchase_title">Активація TG Plus</string>
+    <string name="developer_purchase_body">Код відкриває Plus на виданий термін або безстроково. Узгодьте ціну та підтвердьте оплату з розробником перед отриманням коду.</string>
+    <string name="developer_purchase_banner">Пряма активація · лише офіційний розробник</string>
+    <string name="developer_purchase_note">Надішліть розробнику запит активації. Він містить ID інсталяції та Key ID, але не ваші приватні дані чи ключ підпису.</string>
     <string name="developer_purchase_button">Написати розробнику в Telegram</string>
     <string name="installation_id_label">Ваш ідентифікатор встановлення</string>
     <string name="installation_id_copy">Скопіювати ідентифікатор встановлення</string>
