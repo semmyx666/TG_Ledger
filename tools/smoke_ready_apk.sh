@@ -3,7 +3,9 @@
 set -eu
 mkdir -p verification/ready-apk-smoke
 adb install -r ready-delivery.apk
-adb logcat -c
+# The signed release package is freshly installed in this emulator. Do not clear
+# all log buffers: Android 8 emulator logd can reject that unrelated operation.
+# Keep full crash evidence; only a crash of this exact release package fails below.
 adb shell am start -W -n com.semmyx.ledger/.MainActivity
 sleep 10
 adb shell pidof com.semmyx.ledger > verification/ready-apk-smoke/process.txt
