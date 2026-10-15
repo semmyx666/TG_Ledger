@@ -99,8 +99,6 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Download exact signed delivery APK
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: python3 tools/download_ready_apk.py
       - name: Device tests
         uses: reactivecircus/android-emulator-runner@v2
