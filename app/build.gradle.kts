@@ -1,3 +1,10 @@
+import java.util.Properties
+import java.util.Base64
+import java.security.KeyFactory
+import java.security.MessageDigest
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.X509EncodedKeySpec
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -8,7 +15,24 @@ plugins {
 fun quoted(value: String) = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 val playKey = providers.gradleProperty("PLAY_LICENSE_KEY").orElse("")
 val product = providers.gradleProperty("PREMIUM_PRODUCT_ID").orElse("ledger_plus")
-val developerKey = providers.gradleProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY").orElse("")
+// Per-project setup is authoritative, so stale ~/.gradle values cannot silently override it.
+val activationFile = rootProject.file("activation-public.properties")
+val activationProperties = Properties().apply {
+    if (activationFile.exists()) activationFile.inputStream().use { load(it) }
+}
+val developerKey = if (activationFile.exists()) activationProperties.getProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", "").trim()
+    else providers.gradleProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY").orElse("").get().trim()
+val developerKeyId = if (developerKey.isBlank()) "" else try {
+    val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(developerKey))) as RSAPublicKey
+    check(key.modulus.bitLength() >= 2048)
+    MessageDigest.getInstance("SHA-256").digest(key.encoded).take(8).joinToString("") { "%02X".format(it) }
+} catch (error: Exception) { throw GradleException("Invalid activation public key. Run START_ACTIVATION.cmd to configure this project.", error) }
+if (providers.gradleProperty("REQUIRE_DEVELOPER_ACTIVATION").orElse("false").get().toBoolean() && developerKeyId.isEmpty()) {
+    throw GradleException("Activation is not configured. Run START_ACTIVATION.cmd, import/create your key, then build again.")
+}
+tasks.register("activationDoctor") {
+    doLast { println("Developer activation Key ID: " + developerKeyId.ifEmpty { "NOT CONFIGURED" }) }
+}
 val legacyApproved = providers.gradleProperty("LEGACY_BILLING_EXTENSION_APPROVED").orElse("false")
 
 android {
@@ -18,12 +42,12 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18
-        versionName = "4.3.3"
+        versionCode = 19
+        versionName = "4.4.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
-        buildConfigField("String", "DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", quoted(developerKey.get()))
+        buildConfigField("String", "DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", quoted(developerKey))
         resourceConfigurations += listOf("en", "uk")
     }
     flavorDimensions += "billing"

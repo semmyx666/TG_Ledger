@@ -75,4 +75,29 @@ class ComposeScreensTest {
         compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API ПриватБанку",substring=true)
     }
 
+    @Test fun activationRequestIncludesTheInstalledKeyAndFailedInputIsNotDiscarded() {
+        var input by mutableStateOf("bad-code")
+        var copied = ""
+        var attempts = 0
+        val premium = com.semmyx.ledger.domain.PremiumState(developerPurchaseEnabled=true,
+            developerInstallationId="A21C-FEA5-E432",developerKeyId="1234567890ABCDEF",
+            activationProblem=com.semmyx.ledger.domain.ActivationProblem.KEY_MISMATCH)
+        compose.setContent { LocalizedContent(AppLanguage.ENGLISH) { LedgerTheme {
+            com.semmyx.ledger.settings.DeveloperActivationPanel(premium,input,{input=it},false,{attempts++},{copied=it},{})
+        } } }
+        compose.onNodeWithTag("copyActivationRequest").performClick()
+        compose.runOnIdle { assertEquals("TGREQ1|A21C-FEA5-E432|1234567890ABCDEF|ledger_plus",copied) }
+        compose.onNodeWithTag("activateDeveloperCode").performClick()
+        compose.onNodeWithTag("activationCodeField").assertTextContains("bad-code")
+        compose.onNodeWithTag("activationProblem").assertTextContains("different signing key",substring=true)
+        compose.runOnIdle { assertEquals(1,attempts) }
+    }
+    @Test fun unconfiguredActivationIsExplainedRatherThanHidden() {
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            com.semmyx.ledger.settings.DeveloperActivationPanel(com.semmyx.ledger.domain.PremiumState(),"",{},false,{},{},{})
+        } } }
+        compose.onNodeWithTag("activationNotConfigured").assertIsDisplayed()
+        compose.onNodeWithTag("activateDeveloperCode").assertDoesNotExist()
+    }
+
 }

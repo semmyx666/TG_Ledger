@@ -15,3 +15,6 @@ gradle/wrapper/gradle-wrapper.jar
 
 __pycache__/
 *.pyc
+
+activation-public.properties
+*.activation

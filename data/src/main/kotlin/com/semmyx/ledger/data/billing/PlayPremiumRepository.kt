@@ -53,6 +53,7 @@ class PlayPremiumRepository(
         .stateIn(scope, SharingStarted.Eagerly, merge(playState.value, developerActivation.value))
     private val client = createVersionedBillingClient(app, this)
     private val refreshLock = Mutex()
+    private val developerLock = Mutex()
     private var details: ProductDetails? = null
     private val cacheTtlMillis = 7L * 24 * 60 * 60 * 1000
 
@@ -83,7 +84,7 @@ class PlayPremiumRepository(
 
     private suspend fun refreshLocalEntitlements() {
         try {
-            developerActivation.value = cachedDeveloperEntitlement()
+            developerLock.withLock { developerActivation.value = cachedDeveloperEntitlement() }
             val now = clock.millis()
             val trialStarted = vault.read { it.has("trialStart") }
             trial.value = if (!trialStarted) Trial(available = true) else vault.update { json ->
@@ -203,15 +204,28 @@ class PlayPremiumRepository(
      * for a wrong, tampered, expired, or installation-mismatched code.
      */
     override suspend fun activateDeveloperToken(token: String): Boolean = withContext(Dispatchers.Default) {
-        val activation = developerVerifier.verify(token, installationId, productId, clock.millis())
-        if (activation == null) {
-            playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE) }
-            return@withContext false
+        developerLock.withLock {
+            val result = developerVerifier.check(token, installationId, productId, clock.millis())
+            val activation = result.activation
+            if (activation == null) {
+                playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE, activationProblem = result.problem) }
+                return@withLock false
+            }
+            try {
+                // Keep a valid permanent/longer grant when an older code is pasted again.
+                val existing = cachedDeveloperEntitlement()
+                val keep = existing != null && (existing.expiresAtMillis == null ||
+                    (activation.expiresAtMillis != null && existing.expiresAtMillis >= activation.expiresAtMillis))
+                if (!keep) vault.update { it.put("developerActivationCode", developerVerifier.normalize(token)) }
+                developerActivation.value = if (keep) existing else activation
+                playState.update { it.copy(issue = null, activationProblem = null) }
+                true
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE, activationProblem = ActivationProblem.STORAGE) }
+                false
+            }
         }
-        vault.update { it.put("developerActivationCode", token.trim()) }
-        developerActivation.value = activation
-        playState.update { it.copy(issue = null) }
-        true
     }
 
     override suspend fun developerInstallationId(): String = installationId
@@ -254,6 +268,8 @@ class PlayPremiumRepository(
             expiresAtMillis = when { play.entitled -> null; developerActive -> dev?.expiresAtMillis; else -> trialEnd },
             developerPurchaseEnabled = developerVerifier.configured,
             developerInstallationId = installationId,
+            developerKeyId = developerVerifier.keyId,
+            developerProductId = productId,
         )
     }
 
