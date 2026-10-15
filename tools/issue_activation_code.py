@@ -29,6 +29,11 @@ PROJECT = HERE.parent
 DEFAULT_PRODUCT_ID = 'ledger_plus'
 PROPERTY = 'DEVELOPER_SUBSCRIPTION_PUBLIC_KEY'
 MAX_CODE = 16384
+# Redirected Windows consoles can use a code page without Cyrillic. Diagnostic
+# printing must never turn a successful import into a failure after writing it.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, 'reconfigure'):
+        stream.reconfigure(errors='backslashreplace')
 
 
 def key_home() -> Path:

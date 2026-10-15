@@ -129,6 +129,12 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(0,result.returncode,result.stderr);self.assertEqual('v2',self.decode(result.stdout.strip())[0])
         self.assertNotIn('PRIVATE KEY',result.stdout+result.stderr)
 
+    def test_redirected_ascii_console_cannot_break_import_of_cyrillic_path(self):
+        result=subprocess.run([sys.executable,str(Path(a.__file__)),'setup','--import-key',str(self.source),'--project',str(self.project)],
+                              capture_output=True,text=True,env={**os.environ,'PYTHONIOENCODING':'ascii'})
+        self.assertEqual(0,result.returncode,result.stderr)
+        self.assertTrue(a.inspect_project(self.project)['matches'])
+
     def test_legacy_generate_does_not_overwrite_public_or_private(self):
         out=self.root/'test.der';out.write_bytes(b'preserve')
         with self.assertRaises(ValueError):a.generate_keys(self.root/'new.pem',out)
