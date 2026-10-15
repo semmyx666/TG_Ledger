@@ -18,3 +18,7 @@ __pycache__/
 
 activation-public.properties
 *.activation
+
+/dist/
+*.spec
+premium-*-smoke.json
