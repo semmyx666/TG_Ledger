@@ -1,7 +1,7 @@
 {
-  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38801902922",
-  "artifact_id": 12003654899,
-  "exe_sha256": "1988020381ad828ea27d9370efe11cfe0b5f198242dde822651d5c17c323db76",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38803830837",
+  "artifact_id": 12005851830,
+  "exe_sha256": "18b7c420c13564690e2f98b9485ef710b3eb3880dc343e3c9e9320698d85fa17",
   "reports": {
     "premium-exe-smoke.json": {
       "passed": true,

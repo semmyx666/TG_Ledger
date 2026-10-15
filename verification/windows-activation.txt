@@ -1,7 +1,7 @@
-TG Ledger 4.4.0: native Windows runner
-CI: https://github.com/semmyx666/TG_Ledger/actions/runs/38732319264
-Job: 116412843453, activation-windows, success
-Tested source: 010aeec90dbaf5fc6a754e1fcbc09345438bbd1c
+TG Ledger 4.4.1: native Windows runner
+CI: https://github.com/semmyx666/TG_Ledger/actions/runs/38804609923
+Job: 116662096467, success
+Tested source: cf62397
 
 test_adopts_legacy_key_without_searching_arbitrary_directories (test_activation.ActivationTests.test_adopts_legacy_key_without_searching_arbitrary_directories) ... ok
 test_cannot_silently_replace_existing_stable_key (test_activation.ActivationTests.test_cannot_silently_replace_existing_stable_key) ... ok
@@ -23,6 +23,17 @@ test_stale_global_gradle_key_cannot_override_local_setup (test_activation.Activa
 test_valid_signature_and_exact_five_day_duration (test_activation.ActivationTests.test_valid_signature_and_exact_five_day_duration) ... ok
 test_wrong_app_key_is_blocked (test_activation.ActivationTests.test_wrong_app_key_is_blocked) ... ok
 test_wrong_key_type_is_rejected (test_activation.ActivationTests.test_wrong_key_type_is_rejected) ... ok
-Ran 20 tests in 3.203s
+test_bare_id_requires_no_project_gradle_or_sdk (test_standalone_issuer.StandaloneIssuerTests.test_bare_id_requires_no_project_gradle_or_sdk) ... ok
+test_complete_request_matches_app_key (test_standalone_issuer.StandaloneIssuerTests.test_complete_request_matches_app_key) ... ok
+test_missing_private_file_is_not_replaced_or_regenerated (test_standalone_issuer.StandaloneIssuerTests.test_missing_private_file_is_not_replaced_or_regenerated) ... ok
+test_mixed_owner_files_are_refused (test_standalone_issuer.StandaloneIssuerTests.test_mixed_owner_files_are_refused) ... ok
+test_negative_or_nonfinite_duration_is_refused (test_standalone_issuer.StandaloneIssuerTests.test_negative_or_nonfinite_duration_is_refused) ... ok
+test_owner_config_cannot_escape_its_folder (test_standalone_issuer.StandaloneIssuerTests.test_owner_config_cannot_escape_its_folder) ... ok
+test_request_from_old_apk_is_refused (test_standalone_issuer.StandaloneIssuerTests.test_request_from_old_apk_is_refused) ... ok
+test_wrong_product_and_invalid_id_are_refused (test_standalone_issuer.StandaloneIssuerTests.test_wrong_product_and_invalid_id_are_refused) ... ok
+Ran 28 tests in 3.383s
 OK
 GUI_SMOKE_OK: window, project diagnosis, issuance and clipboard
+[36;1mif (!$r.passed -or !$r.frozen_exe) { throw "Frozen GUI smoke failed" }[0m
+
+Packaged EXE smoke reports and executable provenance: premium-exe-windows.json
