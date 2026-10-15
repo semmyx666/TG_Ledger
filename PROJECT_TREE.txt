@@ -1,4 +1,4 @@
-TG_Ledger-4.4.0/
+TG_Ledger-4.4.1/
   .github/workflows/android.yml
   .gitignore
   CHANGELOG.md
@@ -19,6 +19,7 @@ TG_Ledger-4.4.0/
   app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt
   app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt
   app/src/androidTest/kotlin/com/semmyx/ledger/NativeScreenshots.kt
+  app/src/androidTest/kotlin/com/semmyx/ledger/PackagedKeyIdentityTest.kt
   app/src/main/AndroidManifest.xml
   app/src/main/keepRules/rules.keep
   app/src/main/kotlin/com/semmyx/ledger/AppContainer.kt
@@ -154,6 +155,9 @@ TG_Ledger-4.4.0/
   data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt
   data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
   data/src/test/resources/activation_python.json
+  delivery/activation-public.json
+  delivery/apk-signing-public.json
+  delivery/ready-apk-public.json
   docs/ACTIVATION_4.4.0_RU.md
   docs/ARCHITECTURE.md
   docs/BANKS_4.4.0_RU.md
@@ -166,6 +170,7 @@ TG_Ledger-4.4.0/
   docs/OPTIONAL_VOICE_ASSISTANT.md
   docs/OWNERSHIP.md
   docs/PROJECT_STRUCTURE.md
+  docs/READY_APK_4.4.1_RU.md
   docs/RELEASE_CHECKLIST.md
   docs/RESPONSIVE_2_4_1.md
   docs/SECURITY.md
@@ -208,17 +213,23 @@ TG_Ledger-4.4.0/
   settings.gradle.kts
   tools/activation_manager.py
   tools/audit_project.py
+  tools/configure_delivery.py
+  tools/create_key_premium.py
+  tools/download_ready_apk.py
   tools/export_sources.py
   tools/issue_activation_code.py
   tools/requirements-activation.txt
   tools/run_device_tests.sh
+  tools/smoke_ready_apk.sh
   tools/tests/test_activation.py
+  tools/tests/test_standalone_issuer.py
   tools/verify_bank_regex.py
   tools/verify_bank_sql.py
   tools/verify_navigation_recovery.py
   tools/verify_upgrade_sql.py
   tools/verify_voice_regex.py
   verification/RELEASE_4.4.0.md
+  verification/RELEASE_4.4.1.md
   verification/STATUS.md
   verification/activation-build-config.json
   verification/android-build-3.1.log
@@ -231,6 +242,7 @@ TG_Ledger-4.4.0/
   verification/device-reports/android-26/app/com.semmyx.ledger.BankScreenLayoutTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.CompactLayoutTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.ComposeScreensTest.html
+  verification/device-reports/android-26/app/com.semmyx.ledger.PackagedKeyIdentityTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.html
   verification/device-reports/android-26/app/css/base-style.css
   verification/device-reports/android-26/app/css/style.css
@@ -249,6 +261,7 @@ TG_Ledger-4.4.0/
   verification/device-reports/android-36/app/com.semmyx.ledger.BankScreenLayoutTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.CompactLayoutTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.ComposeScreensTest.html
+  verification/device-reports/android-36/app/com.semmyx.ledger.PackagedKeyIdentityTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.html
   verification/device-reports/android-36/app/css/base-style.css
   verification/device-reports/android-36/app/css/style.css
@@ -268,7 +281,22 @@ TG_Ledger-4.4.0/
   verification/history/4.3.3/RELEASE_4.3.3.md
   verification/history/4.3.3/release-4.3.3.json
   verification/navigation-recovery.json
+  verification/premium-exe-windows.json
+  verification/ready-apk-4.4.1.json
+  verification/ready-apk-smoke/README.md
+  verification/ready-apk-smoke/android-26/crashes.txt
+  verification/ready-apk-smoke/android-26/process.txt
+  verification/ready-apk-smoke/android-26/result.txt
+  verification/ready-apk-smoke/android-26/run-as.txt
+  verification/ready-apk-smoke/android-26/ui.xml
+  verification/ready-apk-smoke/android-36/crashes.txt
+  verification/ready-apk-smoke/android-36/process.txt
+  verification/ready-apk-smoke/android-36/result.txt
+  verification/ready-apk-smoke/android-36/run-as.txt
+  verification/ready-apk-smoke/android-36/screenshot.png
+  verification/ready-apk-smoke/android-36/ui.xml
   verification/release-4.4.0.json
+  verification/release-4.4.1.json
   verification/screenshots/README.md
   verification/screenshots/android-26/activation-320dp-font140-uk.png
   verification/screenshots/android-26/bank-320dp-font140-uk.png

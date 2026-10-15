@@ -1,6 +1,6 @@
-# TG Ledger 4.4.0 — complete file-by-file source
+# TG Ledger 4.4.1 — complete file-by-file source
 
-178 implementation, configuration and test files, without truncation.
+191 implementation, configuration and test files, without truncation.
 
 Generated from tracked files. Local keys and build outputs are excluded.
 
@@ -27,6 +27,25 @@ jobs:
         run: python -m unittest discover -s tools/tests -v
       - name: Native Windows manager smoke test
         run: python tools/activation_manager.py --smoke-test
+      - name: Standalone issuer native GUI
+        run: python tools/create_key_premium.py --smoke-test --smoke-report premium-python-smoke.json
+      - name: Build standalone Windows executable
+        run: |
+          python -m pip install pyinstaller==6.16.0
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "Create Key Premium" --paths tools tools/create_key_premium.py
+      - name: Test packaged executable without project or Python imports
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/Create Key Premium.exe" -ArgumentList '--smoke-test --smoke-report premium-exe-smoke.json' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Packaged issuer failed" }
+          $r = Get-Content premium-exe-smoke.json | ConvertFrom-Json
+          if (!$r.passed -or !$r.frozen_exe) { throw "Frozen GUI smoke failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: create-key-premium-windows
+          path: |
+            dist/Create Key Premium.exe
+            premium-*-smoke.json
   build:
     runs-on: ubuntu-latest
     steps:
@@ -41,12 +60,18 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Configure public APK key
+        run: python3 tools/configure_delivery.py
       - name: Resource and SQL audit
         run: python3 tools/audit_project.py
       - name: Build, unit tests, lint and release shrinking
         run: |
           chmod +x gradlew
-          ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+          ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease -PREQUIRE_DEVELOPER_ACTIVATION=true --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-unsigned
+          path: app/build/outputs/apk/play/release/*unsigned.apk
       - uses: actions/upload-artifact@v4
         with:
           name: debug-apks
@@ -75,11 +100,15 @@ jobs:
         with:
           packages: ''
       - uses: gradle/actions/setup-gradle@v4
+      - name: Configure public APK key
+        run: python3 tools/configure_delivery.py
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      - name: Download exact signed delivery APK
+        run: python3 tools/download_ready_apk.py
       - name: Device tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -87,7 +116,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash tools/run_device_tests.sh
+          script: bash tools/run_device_tests.sh && bash tools/smoke_ready_apk.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -95,6 +124,7 @@ jobs:
           path: |
             **/build/reports/androidTests/
             verification/device-screenshots/
+            verification/ready-apk-smoke/
 ```
 
 ## START_ACTIVATION.cmd
@@ -163,9 +193,10 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 19
-        versionName = "4.4.0"
+        versionCode = 20
+        versionName = "4.4.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders["activationKeyId"] = developerKeyId
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
         buildConfigField("String", "DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", quoted(developerKey))
@@ -718,6 +749,33 @@ object NativeScreenshots {
 }
 ```
 
+## app/src/androidTest/kotlin/com/semmyx/ledger/PackagedKeyIdentityTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import android.content.pm.PackageManager
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.data.billing.DeveloperSubscriptionVerifier
+import org.junit.Assert.*
+import org.junit.Test
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class PackagedKeyIdentityTest {
+    @Test fun packagedPublicKeyMatchesManifestAndRepository() {
+        val app=ApplicationProvider.getApplicationContext<LedgerApplication>()
+        val verifier=DeveloperSubscriptionVerifier(BuildConfig.DEVELOPER_SUBSCRIPTION_PUBLIC_KEY)
+        assertTrue(verifier.configured)
+        @Suppress("DEPRECATION")
+        val metadata=app.packageManager.getApplicationInfo(app.packageName,PackageManager.GET_META_DATA).metaData
+        assertEquals(verifier.keyId,metadata.getString("com.semmyx.ledger.ACTIVATION_KEY_ID"))
+        assertEquals(verifier.keyId,app.container.billing.state.value.developerKeyId)
+    }
+}
+```
+
 ## app/src/main/AndroidManifest.xml
 
 ```xml
@@ -763,6 +821,7 @@ object NativeScreenshots {
         android:supportsRtl="true"
         android:usesCleartextTraffic="false"
         android:theme="@style/Theme.Ledger">
+        <meta-data android:name="com.semmyx.ledger.ACTIVATION_KEY_ID" android:value="${activationKeyId}" />
         <activity android:name=".support.SupportWebActivity" android:exported="false" />
         <activity android:name=".MainActivity" android:exported="true"
             android:windowSoftInputMode="adjustResize"
@@ -9831,7 +9890,7 @@ class PrivatBankClient(
                 .addQueryParameter("limit", "100")
             cursor?.let { url.addQueryParameter("followId", it) }
             val request = Request.Builder().url(url.build()).get().header("token", token)
-                .header("User-Agent", "TG-Ledger/4.4.0")
+                .header("User-Agent", "TG-Ledger/4.4.1")
                 .header("Content-Type", "application/json;charset=utf8").header("Accept", "application/json").build()
             val root = http.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw ApiException(response.code)
@@ -11371,14 +11430,51 @@ class DeveloperSubscriptionVerifierTest {
 
 ```json
 {
-  "source": "Synthetic fixture generated by tools/issue_activation_code.py; public verification data only",
-  "public_key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtHwe7xs40X04Ymg1/q1JLVki5n8W9zdy7pg1AyKRc5LaBoa9HrO2KTAzfq9MtcqRo4KrCswmVEGsNU7h3rreg1JR8SJsYprqeXXF6W8vnuBfjVC/Cmt5ogoqVl8AgJLX9DjfYpcDPRTopg1eTmCvazMXT5PNBWdmTGBnSmFT2pVoNeA55m/lHUuJSrRZf1KEE+VRz6jKozB1fI9wZMlwPjPICWrUf7SkBSE9CWTJjhKhsTo4DVjrClJt3tJXEeifWo7/O5RNLtVFUHFf9xtMSYYFpDIL2dfZTsE8flwgEOTpnogvT7RWuv+2JuKzYdbI8rEW1i5kFX0Yw7tkPMmsawIDAQAB",
-  "key_id": "522FF6229DD37F8C",
+  "source": "Public, expired synthetic grant signed locally with the delivery owner key; no private material",
+  "public_key": "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA3NkQrfrqADGYW1VIGrBw2tWoO0AEW6QPHWCp5ADXGavWpIOyJq6/WLOB+b4p1AjZi0MXRnjM5kTvGuseqjMp8qgYKTvpAWocM4fhjmaA9FaLbcMUGvXC5o+OB9vwu+jr/tzQw0VFnSKoODMD0ch8rKEqV0PG00L5vdN8vTb7O3WB/QwnBxx83Y2LnuzuFup1UfPGgdBh2ZG3dNaVX3TjqrcBSGMM0Szj2EamxbIkdxbHPJanWwIfki/p+Otd7NKHSnlMI++niefqKeWbJheEWbwCwmeyE9TONRT0VpN3KDKHm83l5K0sxX1LZUGYAUFGjSmoTNdMeeBgEkH3QoSZ60Lujql2181B30b/AVth2q+rKe0PgVkkBn0qM42Ci1iQGBQ64P1BqJVIx8q2PigDZGdAN/MK9chfXZyEjjmJVcyc24ZmLi35248iMLJk6h2pVm/WdD9NtUhZr1+RPrRRFmEgf0EqS/u5kNodwkMpB0tywZHYa8gGre/CKHi36znxAgMBAAE=",
+  "key_id": "EB6E82A6AFC4EE5E",
   "installation_id": "AB12-CD34-EF56",
   "product_id": "ledger_plus",
   "now_millis": 1767225600000,
-  "code_v2": "TG2.522FF6229DD37F8C.djJ8NTIyRkY2MjI5REQzN0Y4Q3xBQjEyLUNEMzQtRUY1NnxsZWRnZXJfcGx1c3wxNzY3MjI1NjAwMDAwfDE3Njc2NTc2MDAwMDA.lJEGI0qxSR-u3fT9g6Vh14oH2t0NK36NC6q7Qc9-Yad_2BDVuybm54ViJrNZ_W1Gdj2TpVY6Df6rkzNmkkLdbUR1F-hEBAL8XrkvCgY3tJlUkXE87gUYthXrAPZZvjONHPGiDCDt0GfxLTxioYbbNrVa2Ohn-mUYgxNoueado2lhfN3RME4BoyX3m6eKa3a1tbRSwLhFo3EMbrDJGkaaYqxzo-qHbAQsu8oevZQzqXWXHDjnTTLSuT-zgMfCzWuZpFhJm5Yf_vdsxV1PzSKn9PyYfDd2nlsUElz2pwxtcAXKDHwtXUO5hiDzzHKqzaAAl0rSTiP2iNrV904iNZbNtw",
-  "code_v1": "djF8QUIxMi1DRDM0LUVGNTZ8bGVkZ2VyX3BsdXN8MTc2NzIyNTYwMDAwMHwxNzY3NjU3NjAwMDAw.khuNyAA6wTbAcd3IvuqsaadOXg4Tk7fdLHvwYYUUv-Lu-_jIAz9_NriTE2Gkhel0idkwfkQQeJJJx_u2_s6nDLUoYZX2IUcayQPt6EHP9Hy3I7htd3xHcG7YC2Nhz_XSzeCabRFgEMxJUbsug3c3LQyJEvNmP3xN6C59Cuah7-XLiEh4sNBwIWdnxNVhPfyshqtXuaHOdXBVASsRo21G0UsDPssoLDT22mh_PggK9CZAXWqmr14CYk_xg3o2wGvQLXfT5B9yW_vs2OYbhzdRlkjjXWOv28q5y1t5Ge_VlI6C0rAph-mQ_deWrCfJBoYTncIoAW_EWpqlBxw8klZ-UA"
+  "code_v2": "TG2.EB6E82A6AFC4EE5E.djJ8RUI2RTgyQTZBRkM0RUU1RXxBQjEyLUNEMzQtRUY1NnxsZWRnZXJfcGx1c3wxNzY3MjI1NjAwMDAwfDE3Njc2NTc2MDAwMDA.cFWWMdf87oX_zVFP14h0TZFN2ShaJFfNDV2DyiKGfFrp1yMcBunMSCbaB1Eq9gHeydo342ZzlNcrqZwpxo-R0XRsmu22m33B-AZlczTnO9ibydQtdvtJN-p2UgiGnIp1To-ZRxxqELMW7bJOF_bYM664yZ5bXun6rA0nyhZFZTYQ0GlbuWLqhlrg_GaJ0TCamCK9y36PqmoQh0sHz_ZKAspLfFsGK0tXkD7dOYP50AYQLStsgjYDUPTbAFw4VQuGJg2712474LSPEHZw8BUeOwShS9GgW0a1SJ4b6DLO7Y9lo0rKYDYVwjEJPpG6QZKzmTnUYQ5FfZBH0MgLuPJLpSNCK-nnts2JTQZJluitIJPuH4ImaeO43hfxSZZWZVgWRFCG-fwveuwVWIgzi7L-QY3IhY9gWdspskLJ3MDCzSeN6DbAEo8-PLfult_0Qsmt0H7SPqn2MwNPEy_RPzGA9nU2HKsQBUyow_P9ak3gDO-uNz7Ns5YGeVopfjHl31Qu",
+  "code_v1": "djF8QUIxMi1DRDM0LUVGNTZ8bGVkZ2VyX3BsdXN8MTc2NzIyNTYwMDAwMHwxNzY3NjU3NjAwMDAw.VBQ-U66mUjmFFaG53JoAEe62pijskh90f8V9ZaxzRGCGidFiNeD8aeQscC1XIOgjrmm-s4D_-ZwSYKlsRoQugHC4qX8Ltf62UG7UXyfeR6eZNjC1LzCqlBJwA72C5bQv3NU66YlODC8_JJf2GjNCLFosrm3IHbc3--unp8ONuggLZReJIo_5_QrPUGTA8QtB95FKXTkjb1pkQh-Zw0bJaxx7tMlX5L_nYuahZ3-63_sWkiJNcZs4oS-ZAOLGNh95yBN4SekRlXvThTSN2kXZ5MNohfIeMbZFfnMgn3Qn1ci7cRWl8sLeDiaO-7mtWCAeMteIB9PVEr9bVT1fGzrrDUqcC6AuGplnb_b2sgqtzVr5KvtguEpRLFiRnOHaTUdMiAw0LE2QTer5To2ufeEHpnI9-KZXTWgyTpbP3B3W0ouz8YN5z5YC_dk6z3IWYgFWpWeWFaitW1IsZ2eXJjwytrIaS8WyQgoMPb1uzY2HBGlL4tXl2DmAwJgxELQOf5nF"
+}
+```
+
+## delivery/activation-public.json
+
+```json
+{
+  "version": "4.4.1",
+  "key_id": "EB6E82A6AFC4EE5E",
+  "public_key": "MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA3NkQrfrqADGYW1VIGrBw2tWoO0AEW6QPHWCp5ADXGavWpIOyJq6/WLOB+b4p1AjZi0MXRnjM5kTvGuseqjMp8qgYKTvpAWocM4fhjmaA9FaLbcMUGvXC5o+OB9vwu+jr/tzQw0VFnSKoODMD0ch8rKEqV0PG00L5vdN8vTb7O3WB/QwnBxx83Y2LnuzuFup1UfPGgdBh2ZG3dNaVX3TjqrcBSGMM0Szj2EamxbIkdxbHPJanWwIfki/p+Otd7NKHSnlMI++niefqKeWbJheEWbwCwmeyE9TONRT0VpN3KDKHm83l5K0sxX1LZUGYAUFGjSmoTNdMeeBgEkH3QoSZ60Lujql2181B30b/AVth2q+rKe0PgVkkBn0qM42Ci1iQGBQ64P1BqJVIx8q2PigDZGdAN/MK9chfXZyEjjmJVcyc24ZmLi35248iMLJk6h2pVm/WdD9NtUhZr1+RPrRRFmEgf0EqS/u5kNodwkMpB0tywZHYa8gGre/CKHi36znxAgMBAAE=",
+  "product_id": "ledger_plus",
+  "application_id": "com.semmyx.ledger"
+}
+```
+
+## delivery/apk-signing-public.json
+
+```json
+{
+  "alias": "tgledger-release",
+  "certificate_sha256": "CD4A1391DCE5D0F504A4CC2DC19BE836755C377BB2104C719B55376861A78B50",
+  "application_id": "com.semmyx.ledger",
+  "version": "4.4.1",
+  "version_code": 20,
+  "note": "New APK signing identity, separate from activation RSA key. Keep PKCS12 and password private for future updates."
+}
+```
+
+## delivery/ready-apk-public.json
+
+```json
+{
+  "version": "4.4.1",
+  "asset_id": 645100594,
+  "apk_sha256": "1adb933c20c6d236a49d737deaef8eca1745fd6268f059f7300792407bf5905a",
+  "application_id": "com.semmyx.ledger",
+  "download_url": "https://github.com/semmyx666/TG_Ledger/releases/download/v4.4.1-rc1/TG_Ledger-4.4.1.apk"
 }
 ```
 
@@ -13106,6 +13202,177 @@ print(json.dumps({key:value for key,value in result.items() if key!='checks'}, e
 sys.exit(1 if failures else 0)
 ```
 
+## tools/configure_delivery.py
+
+```python
+#!/usr/bin/env python3
+"""Use PUBLIC release identity only; never loads/signs with a private key."""
+import base64,hashlib,json
+from pathlib import Path
+root=Path(__file__).resolve().parents[1]
+config=json.loads((root/'delivery/activation-public.json').read_text())
+der=base64.b64decode(config['public_key'],validate=True)
+assert hashlib.sha256(der).hexdigest()[:16].upper()==config['key_id']
+(root/'activation-public.properties').write_text('# Public APK delivery identity, not a private key\nDEVELOPER_SUBSCRIPTION_PUBLIC_KEY='+config['public_key']+'\n')
+print('Configured public delivery Key ID:',config['key_id'])
+```
+
+## tools/create_key_premium.py
+
+```python
+#!/usr/bin/env python3
+"""Standalone owner-only issuer. Ready Windows EXE requires neither Python nor the source project.
+Private key is loaded from a separate owner bundle, never embedded into the public EXE/APK.
+"""
+from __future__ import annotations
+import argparse
+import base64
+import json
+from pathlib import Path
+import sys
+import tempfile
+import issue_activation_code as issuer
+
+
+def bundle_root() -> Path:
+    return Path(sys.executable).resolve().parent if getattr(sys,'frozen',False) else Path(__file__).resolve().parent
+
+
+def load_bundle(root: Path):
+    config=json.loads((root/'issuer-config.json').read_text(encoding='utf-8-sig'))
+    path=Path(config.get('private_key_file','private/developer_private_key.pem'))
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError('Invalid private-key path in owner configuration.')
+    key=issuer.load_private(root/path)
+    public=issuer.public_bytes(key)
+    if issuer.fingerprint(public)!=config['key_id'] or base64.b64encode(public).decode()!=config['public_key']:
+        raise ValueError('Key files do not match. Extract the complete PRIVATE owner archive into a new folder; do not replace individual keys.')
+    return config,key
+
+
+def create_code(root: Path, installation_or_request: str, days: float) -> str:
+    config,key=load_bundle(root)
+    value=installation_or_request.strip()
+    if value.startswith('TGREQ1|'):
+        installation,kid,product=issuer.parse_request(value)
+        if kid!=config['key_id']:
+            raise ValueError('Запрос из другой версии APK с другим ключом. Возьмите запрос именно из приложенного APK 4.4.1.')
+        if product!=config['product_id']:
+            raise ValueError('Запрос предназначен для другого продукта.')
+    else:
+        installation=issuer.normalize_installation(value)
+    return issuer.make_token(key,installation,config['product_id'],days)
+
+
+def run_gui(root_path: Path, smoke_report: Path | None = None):
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    root=tk.Tk();root.withdraw()
+    try:
+        config,_=load_bundle(root_path)
+    except Exception as error:
+        messagebox.showerror('Create Key Premium — неполный комплект',
+            'Распакуйте ПОЛНОСТЬЮ личный архив Create Key Premium. Рядом с EXE должны остаться issuer-config.json и папка private.\n\n'+str(error))
+        root.destroy();raise SystemExit(1)
+    root.title('Create Key Premium — TG Ledger '+config['version'])
+    root.geometry('740x600');root.minsize(500,500)
+    frame=ttk.Frame(root,padding=16);frame.pack(fill='both',expand=True)
+    frame.columnconfigure(0,weight=1);frame.rowconfigure(7,weight=1)
+    ttk.Label(frame,text='Создать ключ Premium',font=('Segoe UI',17,'bold')).grid(row=0,column=0,sticky='w')
+    ttk.Label(frame,text='Вставьте ID установки ИМЕННО ИЗ НОВОГО APK (например AB12-CD34-EF56).\nЛучше скопировать полный запрос TGREQ1 из Настроек → Активация TG Plus.').grid(row=1,column=0,sticky='ew',pady=(10,5))
+    installation=tk.StringVar();ttk.Entry(frame,textvariable=installation,font=('Segoe UI',12)).grid(row=2,column=0,sticky='ew')
+    options=ttk.Frame(frame);options.grid(row=3,column=0,sticky='w',pady=12)
+    ttk.Label(options,text='Дней:').pack(side='left');days=tk.StringVar(value='30')
+    ttk.Spinbox(options,from_=0,to=36500,textvariable=days,width=8).pack(side='left',padx=8)
+    ttk.Label(options,text='0 — бессрочно; 5 — на пять дней').pack(side='left')
+    status=tk.StringVar(value='Подтвердите оплату самостоятельно. Срок начинается с выдачи кода.')
+    ttk.Label(frame,textvariable=status).grid(row=4,column=0,sticky='ew')
+    result=tk.Text(frame,height=6,wrap='char',font=('Consolas',10))
+    def generate():
+        try:
+            token=create_code(root_path,installation.get(),float(days.get()))
+            result.delete('1.0','end');result.insert('1.0',token)
+            status.set('Готово: '+('бессрочно.' if float(days.get())==0 else days.get()+' дней с момента выдачи.'))
+            return token
+        except Exception as error:
+            # Never leave an older successful token visible after a failed request.
+            result.delete('1.0','end');status.set('Код НЕ выдан.')
+            if smoke_report is not None:raise
+            messagebox.showerror('Код не выдан',str(error))
+    ttk.Button(frame,text='Создать ключ Premium',command=generate).grid(row=5,column=0,sticky='ew',pady=8)
+    ttk.Label(frame,text='Готовый код — вставьте в приложение и нажмите «Активувати TG Plus»:').grid(row=6,column=0,sticky='ew')
+    result.grid(row=7,column=0,sticky='nsew')
+    def copy():
+        token=result.get('1.0','end').strip()
+        if not token:
+            if smoke_report is not None:raise ValueError('No generated code')
+            messagebox.showinfo('Нет кода','Сначала введите ID и нажмите «Создать ключ Premium».');return
+        root.clipboard_clear();root.clipboard_append(token);root.update()
+        status.set('Код скопирован. Отправляйте только этот код, НЕ генератор и НЕ папку private.')
+    ttk.Button(frame,text='Скопировать код',command=copy).grid(row=8,column=0,sticky='ew',pady=8)
+    ttk.Label(frame,text='Key ID: '+config['key_id']+'\nЛИЧНЫЙ ИНСТРУМЕНТ РАЗРАБОТЧИКА. Не передавайте EXE вместе с ключами покупателям.').grid(row=9,column=0,sticky='ew')
+    def wrap(event):
+        for widget in frame.winfo_children():
+            if isinstance(widget,ttk.Label):widget.configure(wraplength=max(200,event.width-36))
+    frame.bind('<Configure>',wrap)
+    failures=[]
+    if smoke_report is not None:
+        def smoke():
+            try:
+                installation.set('TGREQ1|AB12-CD34-EF56|'+config['key_id']+'|ledger_plus');days.set('5')
+                token=generate();copy();assert root.clipboard_get().strip()==token
+                assert token.startswith('TG2.'+config['key_id']+'.')
+                smoke_report.write_text(json.dumps({'passed':True,'window':True,'issue':True,'clipboard':True,'frozen_exe':bool(getattr(sys,'frozen',False))}))
+            except Exception as error:
+                failures.append(str(error));smoke_report.write_text(json.dumps({'passed':False,'error':str(error)}))
+            root.destroy()
+        root.after(500,smoke)
+    root.deiconify();root.mainloop()
+    if failures:raise SystemExit(1)
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--bundle',type=Path,default=None)
+    parser.add_argument('--smoke-test',action='store_true')
+    parser.add_argument('--smoke-report',type=Path,default=Path('premium-gui-smoke.json'))
+    args=parser.parse_args()
+    if args.smoke_test:
+        report=args.smoke_report.resolve()
+        with tempfile.TemporaryDirectory(prefix='premium-gui-') as temporary:
+            home=Path(temporary);(home/'private').mkdir()
+            key=issuer.rsa.generate_private_key(public_exponent=65537,key_size=2048)
+            issuer.atomic_write(home/'private/developer_private_key.pem',key.private_bytes(issuer.serialization.Encoding.PEM,
+                issuer.serialization.PrivateFormat.PKCS8,issuer.serialization.NoEncryption()),private=True,replace=False)
+            (home/'issuer-config.json').write_text(json.dumps({'version':'4.4.1-test','key_id':issuer.fingerprint(issuer.public_bytes(key)),
+                'public_key':base64.b64encode(issuer.public_bytes(key)).decode(),'product_id':'ledger_plus'}))
+            run_gui(home,report)
+    else:
+        run_gui(args.bundle or bundle_root())
+
+if __name__=='__main__':main()
+```
+
+## tools/download_ready_apk.py
+
+```python
+#!/usr/bin/env python3
+"""Fetch the pinned PUBLIC signed APK; checksum validates the exact release bytes. No credentials."""
+import hashlib,json,re,urllib.request
+from pathlib import Path
+root=Path(__file__).resolve().parents[1]
+c=json.loads((root/'delivery/ready-apk-public.json').read_text())
+version=re.search(r'versionName = "([^"]+)"',(root/'app/build.gradle.kts').read_text())[1]
+assert c['version']==version,'Pinned APK delivery must be updated for the new app version'
+assert re.fullmatch('[a-f0-9]{64}',c['apk_sha256'])
+url=c['download_url']
+assert url.startswith('https://github.com/semmyx666/TG_Ledger/releases/download/')
+data=urllib.request.urlopen(url,timeout=180).read()
+assert hashlib.sha256(data).hexdigest()==c['apk_sha256']
+(root/'ready-delivery.apk').write_bytes(data)
+print('Pinned signed delivery APK SHA-256 verified')
+```
+
 ## tools/export_sources.py
 
 ```python
@@ -13561,6 +13828,64 @@ class ActivationTests(unittest.TestCase):
         out=self.root/'test.der';out.write_bytes(b'preserve')
         with self.assertRaises(ValueError):a.generate_keys(self.root/'new.pem',out)
         self.assertFalse((self.root/'new.pem').exists());self.assertEqual(b'preserve',out.read_bytes())
+
+if __name__=='__main__':unittest.main()
+```
+
+## tools/tests/test_standalone_issuer.py
+
+```python
+import base64,json,sys,tempfile,unittest
+from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import issue_activation_code as issuer
+import create_key_premium as app
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+
+class StandaloneIssuerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):cls.key=issuer.rsa.generate_private_key(public_exponent=65537,key_size=2048)
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='premium-ключ с пробелами-');self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);(self.root/'private').mkdir()
+        issuer.atomic_write(self.root/'private/developer_private_key.pem',self.key.private_bytes(issuer.serialization.Encoding.PEM,
+            issuer.serialization.PrivateFormat.PKCS8,issuer.serialization.NoEncryption()),private=True,replace=False)
+        self.config={'version':'test','key_id':issuer.fingerprint(issuer.public_bytes(self.key)),
+            'public_key':base64.b64encode(issuer.public_bytes(self.key)).decode(),'product_id':'ledger_plus'}
+        self.save()
+    def save(self):(self.root/'issuer-config.json').write_text(json.dumps(self.config),encoding='utf-8')
+    def decode(self,code):
+        _,kid,payload,signature=code.split('.')
+        raw=base64.urlsafe_b64decode(payload+'='*((-len(payload))%4))
+        sig=base64.urlsafe_b64decode(signature+'='*((-len(signature))%4))
+        self.key.public_key().verify(sig,raw,padding.PKCS1v15(),hashes.SHA256())
+        self.assertEqual(self.config['key_id'],kid)
+        return raw.decode().split('|')
+    def test_bare_id_requires_no_project_gradle_or_sdk(self):
+        f=self.decode(app.create_code(self.root,'ab12-cd34-ef56',5))
+        self.assertEqual('AB12-CD34-EF56',f[2]);self.assertEqual(5*86400000,int(f[5])-int(f[4]))
+    def test_complete_request_matches_app_key(self):
+        request='TGREQ1|AB12-CD34-EF56|'+self.config['key_id']+'|ledger_plus'
+        self.assertEqual('',self.decode(app.create_code(self.root,request,0))[-1])
+    def test_request_from_old_apk_is_refused(self):
+        with self.assertRaises(ValueError):app.create_code(self.root,'TGREQ1|AB12-CD34-EF56|0000000000000000|ledger_plus',5)
+    def test_wrong_product_and_invalid_id_are_refused(self):
+        for value in ['bad','TGREQ1|AB12-CD34-EF56|'+self.config['key_id']+'|other']:
+            with self.assertRaises(ValueError):app.create_code(self.root,value,5)
+    def test_mixed_owner_files_are_refused(self):
+        self.config['key_id']='0000000000000000';self.save()
+        with self.assertRaises(ValueError):app.create_code(self.root,'AB12-CD34-EF56',5)
+    def test_missing_private_file_is_not_replaced_or_regenerated(self):
+        path=self.root/'private/developer_private_key.pem';path.unlink()
+        with self.assertRaises(OSError):app.create_code(self.root,'AB12-CD34-EF56',5)
+        self.assertFalse(path.exists())
+    def test_negative_or_nonfinite_duration_is_refused(self):
+        for value in [-1,float('nan'),float('inf')]:
+            with self.assertRaises(ValueError):app.create_code(self.root,'AB12-CD34-EF56',value)
+    def test_owner_config_cannot_escape_its_folder(self):
+        self.config['private_key_file']='../other.pem';self.save()
+        with self.assertRaises(ValueError):app.create_code(self.root,'AB12-CD34-EF56',5)
 
 if __name__=='__main__':unittest.main()
 ```
@@ -14054,6 +14379,68 @@ with tempfile.TemporaryDirectory() as folder:
 }
 ```
 
+## verification/premium-exe-windows.json
+
+```json
+{
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38803830837",
+  "artifact_id": 12005851830,
+  "exe_sha256": "18b7c420c13564690e2f98b9485ef710b3eb3880dc343e3c9e9320698d85fa17",
+  "reports": {
+    "premium-exe-smoke.json": {
+      "passed": true,
+      "window": true,
+      "issue": true,
+      "clipboard": true,
+      "frozen_exe": true
+    },
+    "premium-python-smoke.json": {
+      "passed": true,
+      "window": true,
+      "issue": true,
+      "clipboard": true,
+      "frozen_exe": false
+    }
+  },
+  "production_private_key_in_ci": false
+}
+```
+
+## verification/ready-apk-4.4.1.json
+
+```json
+{
+  "alias": "tgledger-release",
+  "certificate_sha256": "CD4A1391DCE5D0F504A4CC2DC19BE836755C377BB2104C719B55376861A78B50",
+  "application_id": "com.semmyx.ledger",
+  "version": "4.4.1",
+  "version_code": 20,
+  "note": "New APK signing identity, separate from activation RSA key. Keep PKCS12 and password private for future updates.",
+  "apk_sha256": "1adb933c20c6d236a49d737deaef8eca1745fd6268f059f7300792407bf5905a",
+  "apk_bytes": 5191228,
+  "activation_key_id": "EB6E82A6AFC4EE5E",
+  "release_debuggable": false,
+  "min_sdk": 26,
+  "zip_alignment_16k_verified": true,
+  "signature_v2_verified": true,
+  "signature_v3_verified": true,
+  "actual_dex_public_key_match": true,
+  "private_key_in_apk": false
+}
+```
+
+## verification/ready-apk-smoke/android-26/ui.xml
+
+```xml
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="" resource-id="android:id/content" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="" resource-id="" class="G0.r0" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]"><node index="0" text="TG Ledger" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[64,63][398,82]" /><node index="1" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[398,48][456,96]"><node index="0" text="Skip" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[413,62][442,82]" /><node index="1" text="" resource-id="" class="android.widget.Button" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[398,52][456,92]" /></node><node index="2" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="true" long-clickable="false" password="false" selected="false" bounds="[24,96][456,748]"><node index="0" text="" resource-id="" class="android.widget.ScrollView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,96][456,748]"><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[156,269][324,437]" /><node index="1" text="Your money. Your rules." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[70,469][411,507]" /><node index="2" text="A quiet space for your finances. Made with care, for the way you live." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,523][456,575]" /></node></node><node index="3" text="S." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[228,748][253,781]" /><node index="4" text="An original finance journal" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[161,781][319,794]" /><node index="5" text="© 2026 S. · TG Ledger" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[182,794][299,808]" /><node index="6" text="1 / 4" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[226,816][255,832]" /><node index="7" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,872][456,928]"><node index="0" text="Continue" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[211,890][270,910]" /><node index="1" text="" resource-id="" class="android.widget.Button" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,872][456,928]" /></node></node></node></node></node></node></node></hierarchy>
+```
+
+## verification/ready-apk-smoke/android-36/ui.xml
+
+```xml
+<?xml version='1.0' encoding='UTF-8' standalone='yes' ?><hierarchy rotation="0"><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="0" hint=""><node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="1" hint=""><node index="0" text="" resource-id="android:id/content" class="android.widget.FrameLayout" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="1" hint=""><node index="0" text="" resource-id="" class="G0.r0" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="1" hint=""><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="0" hint=""><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[0,0][480,960]" drawing-order="0" hint=""><node index="0" text="TG Ledger" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[64,63][398,82]" drawing-order="0" hint="" /><node index="1" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[398,48][456,96]" drawing-order="0" hint=""><node index="0" text="Skip" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[412,62][442,82]" drawing-order="0" hint="" /><node index="1" text="" resource-id="" class="android.widget.Button" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[398,52][456,92]" drawing-order="0" hint="" /></node><node index="2" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="true" long-clickable="false" password="false" selected="false" bounds="[24,96][456,724]" drawing-order="0" hint=""><node index="0" text="" resource-id="" class="android.widget.ScrollView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,96][456,724]" drawing-order="0" hint=""><node index="0" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[156,257][324,425]" drawing-order="0" hint="" /><node index="1" text="Your money. Your rules." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[69,457][411,495]" drawing-order="0" hint="" /><node index="2" text="A quiet space for your finances. Made with care, for the way you live." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,511][456,563]" drawing-order="0" hint="" /></node></node><node index="3" text="S." resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[228,724][253,757]" drawing-order="0" hint="" /><node index="4" text="An original finance journal" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[168,757][312,770]" drawing-order="0" hint="" /><node index="5" text="© 2026 S. · TG Ledger" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[178,770][303,784]" drawing-order="0" hint="" /><node index="6" text="1 / 4" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[225,792][255,808]" drawing-order="0" hint="" /><node index="7" text="" resource-id="" class="android.view.View" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="true" enabled="true" focusable="true" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,848][456,904]" drawing-order="0" hint=""><node index="0" text="Continue" resource-id="" class="android.widget.TextView" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[210,866][270,886]" drawing-order="0" hint="" /><node index="1" text="" resource-id="" class="android.widget.Button" package="com.semmyx.ledger" content-desc="" checkable="false" checked="false" clickable="false" enabled="true" focusable="false" focused="false" scrollable="false" long-clickable="false" password="false" selected="false" bounds="[24,848][456,904]" drawing-order="0" hint="" /></node></node></node></node></node></node></node></hierarchy>
+```
+
 ## verification/release-4.4.0.json
 
 ```json
@@ -14151,14 +14538,141 @@ with tempfile.TemporaryDirectory() as folder:
 }
 ```
 
+## verification/release-4.4.1.json
+
+```json
+{
+  "version": "4.4.1",
+  "version_code": 20,
+  "tested_code_commit": "cf623973ac75ac491f72660685e32b20774cbf6e",
+  "apk_app_build_commit": "901b0a6",
+  "apk_application_code_unchanged_since_build": true,
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38804609923",
+  "jobs": [
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-15T20:46:12Z",
+      "completed_at": "2026-10-15T20:50:38Z"
+    },
+    {
+      "name": "activation-windows",
+      "conclusion": "success",
+      "started_at": "2026-10-15T20:46:12Z",
+      "completed_at": "2026-10-15T20:47:11Z"
+    },
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T20:46:12Z",
+      "completed_at": "2026-10-15T20:50:53Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T20:46:12Z",
+      "completed_at": "2026-10-15T20:51:03Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 12005003800,
+      "name": "device-reports-api-26",
+      "size_in_bytes": 230750
+    },
+    {
+      "id": 12006416229,
+      "name": "device-reports-api-36",
+      "size_in_bytes": 237289
+    },
+    {
+      "id": 12005488805,
+      "name": "validation-reports",
+      "size_in_bytes": 229107
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 27,
+    "data_play": 29,
+    "data_legacy_v7": 29
+  },
+  "instrumented": {
+    "api26": {
+      "app": 19,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 19,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "windows": {
+    "unit_tests": 28,
+    "failed": 0,
+    "native_gui": true,
+    "clipboard": true,
+    "frozen_exe": true,
+    "exe_artifact_provenance": "premium-exe-windows.json",
+    "production_key_used_in_ci": false
+  },
+  "ready_apk": {
+    "alias": "tgledger-release",
+    "certificate_sha256": "CD4A1391DCE5D0F504A4CC2DC19BE836755C377BB2104C719B55376861A78B50",
+    "application_id": "com.semmyx.ledger",
+    "version": "4.4.1",
+    "version_code": 20,
+    "note": "New APK signing identity, separate from activation RSA key. Keep PKCS12 and password private for future updates.",
+    "apk_sha256": "1adb933c20c6d236a49d737deaef8eca1745fd6268f059f7300792407bf5905a",
+    "apk_bytes": 5191228,
+    "activation_key_id": "EB6E82A6AFC4EE5E",
+    "release_debuggable": false,
+    "min_sdk": 26,
+    "zip_alignment_16k_verified": true,
+    "signature_v2_verified": true,
+    "signature_v3_verified": true,
+    "actual_dex_public_key_match": true,
+    "private_key_in_apk": false
+  },
+  "signed_release_startup": {
+    "api26": true,
+    "api36": true,
+    "same_delivered_apk_sha256": true,
+    "nondebuggable": true,
+    "physical_phone": false
+  },
+  "owner_bundle_signature_verified_with_packaged_public_key": true,
+  "private_keys_on_github": false,
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "user_old_private_key_accessed": false,
+  "new_owner_private_key_delivered_separately": true,
+  "packaging_changes_after_tests": "Reports, screenshots, documentation, source book/tree and manifest only; application, issuer and workflow unchanged."
+}
+```
+
 ## verification/source-audit.json
 
 ```json
 {
   "kind": "offline-structural-resource-and-sql-audit",
-  "passed_assertions": 2597,
+  "passed_assertions": 2600,
   "failures": [],
-  "kotlin_source_files": 116,
+  "kotlin_source_files": 117,
   "localized_string_pairs": 412,
   "compiled_android": false,
   "executed_android_or_junit_tests": false,
@@ -15008,833 +15522,836 @@ with tempfile.TemporaryDirectory() as folder:
     "No duplicate string: values-uk/activation_expired",
     "No duplicate string: values-uk/activation_storage",
     "English/Ukrainian key parity",
-    "Format-argument parity: help_heading",
-    "Nonempty translations: help_heading",
-    "Format-argument parity: period_month",
-    "Nonempty translations: period_month",
-    "Format-argument parity: installation_id_label",
-    "Nonempty translations: installation_id_label",
-    "Format-argument parity: activation_invalid",
-    "Nonempty translations: activation_invalid",
-    "Format-argument parity: color_background",
-    "Nonempty translations: color_background",
-    "Format-argument parity: api_sync_now",
-    "Nonempty translations: api_sync_now",
-    "Format-argument parity: billing_network",
-    "Nonempty translations: billing_network",
-    "Format-argument parity: bank_app_permissions",
-    "Nonempty translations: bank_app_permissions",
-    "Format-argument parity: assistant_write_short",
-    "Nonempty translations: assistant_write_short",
-    "Format-argument parity: activation_copy_request",
-    "Nonempty translations: activation_copy_request",
-    "Format-argument parity: chart_description",
-    "Nonempty translations: chart_description",
-    "Format-argument parity: premium_local_notice",
-    "Nonempty translations: premium_local_notice",
-    "Format-argument parity: total_balance",
-    "Nonempty translations: total_balance",
-    "Format-argument parity: load_more",
-    "Nonempty translations: load_more",
-    "Format-argument parity: cinematic_history",
-    "Nonempty translations: cinematic_history",
-    "Format-argument parity: installation_id_copied",
-    "Nonempty translations: installation_id_copied",
-    "Format-argument parity: expense",
-    "Nonempty translations: expense",
-    "Format-argument parity: privat_api_howto",
-    "Nonempty translations: privat_api_howto",
-    "Format-argument parity: fps_auto",
-    "Nonempty translations: fps_auto",
-    "Format-argument parity: bank_access_yes",
-    "Nonempty translations: bank_access_yes",
-    "Format-argument parity: mascot_card_title",
-    "Nonempty translations: mascot_card_title",
-    "Format-argument parity: api_howto",
-    "Nonempty translations: api_howto",
-    "Format-argument parity: create_pin",
-    "Nonempty translations: create_pin",
-    "Format-argument parity: onboard_title_one",
-    "Nonempty translations: onboard_title_one",
-    "Format-argument parity: onboard_body_three",
-    "Nonempty translations: onboard_body_three",
-    "Format-argument parity: activation_key_id",
-    "Nonempty translations: activation_key_id",
-    "Format-argument parity: bank_budget_progress",
-    "Nonempty translations: bank_budget_progress",
-    "Format-argument parity: import_connected",
-    "Nonempty translations: import_connected",
-    "Format-argument parity: support_intro",
-    "Nonempty translations: support_intro",
-    "Format-argument parity: copy_handle",
-    "Nonempty translations: copy_handle",
-    "Format-argument parity: cinematic_week_average",
-    "Nonempty translations: cinematic_week_average",
-    "Format-argument parity: bank_privacy",
-    "Nonempty translations: bank_privacy",
-    "Format-argument parity: reference_rates",
-    "Nonempty translations: reference_rates",
-    "Format-argument parity: voice_assistant_button",
-    "Nonempty translations: voice_assistant_button",
-    "Format-argument parity: api_token_label",
-    "Nonempty translations: api_token_label",
-    "Format-argument parity: mascot_animations",
-    "Nonempty translations: mascot_animations",
-    "Format-argument parity: color_surface",
-    "Nonempty translations: color_surface",
-    "Format-argument parity: colors_explanation",
-    "Nonempty translations: colors_explanation",
-    "Format-argument parity: cash_flow",
-    "Nonempty translations: cash_flow",
-    "Format-argument parity: cinematic_transactions",
-    "Nonempty translations: cinematic_transactions",
-    "Format-argument parity: import_to_queue",
-    "Nonempty translations: import_to_queue",
-    "Format-argument parity: assistant_send",
-    "Nonempty translations: assistant_send",
-    "Format-argument parity: premium_source_trial",
-    "Nonempty translations: premium_source_trial",
-    "Format-argument parity: trial_14",
-    "Nonempty translations: trial_14",
-    "Format-argument parity: bank_sms_no",
-    "Nonempty translations: bank_sms_no",
-    "Format-argument parity: total_all_time",
-    "Nonempty translations: total_all_time",
-    "Format-argument parity: undo_expired",
-    "Nonempty translations: undo_expired",
-    "Format-argument parity: analytics_title",
-    "Nonempty translations: analytics_title",
-    "Format-argument parity: activation_code_label",
-    "Nonempty translations: activation_code_label",
-    "Format-argument parity: erase_digit",
-    "Nonempty translations: erase_digit",
-    "Format-argument parity: category_dining",
-    "Nonempty translations: category_dining",
-    "Format-argument parity: api_imported_last",
-    "Nonempty translations: api_imported_last",
-    "Format-argument parity: category_health",
-    "Nonempty translations: category_health",
-    "Format-argument parity: help_privacy_title",
-    "Nonempty translations: help_privacy_title",
-    "Format-argument parity: help_premium_body",
-    "Nonempty translations: help_premium_body",
-    "Format-argument parity: dashboard_subtitle",
-    "Nonempty translations: dashboard_subtitle",
-    "Format-argument parity: biometric_title",
-    "Nonempty translations: biometric_title",
-    "Format-argument parity: unlock_title",
-    "Nonempty translations: unlock_title",
-    "Format-argument parity: activation_device",
-    "Nonempty translations: activation_device",
-    "Format-argument parity: positive_amount",
-    "Nonempty translations: positive_amount",
     "Format-argument parity: sms_scanning",
     "Nonempty translations: sms_scanning",
-    "Format-argument parity: activation_clock",
-    "Nonempty translations: activation_clock",
-    "Format-argument parity: display_name",
-    "Nonempty translations: display_name",
-    "Format-argument parity: help_security_title",
-    "Nonempty translations: help_security_title",
-    "Format-argument parity: done",
-    "Nonempty translations: done",
-    "Format-argument parity: load_error_title",
-    "Nonempty translations: load_error_title",
-    "Format-argument parity: bank_duplicate",
-    "Nonempty translations: bank_duplicate",
-    "Format-argument parity: discard_body",
-    "Nonempty translations: discard_body",
-    "Format-argument parity: cinematic_period",
-    "Nonempty translations: cinematic_period",
-    "Format-argument parity: diagnostics_copy",
-    "Nonempty translations: diagnostics_copy",
-    "Format-argument parity: last_30_days",
-    "Nonempty translations: last_30_days",
-    "Format-argument parity: premium_activated",
-    "Nonempty translations: premium_activated",
-    "Format-argument parity: voice_smalltalk_joke",
-    "Nonempty translations: voice_smalltalk_joke",
-    "Format-argument parity: biometric_subtitle",
-    "Nonempty translations: biometric_subtitle",
-    "Format-argument parity: here_to_help",
-    "Nonempty translations: here_to_help",
-    "Format-argument parity: import_auto_done",
-    "Nonempty translations: import_auto_done",
-    "Format-argument parity: import_repeated",
-    "Nonempty translations: import_repeated",
-    "Format-argument parity: category_transport",
-    "Nonempty translations: category_transport",
-    "Format-argument parity: currency_explanation",
-    "Nonempty translations: currency_explanation",
-    "Format-argument parity: diagnostics_hint",
-    "Nonempty translations: diagnostics_hint",
-    "Format-argument parity: color_muted",
-    "Nonempty translations: color_muted",
-    "Format-argument parity: activation_malformed",
-    "Nonempty translations: activation_malformed",
-    "Format-argument parity: support_privacy",
-    "Nonempty translations: support_privacy",
-    "Format-argument parity: bank_day",
-    "Nonempty translations: bank_day",
-    "Format-argument parity: rates_disclaimer",
-    "Nonempty translations: rates_disclaimer",
-    "Format-argument parity: import_text",
-    "Nonempty translations: import_text",
-    "Format-argument parity: category_transfer",
-    "Nonempty translations: category_transfer",
-    "Format-argument parity: search_scope",
-    "Nonempty translations: search_scope",
-    "Format-argument parity: bank_enabled",
-    "Nonempty translations: bank_enabled",
-    "Format-argument parity: app_version",
-    "Nonempty translations: app_version",
-    "Format-argument parity: activation_code_button",
-    "Nonempty translations: activation_code_button",
-    "Format-argument parity: clear_filters",
-    "Nonempty translations: clear_filters",
-    "Format-argument parity: bank_transfer_review",
-    "Nonempty translations: bank_transfer_review",
-    "Format-argument parity: bank_battery",
-    "Nonempty translations: bank_battery",
-    "Format-argument parity: rates_empty",
-    "Nonempty translations: rates_empty",
-    "Format-argument parity: import_queued",
-    "Nonempty translations: import_queued",
-    "Format-argument parity: activity",
-    "Nonempty translations: activity",
-    "Format-argument parity: import_diagnostics",
-    "Nonempty translations: import_diagnostics",
-    "Format-argument parity: back",
-    "Nonempty translations: back",
-    "Format-argument parity: cinematic_more_buckets",
-    "Nonempty translations: cinematic_more_buckets",
-    "Format-argument parity: color_accent",
-    "Nonempty translations: color_accent",
-    "Format-argument parity: handle_copied",
-    "Nonempty translations: handle_copied",
-    "Format-argument parity: onboard_body_one",
-    "Nonempty translations: onboard_body_one",
-    "Format-argument parity: premium_assistant_toggle_hint",
-    "Nonempty translations: premium_assistant_toggle_hint",
-    "Format-argument parity: bank_category_stats",
-    "Nonempty translations: bank_category_stats",
-    "Format-argument parity: color_saturation",
-    "Nonempty translations: color_saturation",
-    "Format-argument parity: premium_source_developer",
-    "Nonempty translations: premium_source_developer",
-    "Format-argument parity: default_currency",
-    "Nonempty translations: default_currency",
-    "Format-argument parity: lock_now",
-    "Nonempty translations: lock_now",
-    "Format-argument parity: import_counts",
-    "Nonempty translations: import_counts",
-    "Format-argument parity: discard",
-    "Nonempty translations: discard",
-    "Format-argument parity: legend_income",
-    "Nonempty translations: legend_income",
-    "Format-argument parity: cinematic_expenses_period",
-    "Nonempty translations: cinematic_expenses_period",
-    "Format-argument parity: import_queue_note",
-    "Nonempty translations: import_queue_note",
-    "Format-argument parity: diagnostics_copied",
-    "Nonempty translations: diagnostics_copied",
-    "Format-argument parity: voice_permission_denied",
-    "Nonempty translations: voice_permission_denied",
-    "Format-argument parity: voice_smalltalk_compliment",
-    "Nonempty translations: voice_smalltalk_compliment",
-    "Format-argument parity: help_security_body",
-    "Nonempty translations: help_security_body",
-    "Format-argument parity: add_entry",
-    "Nonempty translations: add_entry",
-    "Format-argument parity: premium_feature_mascot",
-    "Nonempty translations: premium_feature_mascot",
-    "Format-argument parity: premium_feature_trends",
-    "Nonempty translations: premium_feature_trends",
-    "Format-argument parity: voice_smalltalk_who_are_you",
-    "Nonempty translations: voice_smalltalk_who_are_you",
-    "Format-argument parity: cinematic_income_categories",
-    "Nonempty translations: cinematic_income_categories",
-    "Format-argument parity: name_invalid",
-    "Nonempty translations: name_invalid",
-    "Format-argument parity: colors_reset_all",
-    "Nonempty translations: colors_reset_all",
-    "Format-argument parity: help_banks_title",
-    "Nonempty translations: help_banks_title",
-    "Format-argument parity: get_started",
-    "Nonempty translations: get_started",
-    "Format-argument parity: cinematic_tooltip",
-    "Nonempty translations: cinematic_tooltip",
-    "Format-argument parity: voice_reply_not_understood",
-    "Nonempty translations: voice_reply_not_understood",
-    "Format-argument parity: voice_reply_balance",
-    "Nonempty translations: voice_reply_balance",
-    "Format-argument parity: activation_product",
-    "Nonempty translations: activation_product",
-    "Format-argument parity: sms_scan",
-    "Nonempty translations: sms_scan",
-    "Format-argument parity: push_howto",
-    "Nonempty translations: push_howto",
-    "Format-argument parity: pin_incorrect",
-    "Nonempty translations: pin_incorrect",
-    "Format-argument parity: unlock_biometric",
-    "Nonempty translations: unlock_biometric",
-    "Format-argument parity: major_release_body",
-    "Nonempty translations: major_release_body",
-    "Format-argument parity: entry_currency_notice",
-    "Nonempty translations: entry_currency_notice",
-    "Format-argument parity: entry_not_found",
-    "Nonempty translations: entry_not_found",
-    "Format-argument parity: bank_cash",
-    "Nonempty translations: bank_cash",
-    "Format-argument parity: voice_entry_added",
-    "Nonempty translations: voice_entry_added",
-    "Format-argument parity: reference_total_for",
-    "Nonempty translations: reference_total_for",
-    "Format-argument parity: restore_purchases",
-    "Nonempty translations: restore_purchases",
-    "Format-argument parity: help",
-    "Nonempty translations: help",
-    "Format-argument parity: note_optional",
-    "Nonempty translations: note_optional",
-    "Format-argument parity: fps_value",
-    "Nonempty translations: fps_value",
-    "Format-argument parity: activation_signature",
-    "Nonempty translations: activation_signature",
-    "Format-argument parity: activation_not_configured",
-    "Nonempty translations: activation_not_configured",
-    "Format-argument parity: cinematic_month_average",
-    "Nonempty translations: cinematic_month_average",
-    "Format-argument parity: fps_title",
-    "Nonempty translations: fps_title",
-    "Format-argument parity: bank_play_sms",
-    "Nonempty translations: bank_play_sms",
-    "Format-argument parity: colors_title",
-    "Nonempty translations: colors_title",
-    "Format-argument parity: category_other",
-    "Nonempty translations: category_other",
-    "Format-argument parity: import_empty",
-    "Nonempty translations: import_empty",
-    "Format-argument parity: last_30_days_plus",
-    "Nonempty translations: last_30_days_plus",
-    "Format-argument parity: voice_reply_opening_entry",
-    "Nonempty translations: voice_reply_opening_entry",
-    "Format-argument parity: bank_privacy_body",
-    "Nonempty translations: bank_privacy_body",
-    "Format-argument parity: import_waiting",
-    "Nonempty translations: import_waiting",
-    "Format-argument parity: save_entry",
-    "Nonempty translations: save_entry",
-    "Format-argument parity: bank_ignore",
-    "Nonempty translations: bank_ignore",
-    "Format-argument parity: brand_intro_body",
-    "Nonempty translations: brand_intro_body",
-    "Format-argument parity: bank_notification_permission",
-    "Nonempty translations: bank_notification_permission",
-    "Format-argument parity: category_empty",
-    "Nonempty translations: category_empty",
-    "Format-argument parity: category_cashback",
-    "Nonempty translations: category_cashback",
-    "Format-argument parity: telegram_support",
-    "Nonempty translations: telegram_support",
-    "Format-argument parity: biometric_unavailable",
-    "Nonempty translations: biometric_unavailable",
-    "Format-argument parity: edit_entry",
-    "Nonempty translations: edit_entry",
-    "Format-argument parity: mascot_hear_again",
-    "Nonempty translations: mascot_hear_again",
-    "Format-argument parity: rate_offline",
-    "Nonempty translations: rate_offline",
-    "Format-argument parity: api_last_sync",
-    "Nonempty translations: api_last_sync",
-    "Format-argument parity: assistant_text_hint",
-    "Nonempty translations: assistant_text_hint",
-    "Format-argument parity: activation_code_hint",
-    "Nonempty translations: activation_code_hint",
-    "Format-argument parity: amount_invalid",
-    "Nonempty translations: amount_invalid",
-    "Format-argument parity: categories",
-    "Nonempty translations: categories",
-    "Format-argument parity: add_first_entry",
-    "Nonempty translations: add_first_entry",
-    "Format-argument parity: other_api_note",
-    "Nonempty translations: other_api_note",
-    "Format-argument parity: voice_smalltalk_how_are_you",
-    "Nonempty translations: voice_smalltalk_how_are_you",
-    "Format-argument parity: help_intro",
-    "Nonempty translations: help_intro",
-    "Format-argument parity: bank_month",
-    "Nonempty translations: bank_month",
-    "Format-argument parity: last_7_days",
-    "Nonempty translations: last_7_days",
-    "Format-argument parity: support_network_error",
-    "Nonempty translations: support_network_error",
-    "Format-argument parity: close",
-    "Nonempty translations: close",
-    "Format-argument parity: amount",
-    "Nonempty translations: amount",
-    "Format-argument parity: color_text",
-    "Nonempty translations: color_text",
-    "Format-argument parity: voice_statistics",
-    "Nonempty translations: voice_statistics",
-    "Format-argument parity: greeting",
-    "Nonempty translations: greeting",
-    "Format-argument parity: language",
-    "Nonempty translations: language",
-    "Format-argument parity: activation_key_mismatch",
-    "Nonempty translations: activation_key_mismatch",
-    "Format-argument parity: bank_sms_permission",
-    "Nonempty translations: bank_sms_permission",
-    "Format-argument parity: import_reconnect",
-    "Nonempty translations: import_reconnect",
-    "Format-argument parity: bank_review_count",
-    "Nonempty translations: bank_review_count",
-    "Format-argument parity: import_manual_privacy",
-    "Nonempty translations: import_manual_privacy",
-    "Format-argument parity: help_privacy_body",
-    "Nonempty translations: help_privacy_body",
-    "Format-argument parity: fps_supported",
-    "Nonempty translations: fps_supported",
-    "Format-argument parity: bank_dashboard",
-    "Nonempty translations: bank_dashboard",
-    "Format-argument parity: billing_configuration",
-    "Nonempty translations: billing_configuration",
-    "Format-argument parity: premium_feature_support",
-    "Nonempty translations: premium_feature_support",
-    "Format-argument parity: premium_expires",
-    "Nonempty translations: premium_expires",
-    "Format-argument parity: page_of",
-    "Nonempty translations: page_of",
-    "Format-argument parity: currency_scope",
-    "Nonempty translations: currency_scope",
-    "Format-argument parity: colors_categories",
-    "Nonempty translations: colors_categories",
-    "Format-argument parity: api_connect",
-    "Nonempty translations: api_connect",
-    "Format-argument parity: bank_consent",
-    "Nonempty translations: bank_consent",
-    "Format-argument parity: biometric_explanation",
-    "Nonempty translations: biometric_explanation",
-    "Format-argument parity: support",
-    "Nonempty translations: support",
-    "Format-argument parity: mascot_gray",
-    "Nonempty translations: mascot_gray",
-    "Format-argument parity: lead_developer",
-    "Nonempty translations: lead_developer",
-    "Format-argument parity: installation_id_copy",
-    "Nonempty translations: installation_id_copy",
-    "Format-argument parity: colors_collapse",
-    "Nonempty translations: colors_collapse",
-    "Format-argument parity: color_apply",
-    "Nonempty translations: color_apply",
-    "Format-argument parity: import_confirm_enabled",
-    "Nonempty translations: import_confirm_enabled",
-    "Format-argument parity: import_unrecognized",
-    "Nonempty translations: import_unrecognized",
-    "Format-argument parity: premium_buy",
-    "Nonempty translations: premium_buy",
-    "Format-argument parity: major_release_title",
-    "Nonempty translations: major_release_title",
-    "Format-argument parity: keep_editing",
-    "Nonempty translations: keep_editing",
-    "Format-argument parity: billing_unavailable",
-    "Nonempty translations: billing_unavailable",
-    "Format-argument parity: need_help",
-    "Nonempty translations: need_help",
-    "Format-argument parity: premium_active",
-    "Nonempty translations: premium_active",
-    "Format-argument parity: profile",
-    "Nonempty translations: profile",
-    "Format-argument parity: color_chart_top",
-    "Nonempty translations: color_chart_top",
-    "Format-argument parity: security",
-    "Nonempty translations: security",
-    "Format-argument parity: period_year",
-    "Nonempty translations: period_year",
-    "Format-argument parity: onboard_title_three",
-    "Nonempty translations: onboard_title_three",
-    "Format-argument parity: help_entries_body",
-    "Nonempty translations: help_entries_body",
-    "Format-argument parity: bank_import_title",
-    "Nonempty translations: bank_import_title",
-    "Format-argument parity: color_error",
-    "Nonempty translations: color_error",
-    "Format-argument parity: developer_purchase_button",
-    "Nonempty translations: developer_purchase_button",
-    "Format-argument parity: billing_acknowledgement",
-    "Nonempty translations: billing_acknowledgement",
-    "Format-argument parity: bank_access_no",
-    "Nonempty translations: bank_access_no",
-    "Format-argument parity: import_disconnected",
-    "Nonempty translations: import_disconnected",
-    "Format-argument parity: voice_smalltalk_thanks",
-    "Nonempty translations: voice_smalltalk_thanks",
-    "Format-argument parity: onboard_body_two",
-    "Nonempty translations: onboard_body_two",
-    "Format-argument parity: overview",
-    "Nonempty translations: overview",
-    "Format-argument parity: bank_new_category",
-    "Nonempty translations: bank_new_category",
-    "Format-argument parity: activation_request_copied",
-    "Nonempty translations: activation_request_copied",
-    "Format-argument parity: brand_intro_title",
-    "Nonempty translations: brand_intro_title",
-    "Format-argument parity: cat_asset_status",
-    "Nonempty translations: cat_asset_status",
-    "Format-argument parity: api_connecting",
-    "Nonempty translations: api_connecting",
-    "Format-argument parity: privat_api_error",
-    "Nonempty translations: privat_api_error",
-    "Format-argument parity: import_package_settings",
-    "Nonempty translations: import_package_settings",
-    "Format-argument parity: import_group",
-    "Nonempty translations: import_group",
-    "Format-argument parity: voice_assistant_hint",
-    "Nonempty translations: voice_assistant_hint",
-    "Format-argument parity: developer_purchase_body",
-    "Nonempty translations: developer_purchase_body",
-    "Format-argument parity: bank_clear_warning",
-    "Nonempty translations: bank_clear_warning",
-    "Format-argument parity: cinematic_more_than_previous",
-    "Nonempty translations: cinematic_more_than_previous",
-    "Format-argument parity: billing_verification",
-    "Nonempty translations: billing_verification",
-    "Format-argument parity: empty_ledger_title",
-    "Nonempty translations: empty_ledger_title",
-    "Format-argument parity: pin_digit_count",
-    "Nonempty translations: pin_digit_count",
-    "Format-argument parity: delete_named_entry",
-    "Nonempty translations: delete_named_entry",
-    "Format-argument parity: bank_recent",
-    "Nonempty translations: bank_recent",
-    "Format-argument parity: auto_lock_explanation",
-    "Nonempty translations: auto_lock_explanation",
-    "Format-argument parity: cinematic_less_than_previous",
-    "Nonempty translations: cinematic_less_than_previous",
-    "Format-argument parity: language_instant",
-    "Nonempty translations: language_instant",
-    "Format-argument parity: sms_restricted_tip",
-    "Nonempty translations: sms_restricted_tip",
-    "Format-argument parity: all_categories",
-    "Nonempty translations: all_categories",
-    "Format-argument parity: import_disabled",
-    "Nonempty translations: import_disabled",
-    "Format-argument parity: bank_unknown",
-    "Nonempty translations: bank_unknown",
-    "Format-argument parity: trial_explanation",
-    "Nonempty translations: trial_explanation",
-    "Format-argument parity: bank_time_received",
-    "Nonempty translations: bank_time_received",
-    "Format-argument parity: all_time",
-    "Nonempty translations: all_time",
-    "Format-argument parity: cinematic_chart_accessibility",
-    "Nonempty translations: cinematic_chart_accessibility",
-    "Format-argument parity: help_entries_title",
-    "Nonempty translations: help_entries_title",
-    "Format-argument parity: biometric_failed",
-    "Nonempty translations: biometric_failed",
-    "Format-argument parity: theme_system",
-    "Nonempty translations: theme_system",
-    "Format-argument parity: undo",
-    "Nonempty translations: undo",
-    "Format-argument parity: developer_purchase_note",
-    "Nonempty translations: developer_purchase_note",
-    "Format-argument parity: import_package_warning",
-    "Nonempty translations: import_package_warning",
-    "Format-argument parity: skip",
-    "Nonempty translations: skip",
-    "Format-argument parity: entry_title",
-    "Nonempty translations: entry_title",
-    "Format-argument parity: bank_budget",
-    "Nonempty translations: bank_budget",
-    "Format-argument parity: import_unsupported",
-    "Nonempty translations: import_unsupported",
-    "Format-argument parity: storage_error",
-    "Nonempty translations: storage_error",
-    "Format-argument parity: diagnostics_clear",
-    "Nonempty translations: diagnostics_clear",
-    "Format-argument parity: voice_ask_source",
-    "Nonempty translations: voice_ask_source",
-    "Format-argument parity: bank_week",
-    "Nonempty translations: bank_week",
-    "Format-argument parity: api_connected",
-    "Nonempty translations: api_connected",
-    "Format-argument parity: app_name",
-    "Nonempty translations: app_name",
-    "Format-argument parity: category_salary",
-    "Nonempty translations: category_salary",
-    "Format-argument parity: colors_edit",
-    "Nonempty translations: colors_edit",
-    "Format-argument parity: help_banks_body",
-    "Nonempty translations: help_banks_body",
-    "Format-argument parity: chart_empty",
-    "Nonempty translations: chart_empty",
-    "Format-argument parity: language_en",
-    "Nonempty translations: language_en",
-    "Format-argument parity: period_today",
-    "Nonempty translations: period_today",
-    "Format-argument parity: premium_source_play",
-    "Nonempty translations: premium_source_play",
-    "Format-argument parity: expenses",
-    "Nonempty translations: expenses",
-    "Format-argument parity: income",
-    "Nonempty translations: income",
-    "Format-argument parity: start_over",
-    "Nonempty translations: start_over",
-    "Format-argument parity: title_optional_hint",
-    "Nonempty translations: title_optional_hint",
-    "Format-argument parity: bank_auto",
-    "Nonempty translations: bank_auto",
-    "Format-argument parity: total_thirty_days",
-    "Nonempty translations: total_thirty_days",
-    "Format-argument parity: privat_api_connected",
-    "Nonempty translations: privat_api_connected",
-    "Format-argument parity: premium_offline_notice",
-    "Nonempty translations: premium_offline_notice",
-    "Format-argument parity: bank_card",
-    "Nonempty translations: bank_card",
-    "Format-argument parity: api_error_bad_token",
-    "Nonempty translations: api_error_bad_token",
-    "Format-argument parity: diagnostics_close",
-    "Nonempty translations: diagnostics_close",
-    "Format-argument parity: voice_recognizer_unavailable",
-    "Nonempty translations: voice_recognizer_unavailable",
-    "Format-argument parity: category",
-    "Nonempty translations: category",
-    "Format-argument parity: voice_assistant_listening",
-    "Nonempty translations: voice_assistant_listening",
-    "Format-argument parity: title_invalid",
-    "Nonempty translations: title_invalid",
-    "Format-argument parity: settings",
-    "Nonempty translations: settings",
-    "Format-argument parity: rates_as_of",
-    "Nonempty translations: rates_as_of",
-    "Format-argument parity: api_syncing",
-    "Nonempty translations: api_syncing",
-    "Format-argument parity: pin_recovery_notice",
-    "Nonempty translations: pin_recovery_notice",
-    "Format-argument parity: use_pin",
-    "Nonempty translations: use_pin",
-    "Format-argument parity: voice_reply_spent_today",
-    "Nonempty translations: voice_reply_spent_today",
-    "Format-argument parity: refreshing",
-    "Nonempty translations: refreshing",
-    "Format-argument parity: search_entries",
-    "Nonempty translations: search_entries",
-    "Format-argument parity: category_food",
-    "Nonempty translations: category_food",
-    "Format-argument parity: bank_source",
-    "Nonempty translations: bank_source",
-    "Format-argument parity: contact_telegram",
-    "Nonempty translations: contact_telegram",
-    "Format-argument parity: refresh_rates",
-    "Nonempty translations: refresh_rates",
-    "Format-argument parity: api_error_no_accounts",
-    "Nonempty translations: api_error_no_accounts",
-    "Format-argument parity: save_profile",
-    "Nonempty translations: save_profile",
-    "Format-argument parity: billing_activation_code",
-    "Nonempty translations: billing_activation_code",
-    "Format-argument parity: import_mode_title",
-    "Nonempty translations: import_mode_title",
-    "Format-argument parity: next",
-    "Nonempty translations: next",
-    "Format-argument parity: theme_dark",
-    "Nonempty translations: theme_dark",
-    "Format-argument parity: api_error_rate",
-    "Nonempty translations: api_error_rate",
-    "Format-argument parity: local_profile",
-    "Nonempty translations: local_profile",
-    "Format-argument parity: privat_api_token",
-    "Nonempty translations: privat_api_token",
-    "Format-argument parity: color_icons",
-    "Nonempty translations: color_icons",
-    "Format-argument parity: activation_checking",
-    "Nonempty translations: activation_checking",
-    "Format-argument parity: bank_export",
-    "Nonempty translations: bank_export",
-    "Format-argument parity: saved",
-    "Nonempty translations: saved",
-    "Format-argument parity: import_confirm_permission",
-    "Nonempty translations: import_confirm_permission",
-    "Format-argument parity: help_premium_title",
-    "Nonempty translations: help_premium_title",
-    "Format-argument parity: api_error_network",
-    "Nonempty translations: api_error_network",
-    "Format-argument parity: onboard_title_two",
-    "Nonempty translations: onboard_title_two",
-    "Format-argument parity: language_uk",
-    "Nonempty translations: language_uk",
-    "Format-argument parity: confirm_pin",
-    "Nonempty translations: confirm_pin",
-    "Format-argument parity: color_chart_bottom",
-    "Nonempty translations: color_chart_bottom",
-    "Format-argument parity: brand_design_label",
-    "Nonempty translations: brand_design_label",
-    "Format-argument parity: color_contrast_warning",
-    "Nonempty translations: color_contrast_warning",
-    "Format-argument parity: api_open_site",
-    "Nonempty translations: api_open_site",
-    "Format-argument parity: pin_mismatch",
-    "Nonempty translations: pin_mismatch",
-    "Format-argument parity: discard_title",
-    "Nonempty translations: discard_title",
-    "Format-argument parity: no_matches_body",
-    "Nonempty translations: no_matches_body",
-    "Format-argument parity: brand_copyright",
-    "Nonempty translations: brand_copyright",
-    "Format-argument parity: cat_tap_hint",
-    "Nonempty translations: cat_tap_hint",
-    "Format-argument parity: title_hint",
-    "Nonempty translations: title_hint",
-    "Format-argument parity: color_hue",
-    "Nonempty translations: color_hue",
-    "Format-argument parity: bank_budget_disable",
-    "Nonempty translations: bank_budget_disable",
-    "Format-argument parity: category_home",
-    "Nonempty translations: category_home",
-    "Format-argument parity: premium_assistant_toggle",
-    "Nonempty translations: premium_assistant_toggle",
-    "Format-argument parity: cinematic_expense_categories",
-    "Nonempty translations: cinematic_expense_categories",
-    "Format-argument parity: import_paste",
-    "Nonempty translations: import_paste",
-    "Format-argument parity: all",
-    "Nonempty translations: all",
-    "Format-argument parity: negative_amount",
-    "Nonempty translations: negative_amount",
-    "Format-argument parity: color_invalid",
-    "Nonempty translations: color_invalid",
-    "Format-argument parity: fps_explanation",
-    "Nonempty translations: fps_explanation",
-    "Format-argument parity: import_mode_api",
-    "Nonempty translations: import_mode_api",
-    "Format-argument parity: retry",
-    "Nonempty translations: retry",
-    "Format-argument parity: cat_locked_hint",
-    "Nonempty translations: cat_locked_hint",
-    "Format-argument parity: mascot_premium_note",
-    "Nonempty translations: mascot_premium_note",
-    "Format-argument parity: character_count",
-    "Nonempty translations: character_count",
-    "Format-argument parity: voice_smalltalk_bye",
-    "Nonempty translations: voice_smalltalk_bye",
-    "Format-argument parity: theme_light",
-    "Nonempty translations: theme_light",
-    "Format-argument parity: pay_source_required",
-    "Nonempty translations: pay_source_required",
-    "Format-argument parity: cinematic_apply",
-    "Nonempty translations: cinematic_apply",
-    "Format-argument parity: empty_ledger_body",
-    "Nonempty translations: empty_ledger_body",
-    "Format-argument parity: color_brightness",
-    "Nonempty translations: color_brightness",
-    "Format-argument parity: privat_api_title",
-    "Nonempty translations: privat_api_title",
-    "Format-argument parity: cinematic_comparison",
-    "Nonempty translations: cinematic_comparison",
-    "Format-argument parity: cinematic_more",
-    "Nonempty translations: cinematic_more",
-    "Format-argument parity: rate_value",
-    "Nonempty translations: rate_value",
-    "Format-argument parity: entry_deleted",
-    "Nonempty translations: entry_deleted",
-    "Format-argument parity: sms_scan_result",
-    "Nonempty translations: sms_scan_result",
-    "Format-argument parity: pin_setup_subtitle",
-    "Nonempty translations: pin_setup_subtitle",
-    "Format-argument parity: diagnostics_title",
-    "Nonempty translations: diagnostics_title",
-    "Format-argument parity: bank_clear_history",
-    "Nonempty translations: bank_clear_history",
     "Format-argument parity: pin_locked",
     "Nonempty translations: pin_locked",
-    "Format-argument parity: brand_author_signature",
-    "Nonempty translations: brand_author_signature",
-    "Format-argument parity: developer_purchase_title",
-    "Nonempty translations: developer_purchase_title",
-    "Format-argument parity: bank_limit_recent",
-    "Nonempty translations: bank_limit_recent",
-    "Format-argument parity: fps_fallback",
-    "Nonempty translations: fps_fallback",
-    "Format-argument parity: cancel",
-    "Nonempty translations: cancel",
-    "Format-argument parity: mascot_sky",
-    "Nonempty translations: mascot_sky",
-    "Format-argument parity: category_leisure",
-    "Nonempty translations: category_leisure",
-    "Format-argument parity: premium_body",
-    "Nonempty translations: premium_body",
-    "Format-argument parity: developer_purchase_banner",
-    "Nonempty translations: developer_purchase_banner",
-    "Format-argument parity: bank_setup",
-    "Nonempty translations: bank_setup",
-    "Format-argument parity: activation_expired",
-    "Nonempty translations: activation_expired",
-    "Format-argument parity: dashboard_heading",
-    "Nonempty translations: dashboard_heading",
-    "Format-argument parity: billing_pending",
-    "Nonempty translations: billing_pending",
-    "Format-argument parity: no_matches",
-    "Nonempty translations: no_matches",
-    "Format-argument parity: privat_api_site",
-    "Nonempty translations: privat_api_site",
-    "Format-argument parity: bank_sms_yes",
-    "Nonempty translations: bank_sms_yes",
-    "Format-argument parity: category_transaction_count",
-    "Nonempty translations: category_transaction_count",
-    "Format-argument parity: delete_entry",
-    "Nonempty translations: delete_entry",
-    "Format-argument parity: support_handle",
-    "Nonempty translations: support_handle",
-    "Format-argument parity: pin_unlock_subtitle",
-    "Nonempty translations: pin_unlock_subtitle",
-    "Format-argument parity: sms_howto",
-    "Nonempty translations: sms_howto",
-    "Format-argument parity: import_mode_notify",
-    "Nonempty translations: import_mode_notify",
-    "Format-argument parity: premium_unlock",
-    "Nonempty translations: premium_unlock",
-    "Format-argument parity: color_reset",
-    "Nonempty translations: color_reset",
-    "Format-argument parity: voice_smalltalk_greeting",
-    "Nonempty translations: voice_smalltalk_greeting",
-    "Format-argument parity: color_grid",
-    "Nonempty translations: color_grid",
-    "Format-argument parity: mascot_style",
-    "Nonempty translations: mascot_style",
-    "Format-argument parity: clear_search",
-    "Nonempty translations: clear_search",
-    "Format-argument parity: biometric_unlock",
-    "Nonempty translations: biometric_unlock",
-    "Format-argument parity: total_seven_days",
-    "Nonempty translations: total_seven_days",
+    "Format-argument parity: help_banks_body",
+    "Nonempty translations: help_banks_body",
+    "Format-argument parity: voice_statistics",
+    "Nonempty translations: voice_statistics",
+    "Format-argument parity: voice_smalltalk_who_are_you",
+    "Nonempty translations: voice_smalltalk_who_are_you",
+    "Format-argument parity: theme_light",
+    "Nonempty translations: theme_light",
+    "Format-argument parity: load_error_title",
+    "Nonempty translations: load_error_title",
+    "Format-argument parity: color_invalid",
+    "Nonempty translations: color_invalid",
+    "Format-argument parity: category_salary",
+    "Nonempty translations: category_salary",
+    "Format-argument parity: trial_14",
+    "Nonempty translations: trial_14",
+    "Format-argument parity: billing_verification",
+    "Nonempty translations: billing_verification",
+    "Format-argument parity: pin_mismatch",
+    "Nonempty translations: pin_mismatch",
     "Format-argument parity: diagnostics_show_button",
     "Nonempty translations: diagnostics_show_button",
-    "Format-argument parity: security_error",
-    "Nonempty translations: security_error",
+    "Format-argument parity: voice_smalltalk_bye",
+    "Nonempty translations: voice_smalltalk_bye",
+    "Format-argument parity: bank_sms_yes",
+    "Nonempty translations: bank_sms_yes",
+    "Format-argument parity: voice_assistant_hint",
+    "Nonempty translations: voice_assistant_hint",
+    "Format-argument parity: last_7_days",
+    "Nonempty translations: last_7_days",
+    "Format-argument parity: color_surface",
+    "Nonempty translations: color_surface",
+    "Format-argument parity: bank_time_received",
+    "Nonempty translations: bank_time_received",
+    "Format-argument parity: privat_api_connected",
+    "Nonempty translations: privat_api_connected",
+    "Format-argument parity: activation_device",
+    "Nonempty translations: activation_device",
+    "Format-argument parity: voice_permission_denied",
+    "Nonempty translations: voice_permission_denied",
+    "Format-argument parity: mascot_sky",
+    "Nonempty translations: mascot_sky",
+    "Format-argument parity: import_queue_note",
+    "Nonempty translations: import_queue_note",
+    "Format-argument parity: here_to_help",
+    "Nonempty translations: here_to_help",
+    "Format-argument parity: theme_dark",
+    "Nonempty translations: theme_dark",
+    "Format-argument parity: api_sync_now",
+    "Nonempty translations: api_sync_now",
+    "Format-argument parity: import_manual_privacy",
+    "Nonempty translations: import_manual_privacy",
+    "Format-argument parity: cinematic_less_than_previous",
+    "Nonempty translations: cinematic_less_than_previous",
+    "Format-argument parity: delete_entry",
+    "Nonempty translations: delete_entry",
+    "Format-argument parity: help_privacy_title",
+    "Nonempty translations: help_privacy_title",
+    "Format-argument parity: bank_privacy",
+    "Nonempty translations: bank_privacy",
+    "Format-argument parity: voice_smalltalk_compliment",
+    "Nonempty translations: voice_smalltalk_compliment",
+    "Format-argument parity: trial_explanation",
+    "Nonempty translations: trial_explanation",
+    "Format-argument parity: last_30_days_plus",
+    "Nonempty translations: last_30_days_plus",
+    "Format-argument parity: cinematic_more",
+    "Nonempty translations: cinematic_more",
+    "Format-argument parity: colors_reset_all",
+    "Nonempty translations: colors_reset_all",
+    "Format-argument parity: cinematic_period",
+    "Nonempty translations: cinematic_period",
+    "Format-argument parity: cash_flow",
+    "Nonempty translations: cash_flow",
+    "Format-argument parity: total_seven_days",
+    "Nonempty translations: total_seven_days",
+    "Format-argument parity: push_howto",
+    "Nonempty translations: push_howto",
+    "Format-argument parity: dashboard_subtitle",
+    "Nonempty translations: dashboard_subtitle",
+    "Format-argument parity: premium_source_trial",
+    "Nonempty translations: premium_source_trial",
+    "Format-argument parity: bank_clear_warning",
+    "Nonempty translations: bank_clear_warning",
+    "Format-argument parity: bank_import_title",
+    "Nonempty translations: bank_import_title",
+    "Format-argument parity: search_scope",
+    "Nonempty translations: search_scope",
+    "Format-argument parity: cinematic_expenses_period",
+    "Nonempty translations: cinematic_expenses_period",
+    "Format-argument parity: bank_limit_recent",
+    "Nonempty translations: bank_limit_recent",
+    "Format-argument parity: cinematic_transactions",
+    "Nonempty translations: cinematic_transactions",
+    "Format-argument parity: refresh_rates",
+    "Nonempty translations: refresh_rates",
+    "Format-argument parity: bank_review_count",
+    "Nonempty translations: bank_review_count",
+    "Format-argument parity: category",
+    "Nonempty translations: category",
+    "Format-argument parity: color_accent",
+    "Nonempty translations: color_accent",
+    "Format-argument parity: premium_feature_mascot",
+    "Nonempty translations: premium_feature_mascot",
+    "Format-argument parity: category_empty",
+    "Nonempty translations: category_empty",
+    "Format-argument parity: bank_unknown",
+    "Nonempty translations: bank_unknown",
+    "Format-argument parity: bank_privacy_body",
+    "Nonempty translations: bank_privacy_body",
+    "Format-argument parity: import_group",
+    "Nonempty translations: import_group",
+    "Format-argument parity: category_transfer",
+    "Nonempty translations: category_transfer",
+    "Format-argument parity: chart_description",
+    "Nonempty translations: chart_description",
+    "Format-argument parity: cinematic_expense_categories",
+    "Nonempty translations: cinematic_expense_categories",
+    "Format-argument parity: mascot_card_title",
+    "Nonempty translations: mascot_card_title",
+    "Format-argument parity: premium_offline_notice",
+    "Nonempty translations: premium_offline_notice",
     "Format-argument parity: history_search",
     "Nonempty translations: history_search",
-    "Format-argument parity: diagnostics_none",
-    "Nonempty translations: diagnostics_none",
-    "Format-argument parity: pay_source_title",
-    "Nonempty translations: pay_source_title",
-    "Format-argument parity: activation_storage",
-    "Nonempty translations: activation_storage",
-    "Format-argument parity: legend_expense",
-    "Nonempty translations: legend_expense",
-    "Format-argument parity: premium_name",
-    "Nonempty translations: premium_name",
+    "Format-argument parity: cat_tap_hint",
+    "Nonempty translations: cat_tap_hint",
+    "Format-argument parity: activation_checking",
+    "Nonempty translations: activation_checking",
+    "Format-argument parity: refreshing",
+    "Nonempty translations: refreshing",
+    "Format-argument parity: mascot_gray",
+    "Nonempty translations: mascot_gray",
+    "Format-argument parity: activation_expired",
+    "Nonempty translations: activation_expired",
+    "Format-argument parity: analytics_title",
+    "Nonempty translations: analytics_title",
+    "Format-argument parity: help_banks_title",
+    "Nonempty translations: help_banks_title",
+    "Format-argument parity: installation_id_label",
+    "Nonempty translations: installation_id_label",
+    "Format-argument parity: pin_digit_count",
+    "Nonempty translations: pin_digit_count",
+    "Format-argument parity: pin_unlock_subtitle",
+    "Nonempty translations: pin_unlock_subtitle",
+    "Format-argument parity: voice_recognizer_unavailable",
+    "Nonempty translations: voice_recognizer_unavailable",
+    "Format-argument parity: fps_supported",
+    "Nonempty translations: fps_supported",
+    "Format-argument parity: rates_empty",
+    "Nonempty translations: rates_empty",
+    "Format-argument parity: lead_developer",
+    "Nonempty translations: lead_developer",
+    "Format-argument parity: import_disconnected",
+    "Nonempty translations: import_disconnected",
+    "Format-argument parity: import_confirm_permission",
+    "Nonempty translations: import_confirm_permission",
+    "Format-argument parity: language",
+    "Nonempty translations: language",
+    "Format-argument parity: page_of",
+    "Nonempty translations: page_of",
+    "Format-argument parity: period_year",
+    "Nonempty translations: period_year",
+    "Format-argument parity: brand_intro_body",
+    "Nonempty translations: brand_intro_body",
+    "Format-argument parity: erase_digit",
+    "Nonempty translations: erase_digit",
+    "Format-argument parity: billing_activation_code",
+    "Nonempty translations: billing_activation_code",
+    "Format-argument parity: assistant_send",
+    "Nonempty translations: assistant_send",
+    "Format-argument parity: import_connected",
+    "Nonempty translations: import_connected",
+    "Format-argument parity: cat_asset_status",
+    "Nonempty translations: cat_asset_status",
+    "Format-argument parity: fps_auto",
+    "Nonempty translations: fps_auto",
+    "Format-argument parity: entry_deleted",
+    "Nonempty translations: entry_deleted",
+    "Format-argument parity: skip",
+    "Nonempty translations: skip",
+    "Format-argument parity: category_health",
+    "Nonempty translations: category_health",
+    "Format-argument parity: rates_as_of",
+    "Nonempty translations: rates_as_of",
+    "Format-argument parity: billing_unavailable",
+    "Nonempty translations: billing_unavailable",
+    "Format-argument parity: import_paste",
+    "Nonempty translations: import_paste",
+    "Format-argument parity: help",
+    "Nonempty translations: help",
+    "Format-argument parity: voice_assistant_listening",
+    "Nonempty translations: voice_assistant_listening",
+    "Format-argument parity: title_optional_hint",
+    "Nonempty translations: title_optional_hint",
+    "Format-argument parity: contact_telegram",
+    "Nonempty translations: contact_telegram",
+    "Format-argument parity: bank_budget_disable",
+    "Nonempty translations: bank_budget_disable",
+    "Format-argument parity: overview",
+    "Nonempty translations: overview",
+    "Format-argument parity: expense",
+    "Nonempty translations: expense",
+    "Format-argument parity: help_premium_body",
+    "Nonempty translations: help_premium_body",
+    "Format-argument parity: import_repeated",
+    "Nonempty translations: import_repeated",
+    "Format-argument parity: colors_categories",
+    "Nonempty translations: colors_categories",
+    "Format-argument parity: bank_play_sms",
+    "Nonempty translations: bank_play_sms",
+    "Format-argument parity: developer_purchase_title",
+    "Nonempty translations: developer_purchase_title",
+    "Format-argument parity: display_name",
+    "Nonempty translations: display_name",
+    "Format-argument parity: reference_total_for",
+    "Nonempty translations: reference_total_for",
+    "Format-argument parity: support",
+    "Nonempty translations: support",
+    "Format-argument parity: language_en",
+    "Nonempty translations: language_en",
+    "Format-argument parity: billing_network",
+    "Nonempty translations: billing_network",
+    "Format-argument parity: onboard_body_one",
+    "Nonempty translations: onboard_body_one",
+    "Format-argument parity: activation_key_mismatch",
+    "Nonempty translations: activation_key_mismatch",
+    "Format-argument parity: color_background",
+    "Nonempty translations: color_background",
+    "Format-argument parity: done",
+    "Nonempty translations: done",
+    "Format-argument parity: amount",
+    "Nonempty translations: amount",
+    "Format-argument parity: category_other",
+    "Nonempty translations: category_other",
     "Format-argument parity: date_invalid",
     "Nonempty translations: date_invalid",
-    "Format-argument parity: api_disconnect",
-    "Nonempty translations: api_disconnect",
-    "Format-argument parity: appearance",
-    "Nonempty translations: appearance",
+    "Format-argument parity: premium_local_notice",
+    "Nonempty translations: premium_local_notice",
+    "Format-argument parity: cinematic_history",
+    "Nonempty translations: cinematic_history",
+    "Format-argument parity: help_premium_title",
+    "Nonempty translations: help_premium_title",
+    "Format-argument parity: title_hint",
+    "Nonempty translations: title_hint",
+    "Format-argument parity: activation_key_id",
+    "Nonempty translations: activation_key_id",
+    "Format-argument parity: bank_duplicate",
+    "Nonempty translations: bank_duplicate",
+    "Format-argument parity: entry_currency_notice",
+    "Nonempty translations: entry_currency_notice",
+    "Format-argument parity: activation_malformed",
+    "Nonempty translations: activation_malformed",
+    "Format-argument parity: major_release_body",
+    "Nonempty translations: major_release_body",
+    "Format-argument parity: storage_error",
+    "Nonempty translations: storage_error",
+    "Format-argument parity: api_syncing",
+    "Nonempty translations: api_syncing",
+    "Format-argument parity: settings",
+    "Nonempty translations: settings",
+    "Format-argument parity: bank_month",
+    "Nonempty translations: bank_month",
+    "Format-argument parity: import_disabled",
+    "Nonempty translations: import_disabled",
+    "Format-argument parity: retry",
+    "Nonempty translations: retry",
+    "Format-argument parity: activation_storage",
+    "Nonempty translations: activation_storage",
+    "Format-argument parity: cancel",
+    "Nonempty translations: cancel",
+    "Format-argument parity: activation_copy_request",
+    "Nonempty translations: activation_copy_request",
+    "Format-argument parity: handle_copied",
+    "Nonempty translations: handle_copied",
+    "Format-argument parity: onboard_title_two",
+    "Nonempty translations: onboard_title_two",
+    "Format-argument parity: discard_body",
+    "Nonempty translations: discard_body",
+    "Format-argument parity: period_month",
+    "Nonempty translations: period_month",
+    "Format-argument parity: all_time",
+    "Nonempty translations: all_time",
+    "Format-argument parity: import_mode_title",
+    "Nonempty translations: import_mode_title",
+    "Format-argument parity: pin_setup_subtitle",
+    "Nonempty translations: pin_setup_subtitle",
+    "Format-argument parity: color_text",
+    "Nonempty translations: color_text",
+    "Format-argument parity: help_security_title",
+    "Nonempty translations: help_security_title",
+    "Format-argument parity: api_howto",
+    "Nonempty translations: api_howto",
+    "Format-argument parity: voice_reply_opening_entry",
+    "Nonempty translations: voice_reply_opening_entry",
+    "Format-argument parity: fps_explanation",
+    "Nonempty translations: fps_explanation",
+    "Format-argument parity: bank_recent",
+    "Nonempty translations: bank_recent",
+    "Format-argument parity: category_transaction_count",
+    "Nonempty translations: category_transaction_count",
+    "Format-argument parity: create_pin",
+    "Nonempty translations: create_pin",
+    "Format-argument parity: voice_reply_spent_today",
+    "Nonempty translations: voice_reply_spent_today",
+    "Format-argument parity: support_privacy",
+    "Nonempty translations: support_privacy",
+    "Format-argument parity: bank_export",
+    "Nonempty translations: bank_export",
+    "Format-argument parity: onboard_title_three",
+    "Nonempty translations: onboard_title_three",
+    "Format-argument parity: color_contrast_warning",
+    "Nonempty translations: color_contrast_warning",
+    "Format-argument parity: all",
+    "Nonempty translations: all",
+    "Format-argument parity: colors_title",
+    "Nonempty translations: colors_title",
+    "Format-argument parity: biometric_title",
+    "Nonempty translations: biometric_title",
+    "Format-argument parity: expenses",
+    "Nonempty translations: expenses",
+    "Format-argument parity: premium_active",
+    "Nonempty translations: premium_active",
+    "Format-argument parity: rates_disclaimer",
+    "Nonempty translations: rates_disclaimer",
+    "Format-argument parity: cat_locked_hint",
+    "Nonempty translations: cat_locked_hint",
+    "Format-argument parity: cinematic_more_than_previous",
+    "Nonempty translations: cinematic_more_than_previous",
+    "Format-argument parity: discard_title",
+    "Nonempty translations: discard_title",
+    "Format-argument parity: api_error_bad_token",
+    "Nonempty translations: api_error_bad_token",
+    "Format-argument parity: activation_code_button",
+    "Nonempty translations: activation_code_button",
+    "Format-argument parity: fps_value",
+    "Nonempty translations: fps_value",
+    "Format-argument parity: delete_named_entry",
+    "Nonempty translations: delete_named_entry",
+    "Format-argument parity: unlock_title",
+    "Nonempty translations: unlock_title",
+    "Format-argument parity: undo",
+    "Nonempty translations: undo",
+    "Format-argument parity: import_empty",
+    "Nonempty translations: import_empty",
+    "Format-argument parity: premium_body",
+    "Nonempty translations: premium_body",
+    "Format-argument parity: category_dining",
+    "Nonempty translations: category_dining",
+    "Format-argument parity: bank_transfer_review",
+    "Nonempty translations: bank_transfer_review",
+    "Format-argument parity: premium_buy",
+    "Nonempty translations: premium_buy",
+    "Format-argument parity: bank_budget",
+    "Nonempty translations: bank_budget",
+    "Format-argument parity: undo_expired",
+    "Nonempty translations: undo_expired",
+    "Format-argument parity: currency_explanation",
+    "Nonempty translations: currency_explanation",
+    "Format-argument parity: api_open_site",
+    "Nonempty translations: api_open_site",
+    "Format-argument parity: bank_new_category",
+    "Nonempty translations: bank_new_category",
+    "Format-argument parity: biometric_unlock",
+    "Nonempty translations: biometric_unlock",
+    "Format-argument parity: import_unsupported",
+    "Nonempty translations: import_unsupported",
+    "Format-argument parity: diagnostics_hint",
+    "Nonempty translations: diagnostics_hint",
+    "Format-argument parity: api_error_no_accounts",
+    "Nonempty translations: api_error_no_accounts",
+    "Format-argument parity: diagnostics_copied",
+    "Nonempty translations: diagnostics_copied",
+    "Format-argument parity: support_intro",
+    "Nonempty translations: support_intro",
+    "Format-argument parity: voice_entry_added",
+    "Nonempty translations: voice_entry_added",
+    "Format-argument parity: bank_cash",
+    "Nonempty translations: bank_cash",
+    "Format-argument parity: import_reconnect",
+    "Nonempty translations: import_reconnect",
+    "Format-argument parity: category_transport",
+    "Nonempty translations: category_transport",
+    "Format-argument parity: voice_reply_not_understood",
+    "Nonempty translations: voice_reply_not_understood",
+    "Format-argument parity: diagnostics_clear",
+    "Nonempty translations: diagnostics_clear",
+    "Format-argument parity: activation_code_label",
+    "Nonempty translations: activation_code_label",
+    "Format-argument parity: import_package_settings",
+    "Nonempty translations: import_package_settings",
+    "Format-argument parity: category_food",
+    "Nonempty translations: category_food",
+    "Format-argument parity: import_waiting",
+    "Nonempty translations: import_waiting",
+    "Format-argument parity: copy_handle",
+    "Nonempty translations: copy_handle",
+    "Format-argument parity: help_entries_title",
+    "Nonempty translations: help_entries_title",
+    "Format-argument parity: start_over",
+    "Nonempty translations: start_over",
+    "Format-argument parity: onboard_title_one",
+    "Nonempty translations: onboard_title_one",
+    "Format-argument parity: color_muted",
+    "Nonempty translations: color_muted",
+    "Format-argument parity: category_cashback",
+    "Nonempty translations: category_cashback",
+    "Format-argument parity: period_today",
+    "Nonempty translations: period_today",
+    "Format-argument parity: no_matches",
+    "Nonempty translations: no_matches",
+    "Format-argument parity: rate_value",
+    "Nonempty translations: rate_value",
+    "Format-argument parity: import_mode_notify",
+    "Nonempty translations: import_mode_notify",
+    "Format-argument parity: greeting",
+    "Nonempty translations: greeting",
+    "Format-argument parity: confirm_pin",
+    "Nonempty translations: confirm_pin",
+    "Format-argument parity: restore_purchases",
+    "Nonempty translations: restore_purchases",
+    "Format-argument parity: all_categories",
+    "Nonempty translations: all_categories",
+    "Format-argument parity: import_counts",
+    "Nonempty translations: import_counts",
+    "Format-argument parity: premium_assistant_toggle",
+    "Nonempty translations: premium_assistant_toggle",
+    "Format-argument parity: activity",
+    "Nonempty translations: activity",
+    "Format-argument parity: load_more",
+    "Nonempty translations: load_more",
+    "Format-argument parity: total_thirty_days",
+    "Nonempty translations: total_thirty_days",
+    "Format-argument parity: premium_activated",
+    "Nonempty translations: premium_activated",
+    "Format-argument parity: activation_signature",
+    "Nonempty translations: activation_signature",
+    "Format-argument parity: legend_expense",
+    "Nonempty translations: legend_expense",
+    "Format-argument parity: bank_app_permissions",
+    "Nonempty translations: bank_app_permissions",
+    "Format-argument parity: mascot_premium_note",
+    "Nonempty translations: mascot_premium_note",
+    "Format-argument parity: diagnostics_none",
+    "Nonempty translations: diagnostics_none",
+    "Format-argument parity: voice_reply_balance",
+    "Nonempty translations: voice_reply_balance",
+    "Format-argument parity: developer_purchase_note",
+    "Nonempty translations: developer_purchase_note",
+    "Format-argument parity: voice_ask_source",
+    "Nonempty translations: voice_ask_source",
+    "Format-argument parity: bank_card",
+    "Nonempty translations: bank_card",
+    "Format-argument parity: api_error_rate",
+    "Nonempty translations: api_error_rate",
+    "Format-argument parity: colors_explanation",
+    "Nonempty translations: colors_explanation",
+    "Format-argument parity: add_entry",
+    "Nonempty translations: add_entry",
+    "Format-argument parity: premium_assistant_toggle_hint",
+    "Nonempty translations: premium_assistant_toggle_hint",
+    "Format-argument parity: mascot_hear_again",
+    "Nonempty translations: mascot_hear_again",
+    "Format-argument parity: color_icons",
+    "Nonempty translations: color_icons",
+    "Format-argument parity: bank_auto",
+    "Nonempty translations: bank_auto",
+    "Format-argument parity: total_balance",
+    "Nonempty translations: total_balance",
+    "Format-argument parity: api_error_network",
+    "Nonempty translations: api_error_network",
+    "Format-argument parity: security",
+    "Nonempty translations: security",
+    "Format-argument parity: sms_restricted_tip",
+    "Nonempty translations: sms_restricted_tip",
+    "Format-argument parity: installation_id_copied",
+    "Nonempty translations: installation_id_copied",
+    "Format-argument parity: cinematic_month_average",
+    "Nonempty translations: cinematic_month_average",
+    "Format-argument parity: voice_assistant_button",
+    "Nonempty translations: voice_assistant_button",
+    "Format-argument parity: pin_recovery_notice",
+    "Nonempty translations: pin_recovery_notice",
+    "Format-argument parity: profile",
+    "Nonempty translations: profile",
+    "Format-argument parity: import_package_warning",
+    "Nonempty translations: import_package_warning",
+    "Format-argument parity: privat_api_token",
+    "Nonempty translations: privat_api_token",
+    "Format-argument parity: support_network_error",
+    "Nonempty translations: support_network_error",
+    "Format-argument parity: privat_api_howto",
+    "Nonempty translations: privat_api_howto",
+    "Format-argument parity: edit_entry",
+    "Nonempty translations: edit_entry",
+    "Format-argument parity: fps_fallback",
+    "Nonempty translations: fps_fallback",
+    "Format-argument parity: theme_system",
+    "Nonempty translations: theme_system",
+    "Format-argument parity: close",
+    "Nonempty translations: close",
+    "Format-argument parity: discard",
+    "Nonempty translations: discard",
+    "Format-argument parity: colors_collapse",
+    "Nonempty translations: colors_collapse",
     "Format-argument parity: import_mode_sms",
     "Nonempty translations: import_mode_sms",
+    "Format-argument parity: unlock_biometric",
+    "Nonempty translations: unlock_biometric",
+    "Format-argument parity: support_handle",
+    "Nonempty translations: support_handle",
+    "Format-argument parity: app_version",
+    "Nonempty translations: app_version",
+    "Format-argument parity: import_to_queue",
+    "Nonempty translations: import_to_queue",
+    "Format-argument parity: colors_edit",
+    "Nonempty translations: colors_edit",
+    "Format-argument parity: rate_offline",
+    "Nonempty translations: rate_offline",
+    "Format-argument parity: color_chart_bottom",
+    "Nonempty translations: color_chart_bottom",
+    "Format-argument parity: color_apply",
+    "Nonempty translations: color_apply",
+    "Format-argument parity: installation_id_copy",
+    "Nonempty translations: installation_id_copy",
+    "Format-argument parity: cinematic_income_categories",
+    "Nonempty translations: cinematic_income_categories",
+    "Format-argument parity: api_connect",
+    "Nonempty translations: api_connect",
+    "Format-argument parity: import_text",
+    "Nonempty translations: import_text",
+    "Format-argument parity: bank_consent",
+    "Nonempty translations: bank_consent",
+    "Format-argument parity: privat_api_site",
+    "Nonempty translations: privat_api_site",
+    "Format-argument parity: dashboard_heading",
+    "Nonempty translations: dashboard_heading",
+    "Format-argument parity: diagnostics_title",
+    "Nonempty translations: diagnostics_title",
+    "Format-argument parity: bank_week",
+    "Nonempty translations: bank_week",
+    "Format-argument parity: bank_source",
+    "Nonempty translations: bank_source",
+    "Format-argument parity: mascot_style",
+    "Nonempty translations: mascot_style",
+    "Format-argument parity: local_profile",
+    "Nonempty translations: local_profile",
+    "Format-argument parity: auto_lock_explanation",
+    "Nonempty translations: auto_lock_explanation",
+    "Format-argument parity: reference_rates",
+    "Nonempty translations: reference_rates",
+    "Format-argument parity: privat_api_error",
+    "Nonempty translations: privat_api_error",
+    "Format-argument parity: biometric_subtitle",
+    "Nonempty translations: biometric_subtitle",
+    "Format-argument parity: sms_scan_result",
+    "Nonempty translations: sms_scan_result",
+    "Format-argument parity: clear_filters",
+    "Nonempty translations: clear_filters",
+    "Format-argument parity: color_hue",
+    "Nonempty translations: color_hue",
+    "Format-argument parity: legend_income",
+    "Nonempty translations: legend_income",
+    "Format-argument parity: cinematic_comparison",
+    "Nonempty translations: cinematic_comparison",
+    "Format-argument parity: billing_pending",
+    "Nonempty translations: billing_pending",
+    "Format-argument parity: brand_intro_title",
+    "Nonempty translations: brand_intro_title",
+    "Format-argument parity: help_privacy_body",
+    "Nonempty translations: help_privacy_body",
+    "Format-argument parity: back",
+    "Nonempty translations: back",
+    "Format-argument parity: note_optional",
+    "Nonempty translations: note_optional",
+    "Format-argument parity: entry_not_found",
+    "Nonempty translations: entry_not_found",
+    "Format-argument parity: lock_now",
+    "Nonempty translations: lock_now",
+    "Format-argument parity: next",
+    "Nonempty translations: next",
+    "Format-argument parity: api_connected",
+    "Nonempty translations: api_connected",
+    "Format-argument parity: activation_product",
+    "Nonempty translations: activation_product",
+    "Format-argument parity: premium_unlock",
+    "Nonempty translations: premium_unlock",
+    "Format-argument parity: developer_purchase_button",
+    "Nonempty translations: developer_purchase_button",
+    "Format-argument parity: bank_setup",
+    "Nonempty translations: bank_setup",
+    "Format-argument parity: positive_amount",
+    "Nonempty translations: positive_amount",
+    "Format-argument parity: character_count",
+    "Nonempty translations: character_count",
+    "Format-argument parity: pay_source_title",
+    "Nonempty translations: pay_source_title",
+    "Format-argument parity: empty_ledger_title",
+    "Nonempty translations: empty_ledger_title",
+    "Format-argument parity: api_token_label",
+    "Nonempty translations: api_token_label",
+    "Format-argument parity: sms_scan",
+    "Nonempty translations: sms_scan",
+    "Format-argument parity: premium_feature_trends",
+    "Nonempty translations: premium_feature_trends",
+    "Format-argument parity: import_unrecognized",
+    "Nonempty translations: import_unrecognized",
+    "Format-argument parity: assistant_write_short",
+    "Nonempty translations: assistant_write_short",
+    "Format-argument parity: import_auto_done",
+    "Nonempty translations: import_auto_done",
+    "Format-argument parity: brand_copyright",
+    "Nonempty translations: brand_copyright",
+    "Format-argument parity: premium_source_developer",
+    "Nonempty translations: premium_source_developer",
+    "Format-argument parity: cinematic_week_average",
+    "Nonempty translations: cinematic_week_average",
+    "Format-argument parity: voice_smalltalk_joke",
+    "Nonempty translations: voice_smalltalk_joke",
+    "Format-argument parity: onboard_body_three",
+    "Nonempty translations: onboard_body_three",
+    "Format-argument parity: premium_source_play",
+    "Nonempty translations: premium_source_play",
+    "Format-argument parity: bank_access_yes",
+    "Nonempty translations: bank_access_yes",
+    "Format-argument parity: bank_access_no",
+    "Nonempty translations: bank_access_no",
+    "Format-argument parity: major_release_title",
+    "Nonempty translations: major_release_title",
+    "Format-argument parity: billing_configuration",
+    "Nonempty translations: billing_configuration",
+    "Format-argument parity: get_started",
+    "Nonempty translations: get_started",
+    "Format-argument parity: biometric_unavailable",
+    "Nonempty translations: biometric_unavailable",
+    "Format-argument parity: import_diagnostics",
+    "Nonempty translations: import_diagnostics",
+    "Format-argument parity: bank_day",
+    "Nonempty translations: bank_day",
+    "Format-argument parity: save_profile",
+    "Nonempty translations: save_profile",
+    "Format-argument parity: premium_name",
+    "Nonempty translations: premium_name",
+    "Format-argument parity: cinematic_chart_accessibility",
+    "Nonempty translations: cinematic_chart_accessibility",
+    "Format-argument parity: app_name",
+    "Nonempty translations: app_name",
+    "Format-argument parity: color_grid",
+    "Nonempty translations: color_grid",
+    "Format-argument parity: bank_budget_progress",
+    "Nonempty translations: bank_budget_progress",
+    "Format-argument parity: premium_expires",
+    "Nonempty translations: premium_expires",
+    "Format-argument parity: telegram_support",
+    "Nonempty translations: telegram_support",
+    "Format-argument parity: bank_sms_permission",
+    "Nonempty translations: bank_sms_permission",
+    "Format-argument parity: diagnostics_close",
+    "Nonempty translations: diagnostics_close",
+    "Format-argument parity: help_heading",
+    "Nonempty translations: help_heading",
+    "Format-argument parity: chart_empty",
+    "Nonempty translations: chart_empty",
+    "Format-argument parity: save_entry",
+    "Nonempty translations: save_entry",
+    "Format-argument parity: premium_feature_support",
+    "Nonempty translations: premium_feature_support",
+    "Format-argument parity: activation_code_hint",
+    "Nonempty translations: activation_code_hint",
+    "Format-argument parity: billing_acknowledgement",
+    "Nonempty translations: billing_acknowledgement",
+    "Format-argument parity: activation_clock",
+    "Nonempty translations: activation_clock",
+    "Format-argument parity: assistant_text_hint",
+    "Nonempty translations: assistant_text_hint",
+    "Format-argument parity: sms_howto",
+    "Nonempty translations: sms_howto",
+    "Format-argument parity: last_30_days",
+    "Nonempty translations: last_30_days",
+    "Format-argument parity: clear_search",
+    "Nonempty translations: clear_search",
+    "Format-argument parity: use_pin",
+    "Nonempty translations: use_pin",
+    "Format-argument parity: search_entries",
+    "Nonempty translations: search_entries",
+    "Format-argument parity: privat_api_title",
+    "Nonempty translations: privat_api_title",
+    "Format-argument parity: api_last_sync",
+    "Nonempty translations: api_last_sync",
+    "Format-argument parity: security_error",
+    "Nonempty translations: security_error",
+    "Format-argument parity: developer_purchase_banner",
+    "Nonempty translations: developer_purchase_banner",
+    "Format-argument parity: title_invalid",
+    "Nonempty translations: title_invalid",
+    "Format-argument parity: color_error",
+    "Nonempty translations: color_error",
+    "Format-argument parity: total_all_time",
+    "Nonempty translations: total_all_time",
+    "Format-argument parity: voice_smalltalk_thanks",
+    "Nonempty translations: voice_smalltalk_thanks",
+    "Format-argument parity: bank_ignore",
+    "Nonempty translations: bank_ignore",
+    "Format-argument parity: other_api_note",
+    "Nonempty translations: other_api_note",
+    "Format-argument parity: pay_source_required",
+    "Nonempty translations: pay_source_required",
+    "Format-argument parity: import_confirm_enabled",
+    "Nonempty translations: import_confirm_enabled",
+    "Format-argument parity: brand_design_label",
+    "Nonempty translations: brand_design_label",
+    "Format-argument parity: mascot_animations",
+    "Nonempty translations: mascot_animations",
+    "Format-argument parity: color_reset",
+    "Nonempty translations: color_reset",
+    "Format-argument parity: activation_request_copied",
+    "Nonempty translations: activation_request_copied",
+    "Format-argument parity: pin_incorrect",
+    "Nonempty translations: pin_incorrect",
+    "Format-argument parity: saved",
+    "Nonempty translations: saved",
+    "Format-argument parity: bank_battery",
+    "Nonempty translations: bank_battery",
+    "Format-argument parity: income",
+    "Nonempty translations: income",
+    "Format-argument parity: no_matches_body",
+    "Nonempty translations: no_matches_body",
+    "Format-argument parity: amount_invalid",
+    "Nonempty translations: amount_invalid",
+    "Format-argument parity: default_currency",
+    "Nonempty translations: default_currency",
+    "Format-argument parity: developer_purchase_body",
+    "Nonempty translations: developer_purchase_body",
+    "Format-argument parity: keep_editing",
+    "Nonempty translations: keep_editing",
+    "Format-argument parity: empty_ledger_body",
+    "Nonempty translations: empty_ledger_body",
+    "Format-argument parity: onboard_body_two",
+    "Nonempty translations: onboard_body_two",
+    "Format-argument parity: cinematic_more_buckets",
+    "Nonempty translations: cinematic_more_buckets",
+    "Format-argument parity: import_queued",
+    "Nonempty translations: import_queued",
+    "Format-argument parity: color_brightness",
+    "Nonempty translations: color_brightness",
+    "Format-argument parity: language_instant",
+    "Nonempty translations: language_instant",
+    "Format-argument parity: category_home",
+    "Nonempty translations: category_home",
+    "Format-argument parity: entry_title",
+    "Nonempty translations: entry_title",
+    "Format-argument parity: bank_enabled",
+    "Nonempty translations: bank_enabled",
+    "Format-argument parity: help_intro",
+    "Nonempty translations: help_intro",
+    "Format-argument parity: category_leisure",
+    "Nonempty translations: category_leisure",
+    "Format-argument parity: bank_dashboard",
+    "Nonempty translations: bank_dashboard",
+    "Format-argument parity: voice_smalltalk_how_are_you",
+    "Nonempty translations: voice_smalltalk_how_are_you",
+    "Format-argument parity: help_entries_body",
+    "Nonempty translations: help_entries_body",
+    "Format-argument parity: fps_title",
+    "Nonempty translations: fps_title",
+    "Format-argument parity: help_security_body",
+    "Nonempty translations: help_security_body",
+    "Format-argument parity: cinematic_tooltip",
+    "Nonempty translations: cinematic_tooltip",
+    "Format-argument parity: activation_invalid",
+    "Nonempty translations: activation_invalid",
+    "Format-argument parity: bank_sms_no",
+    "Nonempty translations: bank_sms_no",
+    "Format-argument parity: bank_notification_permission",
+    "Nonempty translations: bank_notification_permission",
+    "Format-argument parity: biometric_explanation",
+    "Nonempty translations: biometric_explanation",
+    "Format-argument parity: need_help",
+    "Nonempty translations: need_help",
+    "Format-argument parity: appearance",
+    "Nonempty translations: appearance",
+    "Format-argument parity: api_disconnect",
+    "Nonempty translations: api_disconnect",
+    "Format-argument parity: currency_scope",
+    "Nonempty translations: currency_scope",
+    "Format-argument parity: diagnostics_copy",
+    "Nonempty translations: diagnostics_copy",
+    "Format-argument parity: name_invalid",
+    "Nonempty translations: name_invalid",
+    "Format-argument parity: negative_amount",
+    "Nonempty translations: negative_amount",
+    "Format-argument parity: biometric_failed",
+    "Nonempty translations: biometric_failed",
+    "Format-argument parity: voice_smalltalk_greeting",
+    "Nonempty translations: voice_smalltalk_greeting",
+    "Format-argument parity: activation_not_configured",
+    "Nonempty translations: activation_not_configured",
+    "Format-argument parity: import_mode_api",
+    "Nonempty translations: import_mode_api",
+    "Format-argument parity: api_imported_last",
+    "Nonempty translations: api_imported_last",
+    "Format-argument parity: api_connecting",
+    "Nonempty translations: api_connecting",
+    "Format-argument parity: bank_clear_history",
+    "Nonempty translations: bank_clear_history",
+    "Format-argument parity: brand_author_signature",
+    "Nonempty translations: brand_author_signature",
+    "Format-argument parity: categories",
+    "Nonempty translations: categories",
+    "Format-argument parity: cinematic_apply",
+    "Nonempty translations: cinematic_apply",
+    "Format-argument parity: language_uk",
+    "Nonempty translations: language_uk",
+    "Format-argument parity: color_saturation",
+    "Nonempty translations: color_saturation",
+    "Format-argument parity: color_chart_top",
+    "Nonempty translations: color_chart_top",
+    "Format-argument parity: bank_category_stats",
+    "Nonempty translations: bank_category_stats",
+    "Format-argument parity: add_first_entry",
+    "Nonempty translations: add_first_entry",
     "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
     "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/PackagedKeyIdentityTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/PackagedKeyIdentityTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/PackagedKeyIdentityTest.kt",
     "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
     "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/ComposeScreensTest.kt",

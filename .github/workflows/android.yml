@@ -18,6 +18,25 @@ jobs:
         run: python -m unittest discover -s tools/tests -v
       - name: Native Windows manager smoke test
         run: python tools/activation_manager.py --smoke-test
+      - name: Standalone issuer native GUI
+        run: python tools/create_key_premium.py --smoke-test --smoke-report premium-python-smoke.json
+      - name: Build standalone Windows executable
+        run: |
+          python -m pip install pyinstaller==6.16.0
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name "Create Key Premium" --paths tools tools/create_key_premium.py
+      - name: Test packaged executable without project or Python imports
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist/Create Key Premium.exe" -ArgumentList '--smoke-test --smoke-report premium-exe-smoke.json' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "Packaged issuer failed" }
+          $r = Get-Content premium-exe-smoke.json | ConvertFrom-Json
+          if (!$r.passed -or !$r.frozen_exe) { throw "Frozen GUI smoke failed" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: create-key-premium-windows
+          path: |
+            dist/Create Key Premium.exe
+            premium-*-smoke.json
   build:
     runs-on: ubuntu-latest
     steps:
@@ -32,12 +51,18 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
       - name: Install SDK
         run: sdkmanager 'platforms;android-36' 'build-tools;35.0.0'
+      - name: Configure public APK key
+        run: python3 tools/configure_delivery.py
       - name: Resource and SQL audit
         run: python3 tools/audit_project.py
       - name: Build, unit tests, lint and release shrinking
         run: |
           chmod +x gradlew
-          ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease --stacktrace
+          ./gradlew :domain:test :data:testPlayDebugUnitTest :data:testLegacyV7DebugUnitTest :app:testPlayDebugUnitTest :app:assemblePlayDebug :app:assembleLegacyV7Debug :app:assemblePlayRelease :app:lintPlayDebug :app:lintPlayRelease -PREQUIRE_DEVELOPER_ACTIVATION=true --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-apk-unsigned
+          path: app/build/outputs/apk/play/release/*unsigned.apk
       - uses: actions/upload-artifact@v4
         with:
           name: debug-apks
@@ -66,11 +91,15 @@ jobs:
         with:
           packages: ''
       - uses: gradle/actions/setup-gradle@v4
+      - name: Configure public APK key
+        run: python3 tools/configure_delivery.py
       - name: Enable emulator acceleration
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+      - name: Download exact signed delivery APK
+        run: python3 tools/download_ready_apk.py
       - name: Device tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -78,7 +107,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: bash tools/run_device_tests.sh
+          script: bash tools/run_device_tests.sh && bash tools/smoke_ready_apk.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -86,3 +115,4 @@ jobs:
           path: |
             **/build/reports/androidTests/
             verification/device-screenshots/
+            verification/ready-apk-smoke/
