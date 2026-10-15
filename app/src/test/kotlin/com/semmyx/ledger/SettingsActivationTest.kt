@@ -20,7 +20,7 @@ class SettingsActivationTest {
         var wait: CompletableDeferred<Unit>? = null
         override suspend fun refresh() {}
         override suspend fun activateDeveloperToken(token: String): Boolean { calls++;wait?.await();return result }
-        override suspend fun developerInstallationId() = "A21C-FEA5-E432"
+        override suspend fun developerInstallationId() = "AB12-CD34-EF56"
         override fun clearIssue() {}
     }
     private fun model(premium: Premium): SettingsViewModel {

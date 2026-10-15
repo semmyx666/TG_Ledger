@@ -80,13 +80,13 @@ class ComposeScreensTest {
         var copied = ""
         var attempts = 0
         val premium = com.semmyx.ledger.domain.PremiumState(developerPurchaseEnabled=true,
-            developerInstallationId="A21C-FEA5-E432",developerKeyId="1234567890ABCDEF",
+            developerInstallationId="AB12-CD34-EF56",developerKeyId="1234567890ABCDEF",
             activationProblem=com.semmyx.ledger.domain.ActivationProblem.KEY_MISMATCH)
         compose.setContent { LocalizedContent(AppLanguage.ENGLISH) { LedgerTheme {
             com.semmyx.ledger.settings.DeveloperActivationPanel(premium,input,{input=it},false,{attempts++},{copied=it},{})
         } } }
         compose.onNodeWithTag("copyActivationRequest").performClick()
-        compose.runOnIdle { assertEquals("TGREQ1|A21C-FEA5-E432|1234567890ABCDEF|ledger_plus",copied) }
+        compose.runOnIdle { assertEquals("TGREQ1|AB12-CD34-EF56|1234567890ABCDEF|ledger_plus",copied) }
         compose.onNodeWithTag("activateDeveloperCode").performClick()
         compose.onNodeWithTag("activationCodeField").assertTextContains("bad-code")
         compose.onNodeWithTag("activationProblem").assertTextContains("different signing key",substring=true)

@@ -18,9 +18,9 @@ class ActivationDiagnosticsTest {
         val enc = Base64.getUrlEncoder().withoutPadding()
         return "TG2.$envelope.${enc.encodeToString(raw)}.${enc.encodeToString(signature)}"
     }
-    private fun code(installation: String = "A21C-FEA5-E432", product: String = "ledger_plus", issued: Long = 1000, end: String = "10000") =
+    private fun code(installation: String = "AB12-CD34-EF56", product: String = "ledger_plus", issued: Long = 1000, end: String = "10000") =
         signed(listOf("v2",verifier.keyId,installation,product,issued.toString(),end))
-    private fun problem(code: String, now: Long = 5000) = verifier.check(code,"A21C-FEA5-E432","ledger_plus",now).problem
+    private fun problem(code: String, now: Long = 5000) = verifier.check(code,"AB12-CD34-EF56","ledger_plus",now).problem
 
     @Test fun pythonV1AndV2SignaturesVerifyInTheActualKotlinVerifier() {
         val fixture = javaClass.classLoader!!.getResourceAsStream("activation_python.json")!!.reader().use { JsonParser.parseReader(it).asJsonObject }
@@ -33,13 +33,13 @@ class ActivationDiagnosticsTest {
     }
     @Test fun lineWrappingAndChatSeparatorsDoNotInvalidateTheSignature() {
         val wrapped=code().chunked(31).joinToString("\r\n \u200B")
-        assertNull(problem("\uFEFF$wrapped\n"));assertNotNull(verifier.verify(wrapped,"A21C-FEA5-E432","ledger_plus",5000))
+        assertNull(problem("\uFEFF$wrapped\n"));assertNotNull(verifier.verify(wrapped,"AB12-CD34-EF56","ledger_plus",5000))
     }
     @Test fun wrongSigningKeyHasSpecificDiagnostic() {
         assertEquals(ActivationProblem.KEY_MISMATCH,problem(code().replace("TG2.${verifier.keyId}.","TG2.0000000000000000.")))
     }
     @Test fun envelopeMustMatchTheSignedKeyId() {
-        assertEquals(ActivationProblem.MALFORMED,problem(signed(listOf("v2","0000000000000000","A21C-FEA5-E432","ledger_plus","1000","10000"))))
+        assertEquals(ActivationProblem.MALFORMED,problem(signed(listOf("v2","0000000000000000","AB12-CD34-EF56","ledger_plus","1000","10000"))))
     }
     @Test fun wrongDeviceAndWrongProductAreDistinct() {
         assertEquals(ActivationProblem.DEVICE,problem(code(installation="1111-2222-3333")))
@@ -51,7 +51,7 @@ class ActivationDiagnosticsTest {
         assertNull(problem(code(issued=305000,end="999999")))
     }
     @Test fun permanentCodeAndLowercaseDeviceIdWork() {
-        assertNotNull(verifier.verify(code(end=""),"a21c-fea5-e432","ledger_plus",5000))
+        assertNotNull(verifier.verify(code(end=""),"ab12-cd34-ef56","ledger_plus",5000))
     }
     @Test fun invalidTimeRangeIsNotAccepted() {
         assertEquals(ActivationProblem.MALFORMED,problem(code(end="1000")))
@@ -66,6 +66,6 @@ class ActivationDiagnosticsTest {
         for (code in listOf("x".repeat(16385),"TG2...","TG2.AAAAAAAAAAAAAAAA.?.?","hello")) assertNotNull(problem(code))
     }
     @Test fun noPublicKeyIsExplicitlyUnconfigured() {
-        assertEquals(ActivationProblem.NOT_CONFIGURED,DeveloperSubscriptionVerifier("").check(code(),"A21C-FEA5-E432","ledger_plus",5000).problem)
+        assertEquals(ActivationProblem.NOT_CONFIGURED,DeveloperSubscriptionVerifier("").check(code(),"AB12-CD34-EF56","ledger_plus",5000).problem)
     }
 }

@@ -168,7 +168,7 @@ def main():
         def smoke():
             try:
                 s = doctor()
-                request.set('TGREQ1|A21C-FEA5-E432|' + s['key_id'] + '|ledger_plus')
+                request.set('TGREQ1|AB12-CD34-EF56|' + s['key_id'] + '|ledger_plus')
                 days.set('5')
                 issue()
                 copy_code()

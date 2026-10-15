@@ -73,7 +73,7 @@ def fingerprint(der: bytes) -> str:
 def normalize_installation(value: str) -> str:
     clean = re.sub(r'[\s\-\u2010-\u2015]', '', value).upper()
     if not re.fullmatch(r'[0-9A-F]{12}', clean):
-        raise ValueError('Installation ID must contain 12 hexadecimal characters, e.g. A21C-FEA5-E432. Copy it again from the app.')
+        raise ValueError('Installation ID must contain 12 hexadecimal characters, e.g. AB12-CD34-EF56. Copy it again from the app.')
     return '-'.join(clean[i:i+4] for i in range(0, 12, 4))
 
 

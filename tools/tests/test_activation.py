@@ -81,35 +81,35 @@ class ActivationTests(unittest.TestCase):
 
     def test_project_mismatch_blocks_issuance(self):
         self.setup_key();(self.project/'activation-public.properties').write_text(a.PROPERTY+'='+base64.b64encode(a.public_bytes(self.other)).decode())
-        with self.assertRaises(ValueError):a.issue_checked('A21C-FEA5-E432',5,self.project)
+        with self.assertRaises(ValueError):a.issue_checked('AB12-CD34-EF56',5,self.project)
 
     def test_request_checks_actual_app_key_and_product(self):
-        s=self.setup_key();req=f"TGREQ1|A21C-FEA5-E432|{s['key_id']}|ledger_plus"
+        s=self.setup_key();req=f"TGREQ1|AB12-CD34-EF56|{s['key_id']}|ledger_plus"
         installation,kid,product=a.parse_request(req)
         code,_=a.issue_checked(installation,5,self.project,expected_key=kid,product=product)
         self.assertEqual(['v2',kid,installation,product],self.decode(code)[:4])
 
     def test_wrong_app_key_is_blocked(self):
         self.setup_key()
-        with self.assertRaises(ValueError):a.issue_checked('A21C-FEA5-E432',5,self.project,expected_key='0000000000000000')
+        with self.assertRaises(ValueError):a.issue_checked('AB12-CD34-EF56',5,self.project,expected_key='0000000000000000')
 
     def test_malformed_request(self):
-        for request in ['TGREQ1|ID','TGREQ1|A21C-FEA5-E432||ledger_plus','TGREQ1|A21C-FEA5-E432|A'*20]:
+        for request in ['TGREQ1|ID','TGREQ1|AB12-CD34-EF56||ledger_plus','TGREQ1|AB12-CD34-EF56|A'*20]:
             with self.assertRaises(ValueError):a.parse_request(request)
 
     def test_valid_signature_and_exact_five_day_duration(self):
-        code=a.make_token(self.key,'a21c fea5 e432','ledger_plus',5,now_millis=1000)
-        f=self.decode(code);self.assertEqual('A21C-FEA5-E432',f[2]);self.assertEqual(5*86400000,int(f[5])-int(f[4]))
+        code=a.make_token(self.key,'ab12 cd34 ef56','ledger_plus',5,now_millis=1000)
+        f=self.decode(code);self.assertEqual('AB12-CD34-EF56',f[2]);self.assertEqual(5*86400000,int(f[5])-int(f[4]))
 
     def test_permanent_and_legacy_formats(self):
-        self.assertEqual('',self.decode(a.make_token(self.key,'A21C-FEA5-E432','ledger_plus',0,now_millis=1))[-1])
-        code=a.make_token(self.key,'A21C-FEA5-E432','ledger_plus',5,legacy=True,now_millis=1)
+        self.assertEqual('',self.decode(a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',0,now_millis=1))[-1])
+        code=a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',5,legacy=True,now_millis=1)
         self.assertEqual(2,len(code.split('.')));self.assertEqual('v1',self.decode(code)[0])
 
     def test_invalid_durations_and_separator_injection(self):
         for days in [-1,float('nan'),float('inf'),36501,0.000000001]:
-            with self.assertRaises(ValueError):a.make_token(self.key,'A21C-FEA5-E432','ledger_plus',days)
-        for installation,product in [('A21C|FEA5|E432','ledger_plus'),('A21C-FEA5-E432','x|y')]:
+            with self.assertRaises(ValueError):a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',days)
+        for installation,product in [('A21C|FEA5|E432','ledger_plus'),('AB12-CD34-EF56','x|y')]:
             with self.assertRaises(ValueError):a.make_token(self.key,installation,product,5)
 
     def test_wrong_key_type_is_rejected(self):
@@ -125,7 +125,7 @@ class ActivationTests(unittest.TestCase):
         script=str(Path(a.__file__))
         result=subprocess.run([sys.executable,script,'setup','--import-key',str(self.source),'--project',str(self.project)],capture_output=True,text=True)
         self.assertEqual(0,result.returncode,result.stderr)
-        result=subprocess.run([sys.executable,script,'issue','--installation-id','A21C-FEA5-E432','--days','5','--project',str(self.project)],capture_output=True,text=True)
+        result=subprocess.run([sys.executable,script,'issue','--installation-id','AB12-CD34-EF56','--days','5','--project',str(self.project)],capture_output=True,text=True)
         self.assertEqual(0,result.returncode,result.stderr);self.assertEqual('v2',self.decode(result.stdout.strip())[0])
         self.assertNotIn('PRIVATE KEY',result.stdout+result.stderr)
 

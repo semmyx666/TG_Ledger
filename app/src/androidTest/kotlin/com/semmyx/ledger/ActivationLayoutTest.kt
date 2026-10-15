@@ -21,7 +21,7 @@ import org.junit.runner.RunWith
 class ActivationLayoutTest {
     @get:Rule val compose=createComposeRule()
     @Test fun activationRemainsReadableAt320dpAndLargeFont() {
-        val premium=PremiumState(developerPurchaseEnabled=true,developerInstallationId="A21C-FEA5-E432",
+        val premium=PremiumState(developerPurchaseEnabled=true,developerInstallationId="AB12-CD34-EF56",
             developerKeyId="1234567890ABCDEF",activationProblem=ActivationProblem.KEY_MISMATCH)
         compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
             val density=LocalDensity.current

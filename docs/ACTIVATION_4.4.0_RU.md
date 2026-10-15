@@ -26,7 +26,7 @@
 ```powershell
 python tools/issue_activation_code.py setup --import-key "D:\папка со старым проектом\tools\developer_private_key.pem"
 python tools/issue_activation_code.py doctor
-python tools/issue_activation_code.py issue --request "TGREQ1|A21C-FEA5-E432|KEY_ID_ИЗ_ПРИЛОЖЕНИЯ|ledger_plus" --days 5
+python tools/issue_activation_code.py issue --request "TGREQ1|AB12-CD34-EF56|KEY_ID_ИЗ_ПРИЛОЖЕНИЯ|ledger_plus" --days 5
 ```
 
 В примере замените запрос полным значением из приложения: `KEY_ID_…` не является настоящим Key ID. Поддержана старая команда `issue --installation-id … --days 5`, но она не может сама проверить ключ **установленного** APK, поэтому предпочтителен `--request`. В stdout выводится только код; диагностика — в stderr.
