@@ -34,8 +34,8 @@ class ActivationLayoutTest {
         compose.onNodeWithTag("activationKeyId").performScrollTo().assertIsDisplayed()
         val layouts=mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
         compose.onNodeWithTag("activationKeyId").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
-        assertTrue(layouts.isNotEmpty());assertFalse(layouts.any { it.hasVisualOverflow })
         NativeScreenshots.save(compose.onRoot().captureToImage(),"activation-320dp-font140-uk")
+        assertTrue(layouts.isNotEmpty());assertFalse("Key ID layout: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}",layouts.any { it.hasVisualOverflow })
         compose.onNodeWithTag("activateDeveloperCode").performScrollTo().assertIsDisplayed().assertIsEnabled()
         compose.onNodeWithTag("activationProblem").performScrollTo().assertIsDisplayed()
     }

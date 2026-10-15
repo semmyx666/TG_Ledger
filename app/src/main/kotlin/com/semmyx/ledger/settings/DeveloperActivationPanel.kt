@@ -21,8 +21,8 @@ fun DeveloperActivationPanel(state: PremiumState, code: String, onCodeChange: (S
         Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
         Text(stringResource(R.string.developer_purchase_body), style = MaterialTheme.typography.bodyMedium)
         Text(stringResource(R.string.installation_id_label) + ": " + state.developerInstallationId, modifier = Modifier.testTag("installationId"))
-        Text(stringResource(R.string.activation_key_id, state.developerKeyId.ifEmpty { "—" }),
-            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("activationKeyId"))
+        Text(stringResource(R.string.activation_key_id, state.developerKeyId.chunked(4).joinToString(" ").ifEmpty { "—" }),
+            style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth().testTag("activationKeyId"))
         if (!state.developerPurchaseEnabled) {
             Text(stringResource(R.string.activation_not_configured), color = MaterialTheme.colorScheme.error,
                 modifier = Modifier.testTag("activationNotConfigured"))
