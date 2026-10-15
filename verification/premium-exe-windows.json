@@ -1,0 +1,22 @@
+{
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38801902922",
+  "artifact_id": 12003654899,
+  "exe_sha256": "1988020381ad828ea27d9370efe11cfe0b5f198242dde822651d5c17c323db76",
+  "reports": {
+    "premium-exe-smoke.json": {
+      "passed": true,
+      "window": true,
+      "issue": true,
+      "clipboard": true,
+      "frozen_exe": true
+    },
+    "premium-python-smoke.json": {
+      "passed": true,
+      "window": true,
+      "issue": true,
+      "clipboard": true,
+      "frozen_exe": false
+    }
+  },
+  "production_private_key_in_ci": false
+}

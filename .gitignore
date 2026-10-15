@@ -22,3 +22,5 @@ activation-public.properties
 /dist/
 *.spec
 premium-*-smoke.json
+
+ready-delivery.apk

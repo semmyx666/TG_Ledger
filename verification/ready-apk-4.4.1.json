@@ -1,0 +1,18 @@
+{
+  "alias": "tgledger-release",
+  "certificate_sha256": "CD4A1391DCE5D0F504A4CC2DC19BE836755C377BB2104C719B55376861A78B50",
+  "application_id": "com.semmyx.ledger",
+  "version": "4.4.1",
+  "version_code": 20,
+  "note": "New APK signing identity, separate from activation RSA key. Keep PKCS12 and password private for future updates.",
+  "apk_sha256": "1adb933c20c6d236a49d737deaef8eca1745fd6268f059f7300792407bf5905a",
+  "apk_bytes": 5191228,
+  "activation_key_id": "EB6E82A6AFC4EE5E",
+  "release_debuggable": false,
+  "min_sdk": 26,
+  "zip_alignment_16k_verified": true,
+  "signature_v2_verified": true,
+  "signature_v3_verified": true,
+  "actual_dex_public_key_match": true,
+  "private_key_in_apk": false
+}
