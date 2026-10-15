@@ -70,6 +70,8 @@ sealed interface PinResult {
 
 enum class BillingIssue { UNAVAILABLE, CONFIGURATION, NETWORK, PENDING, VERIFICATION, ACKNOWLEDGEMENT, ACTIVATION_CODE }
 
+enum class ActivationProblem { NOT_CONFIGURED, KEY_MISMATCH, MALFORMED, SIGNATURE, DEVICE, PRODUCT, CLOCK, EXPIRED, STORAGE }
+
 /** Where the currently active entitlement (if any) came from. */
 enum class PremiumSource { GOOGLE_PLAY, OFFICIAL_DEVELOPER, TRIAL }
 
@@ -87,5 +89,8 @@ data class PremiumState(
     val developerPurchaseEnabled: Boolean = false,
     // Stable per-installation id the developer binds an activation code to.
     val developerInstallationId: String = "",
+    val developerKeyId: String = "",
+    val developerProductId: String = "ledger_plus",
+    val activationProblem: ActivationProblem? = null,
     val trialAvailable: Boolean = false,
 )

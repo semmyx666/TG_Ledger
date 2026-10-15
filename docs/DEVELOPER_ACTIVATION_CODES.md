@@ -1,3 +1,9 @@
+# Developer activation codes — current 4.4.0
+
+Current workflow: `ACTIVATION_4.4.0_RU.md` and `START_ACTIVATION.cmd`. The old manual setup below is historical, not the recommended onboarding. Stable private key: `~/.tg-ledger/activation/developer_private_key.pem`; generated local public configuration: `activation-public.properties` (ignored). v2 is the default; verification still accepts v1 with the same key; issue `--legacy-v1` for older apps.
+
+---
+
 > Історичний опис: зміни 2.0 та актуальні обмеження див. UPDATE_2_UK.md.
 
 # Selling TG Plus directly (before or alongside Google Play)

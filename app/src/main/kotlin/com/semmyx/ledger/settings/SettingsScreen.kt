@@ -181,36 +181,18 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                     }
                 }
                 if (state.premium.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION }?.let {
+                state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION || it == BillingIssue.ACTIVATION_CODE }?.let {
                     Text(stringResource(it.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
                 RestorePurchasesAction(enabled = !state.premium.busy, onClick = model::restorePurchases)
             } }
-            if (state.premium.developerPurchaseEnabled && (!state.premium.entitled || state.premium.expiresAtMillis != null)) item(key = "developerPurchase") { ContentCard {
-                Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
-                Text(stringResource(R.string.developer_purchase_body), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(stringResource(R.string.developer_purchase_banner), style = MaterialTheme.typography.bodyMedium)
-                        Text(stringResource(R.string.developer_purchase_note), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                Button(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.developer_purchase_button)) }
-                HorizontalDivider()
-                Text(stringResource(R.string.installation_id_label), style = MaterialTheme.typography.titleMedium)
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(state.premium.developerInstallationId, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f).testTag("installationId"))
-                    IconButton(onClick = {
-                        clipboard.setText(AnnotatedString(state.premium.developerInstallationId))
-                        scope.launch { snackbar.showSnackbar(context.getString(R.string.installation_id_copied)) }
-                    }) { Icon(Icons.Default.ContentCopy, stringResource(R.string.installation_id_copy)) }
-                }
-                Text(stringResource(R.string.activation_code_label), style = MaterialTheme.typography.titleMedium)
-                OutlinedTextField(value = activationCode, onValueChange = { activationCode = it }, modifier = Modifier.fillMaxWidth().testTag("activationCodeField"),
-                    singleLine = true, label = { Text(stringResource(R.string.activation_code_hint)) })
-                Button(onClick = { model.activateDeveloperCode(activationCode); activationCode = "" }, enabled = activationCode.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.activation_code_button))
-                }
+            if (!state.premium.entitled || state.premium.expiresAtMillis != null || state.premium.source == PremiumSource.OFFICIAL_DEVELOPER) item(key = "developerPurchase") { ContentCard {
+                DeveloperActivationPanel(state.premium, activationCode, { activationCode = it }, state.activating,
+                    onActivate = { model.activateDeveloperCode(activationCode) { activationCode = "" } },
+                    onCopy = { request ->
+                        clipboard.setText(AnnotatedString(request))
+                        scope.launch { snackbar.showSnackbar(context.getString(R.string.activation_request_copied)) }
+                    }, onSupport = onSupport)
             } }
             item(key = "rates") { ContentCard {
                 Text(stringResource(R.string.reference_rates), style = MaterialTheme.typography.titleLarge)

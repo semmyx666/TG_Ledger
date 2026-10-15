@@ -182,10 +182,10 @@
     <string name="premium_expires">Активація дійсна до %1$s</string>
     <string name="premium_assistant_toggle">Показувати персонажа-помічника</string>
     <string name="premium_assistant_toggle_hint">Увімкніть або вимкніть маскота на головному екрані. Доступно лише з активною підпискою Plus.</string>
-    <string name="developer_purchase_title">Купити безпосередньо в розробника</string>
-    <string name="developer_purchase_body">Купи довічний Plus напряму: зв’яжися з розробником у Telegram, узгодь ціну, сплати та отримай підписаний довічний код для свого ID встановлення.</string>
-    <string name="developer_purchase_banner">Пряма довічна активація · лише офіційний розробник</string>
-    <string name="developer_purchase_note">Примітка: згадайте TG Plus і свій ідентифікатор встановлення, коли пишете розробнику щодо покупки.</string>
+    <string name="developer_purchase_title">Активація TG Plus</string>
+    <string name="developer_purchase_body">Код відкриває Plus на виданий термін або безстроково. Узгодьте ціну та підтвердьте оплату з розробником перед отриманням коду.</string>
+    <string name="developer_purchase_banner">Пряма активація · лише офіційний розробник</string>
+    <string name="developer_purchase_note">Надішліть розробнику запит активації. Він містить ID інсталяції та Key ID, але не ваші приватні дані чи ключ підпису.</string>
     <string name="developer_purchase_button">Написати розробнику в Telegram</string>
     <string name="installation_id_label">Ваш ідентифікатор встановлення</string>
     <string name="installation_id_copy">Скопіювати ідентифікатор встановлення</string>
@@ -396,5 +396,18 @@
     <string name="import_confirm_enabled">Сповіщення про збережені платежі ввімкнено</string>
     <string name="assistant_write_short">Написати</string>
     <string name="major_release_title">Що нового у %1$s</string>
-    <string name="major_release_body">• API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
+    <string name="major_release_body">Менеджер активацій для Windows; ключі поза папкою версії; автоматичне налаштування публічного ключа, видимий Key ID та точні причини відмови. Старі коди підтримуються. • API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
+    <string name="activation_key_id">Key ID активації: %1$s</string>
+    <string name="activation_copy_request">Скопіювати запит активації</string>
+    <string name="activation_request_copied">Запит скопійовано; надішліть його розробнику.</string>
+    <string name="activation_checking">Перевірка…</string>
+    <string name="activation_not_configured">Активацію не налаштовано в цій збірці. Розробник має налаштувати публічний ключ і перевстановити оновлення. Не видаляйте застосунок.</string>
+    <string name="activation_key_mismatch">Код підписано іншим ключем. Надішліть запит активації розробнику та звірте Key ID.</string>
+    <string name="activation_malformed">Код неповний або пошкоджений. Скопіюйте лише повний код активації. Переноси рядків дозволені.</string>
+    <string name="activation_signature">Підпис не відповідає цій збірці. Скопіюйте код знову та звірте Key ID розробника.</string>
+    <string name="activation_device">Код видано для іншої інсталяції. Надішліть поточний запит активації з цього застосунку.</string>
+    <string name="activation_product">Код видано для іншого продукту. Попросіть код TG Plus.</string>
+    <string name="activation_clock">Код видано в майбутньому. Перевірте автоматичну дату й час на телефоні та комп’ютері розробника.</string>
+    <string name="activation_expired">Термін дії коду завершився. Попросіть новий код.</string>
+    <string name="activation_storage">Не вдалося безпечно зберегти код. Повторіть або зверніться до підтримки; не очищуйте дані застосунку.</string>
 </resources>

@@ -13,7 +13,7 @@ tracked = sorted(set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text
 version = re.search(r'versionName = "([^"]+)"', (ROOT / 'app/build.gradle.kts').read_text())[1]
 langs = {'.kt':'kotlin', '.kts':'kotlin', '.java':'java', '.py':'python', '.xml':'xml',
          '.yml':'yaml', '.yaml':'yaml', '.properties':'properties', '.ps1':'powershell',
-         '.bat':'batch', '.toml':'toml', '.json':'json'}
+         '.bat':'batch', '.cmd':'batch', '.toml':'toml', '.json':'json'}
 source = [p for p in tracked if Path(p).suffix in langs or p == 'gradlew']
 book = [f'# TG Ledger {version} — complete file-by-file source', '',
         f'{len(source)} implementation, configuration and test files, without truncation.', '',

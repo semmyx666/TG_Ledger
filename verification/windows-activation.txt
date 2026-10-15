@@ -1,0 +1,28 @@
+TG Ledger 4.4.0: native Windows runner
+CI: https://github.com/semmyx666/TG_Ledger/actions/runs/38732319264
+Job: 116412843453, activation-windows, success
+Tested source: 010aeec90dbaf5fc6a754e1fcbc09345438bbd1c
+
+test_adopts_legacy_key_without_searching_arbitrary_directories (test_activation.ActivationTests.test_adopts_legacy_key_without_searching_arbitrary_directories) ... ok
+test_cannot_silently_replace_existing_stable_key (test_activation.ActivationTests.test_cannot_silently_replace_existing_stable_key) ... ok
+test_cli_paths_with_unicode_spaces_and_code_only_stdout (test_activation.ActivationTests.test_cli_paths_with_unicode_spaces_and_code_only_stdout) ... ok
+test_create_is_explicit (test_activation.ActivationTests.test_create_is_explicit) ... ok
+test_create_never_replaces_existing_key (test_activation.ActivationTests.test_create_never_replaces_existing_key) ... ok
+test_explicit_create_and_second_setup_reuse (test_activation.ActivationTests.test_explicit_create_and_second_setup_reuse) ... ok
+test_import_preserves_original_and_configures_local_public_key (test_activation.ActivationTests.test_import_preserves_original_and_configures_local_public_key) ... ok
+test_invalid_durations_and_separator_injection (test_activation.ActivationTests.test_invalid_durations_and_separator_injection) ... ok
+test_legacy_generate_does_not_overwrite_public_or_private (test_activation.ActivationTests.test_legacy_generate_does_not_overwrite_public_or_private) ... ok
+test_malformed_request (test_activation.ActivationTests.test_malformed_request) ... ok
+test_permanent_and_legacy_formats (test_activation.ActivationTests.test_permanent_and_legacy_formats) ... ok
+test_private_file_permissions (test_activation.ActivationTests.test_private_file_permissions) ... ok
+test_project_mismatch_blocks_issuance (test_activation.ActivationTests.test_project_mismatch_blocks_issuance) ... ok
+test_redirected_ascii_console_cannot_break_import_of_cyrillic_path (test_activation.ActivationTests.test_redirected_ascii_console_cannot_break_import_of_cyrillic_path) ... ok
+test_request_checks_actual_app_key_and_product (test_activation.ActivationTests.test_request_checks_actual_app_key_and_product) ... ok
+test_stable_key_survives_next_project_folder (test_activation.ActivationTests.test_stable_key_survives_next_project_folder) ... ok
+test_stale_global_gradle_key_cannot_override_local_setup (test_activation.ActivationTests.test_stale_global_gradle_key_cannot_override_local_setup) ... ok
+test_valid_signature_and_exact_five_day_duration (test_activation.ActivationTests.test_valid_signature_and_exact_five_day_duration) ... ok
+test_wrong_app_key_is_blocked (test_activation.ActivationTests.test_wrong_app_key_is_blocked) ... ok
+test_wrong_key_type_is_rejected (test_activation.ActivationTests.test_wrong_key_type_is_rejected) ... ok
+Ran 20 tests in 3.203s
+OK
+GUI_SMOKE_OK: window, project diagnosis, issuance and clipboard

@@ -182,10 +182,10 @@
     <string name="premium_expires">Activation valid until %1$s</string>
     <string name="premium_assistant_toggle">Show assistant character</string>
     <string name="premium_assistant_toggle_hint">Turn the dashboard mascot on or off. Only visible with an active Plus subscription.</string>
-    <string name="developer_purchase_title">Buy directly from the developer</string>
-    <string name="developer_purchase_body">Buy lifetime Plus directly: contact the developer on Telegram to confirm the price, pay and receive a signed lifetime code for your installation ID.</string>
-    <string name="developer_purchase_banner">Direct lifetime activation · official developer only</string>
-    <string name="developer_purchase_note">Note: mention TG Plus and your installation ID when you write to the developer about your purchase.</string>
+    <string name="developer_purchase_title">TG Plus activation</string>
+    <string name="developer_purchase_body">A code unlocks Plus for its issued duration or permanently. Agree on the price and confirm payment with the developer before requesting a code.</string>
+    <string name="developer_purchase_banner">Direct activation · official developer only</string>
+    <string name="developer_purchase_note">Send the activation request to the developer. It contains the installation and Key ID, not your private data or signing key.</string>
     <string name="developer_purchase_button">Message the developer on Telegram</string>
     <string name="installation_id_label">Your installation ID</string>
     <string name="installation_id_copy">Copy installation ID</string>
@@ -396,5 +396,18 @@
     <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
     <string name="assistant_write_short">Write</string>
     <string name="major_release_title">What is new in %1$s</string>
-    <string name="major_release_body">• monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
+    <string name="major_release_body">Activation manager for Windows; signing keys outside version folders; automatic public-key setup, visible Key ID and precise activation errors. Old codes remain supported. • monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
+    <string name="activation_key_id">Activation Key ID: %1$s</string>
+    <string name="activation_copy_request">Copy activation request</string>
+    <string name="activation_request_copied">Activation request copied; send it to the developer.</string>
+    <string name="activation_checking">Checking…</string>
+    <string name="activation_not_configured">Activation is not configured in this build. The developer must configure the public key and rebuild. Do not uninstall the app.</string>
+    <string name="activation_key_mismatch">This code uses a different signing key. Send the activation request to the developer; compare Key IDs.</string>
+    <string name="activation_malformed">The code is incomplete or damaged. Copy only the complete activation code. Line breaks are allowed.</string>
+    <string name="activation_signature">The signature does not match this build. Copy the code again and compare the developer Key ID.</string>
+    <string name="activation_device">This code is for another installation. Send the current activation request from this app.</string>
+    <string name="activation_product">This code is for a different product. Request a TG Plus code.</string>
+    <string name="activation_clock">The code was issued in the future. Check automatic date/time on the phone and issuer computer.</string>
+    <string name="activation_expired">This activation code has expired. Request a new code.</string>
+    <string name="activation_storage">The code could not be saved securely. Retry or contact support; do not clear application data.</string>
 </resources>

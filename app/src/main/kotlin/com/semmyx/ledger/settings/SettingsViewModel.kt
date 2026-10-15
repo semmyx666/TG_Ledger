@@ -14,6 +14,7 @@ data class SettingsState(
     val rates: List<ExchangeRate> = emptyList(),
     val refreshing: Boolean = false,
     val failed: Boolean = false,
+    val activating: Boolean = false,
 )
 
 class SettingsViewModel(
@@ -23,10 +24,11 @@ class SettingsViewModel(
     private val configureBiometrics: suspend (Boolean) -> Unit,
 ) : ViewModel() {
     private val refreshing = MutableStateFlow(false)
+    private val activating = MutableStateFlow(false)
     private val eventChannel = Channel<UiMessage>(Channel.BUFFERED)
     val events = eventChannel.receiveAsFlow()
-    val state = combine(preferences.preferences, premium.state, rates.rates, refreshing) { prefs, access, rates, busy ->
-        SettingsState(prefs, access, rates, busy)
+    val state = combine(preferences.preferences, premium.state, rates.rates, refreshing, activating) { prefs, access, rates, busy, checking ->
+        SettingsState(prefs, access, rates, busy, activating = checking)
     }.catch { error ->
         if (error is kotlinx.coroutines.CancellationException) throw error
         emit(SettingsState(failed = true))
@@ -59,11 +61,16 @@ class SettingsViewModel(
     }
     fun restorePurchases() = change { premium.refresh() }
     /** Verifies a developer-issued Telegram-sale activation code and grants TG Plus offline if valid. */
-    fun activateDeveloperCode(code: String) {
+    fun activateDeveloperCode(code: String, onAccepted: () -> Unit = {}) {
+        if (activating.value) return
         if (code.isBlank()) { eventChannel.trySend(UiMessage.ACTIVATION_INVALID); return }
-        guarded(onError = { eventChannel.trySend(UiMessage.STORAGE) }) {
-            val granted = premium.activateDeveloperToken(code)
-            eventChannel.send(if (granted) UiMessage.PREMIUM_ACTIVATED else UiMessage.ACTIVATION_INVALID)
+        activating.value = true
+        guarded(onError = { activating.value = false; eventChannel.trySend(UiMessage.STORAGE) }) {
+            try {
+                val granted = premium.activateDeveloperToken(code)
+                if (granted) onAccepted()
+                eventChannel.send(if (granted) UiMessage.PREMIUM_ACTIVATED else UiMessage.ACTIVATION_INVALID)
+            } finally { activating.value = false }
         }
     }
     fun refreshRates() {
