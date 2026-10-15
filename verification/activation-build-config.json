@@ -1,0 +1,28 @@
+{
+  "kind": "actual-gradle-configuration-tests",
+  "checks": [
+    {
+      "check": "activation-gradle-local-wins",
+      "passed": true,
+      "expected_success": true
+    },
+    {
+      "check": "activation-gradle-invalid-rejected",
+      "passed": true,
+      "expected_success": false
+    },
+    {
+      "check": "activation-gradle-required-rejected",
+      "passed": true,
+      "expected_success": false
+    },
+    {
+      "check": "activation-gradle-disabled-explicit",
+      "passed": true,
+      "expected_success": true
+    }
+  ],
+  "all_passed": true,
+  "private_keys_created": false,
+  "build_script_sha256": "b1c69d1a39a80abc7f68ff296f4e47ca898aecee0ee7b535c0136ef310e76efe"
+}

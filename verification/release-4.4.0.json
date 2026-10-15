@@ -1,0 +1,92 @@
+{
+  "version": "4.4.0",
+  "version_code": 19,
+  "tested_code_commit": "010aeec90dbaf5fc6a754e1fcbc09345438bbd1c",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38732319264",
+  "jobs": [
+    {
+      "name": "activation-windows",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:08:15Z"
+    },
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:11:52Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:12:22Z"
+    },
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:14:00Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 11970507644,
+      "name": "device-reports-api-26",
+      "size_in_bytes": 227826
+    },
+    {
+      "id": 11970333062,
+      "name": "device-reports-api-36",
+      "size_in_bytes": 234062
+    },
+    {
+      "id": 11970483125,
+      "name": "validation-reports",
+      "size_in_bytes": 229072
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 27,
+    "data_play": 29,
+    "data_legacy_v7": 29
+  },
+  "instrumented": {
+    "api26": {
+      "app": 18,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 18,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "windows": {
+    "unit_tests": 20,
+    "failed": 0,
+    "gui_smoke": true,
+    "clipboard": true,
+    "unicode_paths": true
+  },
+  "activation_build_configuration_checks": 4,
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "user_private_key_accessed": false,
+  "new_production_private_key_shipped": false,
+  "packaging_changes_after_tests": "Reports, documentation, native screenshots, generated source book, manifest only; app/tool/workflow code unchanged."
+}

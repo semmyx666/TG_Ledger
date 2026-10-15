@@ -1,4 +1,4 @@
-TG_Ledger-4.3.3/
+TG_Ledger-4.4.0/
   .github/workflows/android.yml
   .gitignore
   CHANGELOG.md
@@ -8,9 +8,12 @@ TG_Ledger-4.3.3/
   PROJECT_TREE.txt
   README.md
   SOURCE_CODE.md
+  START_ACTIVATION.cmd
+  START_HERE_RU.txt
   app/.gitignore
   app/build.gradle.kts
   app/proguard-rules.pro
+  app/src/androidTest/kotlin/com/semmyx/ledger/ActivationLayoutTest.kt
   app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt
   app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt
   app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt
@@ -57,6 +60,7 @@ TG_Ledger-4.3.3/
   app/src/main/kotlin/com/semmyx/ledger/platform/OwnershipSeal.kt
   app/src/main/kotlin/com/semmyx/ledger/platform/RateRefreshWorker.kt
   app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt
+  app/src/main/kotlin/com/semmyx/ledger/settings/DeveloperActivationPanel.kt
   app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt
   app/src/main/kotlin/com/semmyx/ledger/settings/SettingsScreen.kt
   app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt
@@ -105,6 +109,7 @@ TG_Ledger-4.3.3/
   app/src/test/java/com/example/myapplication/ExampleUnitTest.kt
   app/src/test/kotlin/com/semmyx/ledger/BankViewModelAccessTest.kt
   app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt
+  app/src/test/kotlin/com/semmyx/ledger/SettingsActivationTest.kt
   app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt
   app/src/test/kotlin/com/semmyx/ledger/cat/CatFaceMeshTest.kt
   app/src/test/kotlin/com/semmyx/ledger/voice/FinanceUpgradeTest.kt
@@ -119,6 +124,7 @@ TG_Ledger-4.3.3/
   data/schemas/README.md
   data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/2.json
   data/schemas/com.semmyx.ledger.data.local.LedgerDatabase/3.json
+  data/src/androidTest/kotlin/com/semmyx/ledger/data/DeveloperActivationPersistenceTest.kt
   data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt
   data/src/androidTest/kotlin/com/semmyx/ledger/data/RoomRepositoryTest.kt
   data/src/legacyV7/kotlin/com/semmyx/ledger/data/billing/BillingVersionAdapter.kt
@@ -145,9 +151,12 @@ TG_Ledger-4.3.3/
   data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt
   data/src/test/kotlin/com/semmyx/ledger/data/bank/MonobankClientTest.kt
   data/src/test/kotlin/com/semmyx/ledger/data/bank/PrivatBankClientTest.kt
+  data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt
   data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
+  data/src/test/resources/activation_python.json
+  docs/ACTIVATION_4.4.0_RU.md
   docs/ARCHITECTURE.md
-  docs/BANKS_4.3.3_RU.md
+  docs/BANKS_4.4.0_RU.md
   docs/BANK_IMPORT_3_RU.md
   docs/CINEMATIC_REDESIGN_UK.md
   docs/COLORS_2_4.md
@@ -197,22 +206,27 @@ TG_Ledger-4.3.3/
   proof/MANIFEST-3.3.2.sha256
   proof/MANIFEST-3.3.2.sha256.ots
   settings.gradle.kts
+  tools/activation_manager.py
   tools/audit_project.py
   tools/export_sources.py
   tools/issue_activation_code.py
+  tools/requirements-activation.txt
   tools/run_device_tests.sh
+  tools/tests/test_activation.py
   tools/verify_bank_regex.py
   tools/verify_bank_sql.py
   tools/verify_navigation_recovery.py
   tools/verify_upgrade_sql.py
   tools/verify_voice_regex.py
-  verification/RELEASE_4.3.3.md
+  verification/RELEASE_4.4.0.md
   verification/STATUS.md
+  verification/activation-build-config.json
   verification/android-build-3.1.log
   verification/android-build-attempt.log
   verification/bank-regex-jvm.json
   verification/bank-sql.json
   verification/cat-skin-assets.json
+  verification/device-reports/android-26/app/com.semmyx.ledger.ActivationLayoutTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.BankBackgroundImportTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.BankScreenLayoutTest.html
   verification/device-reports/android-26/app/com.semmyx.ledger.CompactLayoutTest.html
@@ -222,6 +236,7 @@ TG_Ledger-4.3.3/
   verification/device-reports/android-26/app/css/style.css
   verification/device-reports/android-26/app/index.html
   verification/device-reports/android-26/app/js/report.js
+  verification/device-reports/android-26/data/com.semmyx.ledger.data.DeveloperActivationPersistenceTest.html
   verification/device-reports/android-26/data/com.semmyx.ledger.data.KeystoreSecurityTest.html
   verification/device-reports/android-26/data/com.semmyx.ledger.data.RoomRepositoryTest.html
   verification/device-reports/android-26/data/com.semmyx.ledger.data.html
@@ -229,6 +244,7 @@ TG_Ledger-4.3.3/
   verification/device-reports/android-26/data/css/style.css
   verification/device-reports/android-26/data/index.html
   verification/device-reports/android-26/data/js/report.js
+  verification/device-reports/android-36/app/com.semmyx.ledger.ActivationLayoutTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.BankBackgroundImportTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.BankScreenLayoutTest.html
   verification/device-reports/android-36/app/com.semmyx.ledger.CompactLayoutTest.html
@@ -238,6 +254,7 @@ TG_Ledger-4.3.3/
   verification/device-reports/android-36/app/css/style.css
   verification/device-reports/android-36/app/index.html
   verification/device-reports/android-36/app/js/report.js
+  verification/device-reports/android-36/data/com.semmyx.ledger.data.DeveloperActivationPersistenceTest.html
   verification/device-reports/android-36/data/com.semmyx.ledger.data.KeystoreSecurityTest.html
   verification/device-reports/android-36/data/com.semmyx.ledger.data.RoomRepositoryTest.html
   verification/device-reports/android-36/data/com.semmyx.ledger.data.html
@@ -248,14 +265,18 @@ TG_Ledger-4.3.3/
   verification/gradle-attempt.txt
   verification/history/3.3.3/RELEASE_3.3.3.md
   verification/history/3.3.3/release-3.3.3.json
+  verification/history/4.3.3/RELEASE_4.3.3.md
+  verification/history/4.3.3/release-4.3.3.json
   verification/navigation-recovery.json
-  verification/release-4.3.3.json
+  verification/release-4.4.0.json
   verification/screenshots/README.md
+  verification/screenshots/android-26/activation-320dp-font140-uk.png
   verification/screenshots/android-26/bank-320dp-font140-uk.png
   verification/screenshots/android-26/category-320dp-font140-uk.png
   verification/screenshots/android-26/compact-288dp-uk.png
   verification/screenshots/android-26/compact-320dp-font170-uk.png
   verification/screenshots/android-26/compact-360dp-uk.png
+  verification/screenshots/android-36/activation-320dp-font140-uk.png
   verification/screenshots/android-36/bank-320dp-font140-uk.png
   verification/screenshots/android-36/category-320dp-font140-uk.png
   verification/screenshots/android-36/compact-288dp-uk.png
@@ -264,3 +285,4 @@ TG_Ledger-4.3.3/
   verification/source-audit.json
   verification/upgrade-sql.json
   verification/voice-regex-jvm.json
+  verification/windows-activation.txt

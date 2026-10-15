@@ -1,6 +1,6 @@
-# TG Ledger 4.3.3 — complete file-by-file source
+# TG Ledger 4.4.0 — complete file-by-file source
 
-167 implementation, configuration and test files, without truncation.
+178 implementation, configuration and test files, without truncation.
 
 Generated from tracked files. Local keys and build outputs are excluded.
 
@@ -15,6 +15,18 @@ on:
 permissions:
   contents: read
 jobs:
+  activation-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r tools/requirements-activation.txt
+      - name: Activation CLI regression
+        run: python -m unittest discover -s tools/tests -v
+      - name: Native Windows manager smoke test
+        run: python tools/activation_manager.py --smoke-test
   build:
     runs-on: ubuntu-latest
     steps:
@@ -85,9 +97,35 @@ jobs:
             verification/device-screenshots/
 ```
 
+## START_ACTIVATION.cmd
+
+```batch
+@echo off
+chcp 65001 >nul
+cd /d "%~dp0"
+where py >nul 2>nul
+if not errorlevel 1 (
+    py -3 -X utf8 tools\activation_manager.py
+) else (
+    python -X utf8 tools\activation_manager.py
+)
+if errorlevel 1 (
+    echo.
+    echo Could not start activation manager. Install Python 3 with tkinter, then retry.
+    pause
+)
+```
+
 ## app/build.gradle.kts
 
 ```kotlin
+import java.util.Properties
+import java.util.Base64
+import java.security.KeyFactory
+import java.security.MessageDigest
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.X509EncodedKeySpec
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -98,7 +136,24 @@ plugins {
 fun quoted(value: String) = "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 val playKey = providers.gradleProperty("PLAY_LICENSE_KEY").orElse("")
 val product = providers.gradleProperty("PREMIUM_PRODUCT_ID").orElse("ledger_plus")
-val developerKey = providers.gradleProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY").orElse("")
+// Per-project setup is authoritative, so stale ~/.gradle values cannot silently override it.
+val activationFile = rootProject.file("activation-public.properties")
+val activationProperties = Properties().apply {
+    if (activationFile.exists()) activationFile.inputStream().use { load(it) }
+}
+val developerKey = if (activationFile.exists()) activationProperties.getProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", "").trim()
+    else providers.gradleProperty("DEVELOPER_SUBSCRIPTION_PUBLIC_KEY").orElse("").get().trim()
+val developerKeyId = if (developerKey.isBlank()) "" else try {
+    val key = KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(developerKey))) as RSAPublicKey
+    check(key.modulus.bitLength() >= 2048)
+    MessageDigest.getInstance("SHA-256").digest(key.encoded).take(8).joinToString("") { "%02X".format(it) }
+} catch (error: Exception) { throw GradleException("Invalid activation public key. Run START_ACTIVATION.cmd to configure this project.", error) }
+if (providers.gradleProperty("REQUIRE_DEVELOPER_ACTIVATION").orElse("false").get().toBoolean() && developerKeyId.isEmpty()) {
+    throw GradleException("Activation is not configured. Run START_ACTIVATION.cmd, import/create your key, then build again.")
+}
+tasks.register("activationDoctor") {
+    doLast { println("Developer activation Key ID: " + developerKeyId.ifEmpty { "NOT CONFIGURED" }) }
+}
 val legacyApproved = providers.gradleProperty("LEGACY_BILLING_EXTENSION_APPROVED").orElse("false")
 
 android {
@@ -108,12 +163,12 @@ android {
         applicationId = "com.semmyx.ledger"
         minSdk = 26
         targetSdk = 36
-        versionCode = 18
-        versionName = "4.3.3"
+        versionCode = 19
+        versionName = "4.4.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "PLAY_LICENSE_KEY", quoted(playKey.get()))
         buildConfigField("String", "PREMIUM_PRODUCT_ID", quoted(product.get()))
-        buildConfigField("String", "DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", quoted(developerKey.get()))
+        buildConfigField("String", "DEVELOPER_SUBSCRIPTION_PUBLIC_KEY", quoted(developerKey))
         resourceConfigurations += listOf("en", "uk")
     }
     flavorDimensions += "billing"
@@ -190,6 +245,53 @@ dependencies {
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+}
+```
+
+## app/src/androidTest/kotlin/com/semmyx/ledger/ActivationLayoutTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.*
+import androidx.compose.ui.test.*
+import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.settings.DeveloperActivationPanel
+import com.semmyx.ledger.theme.*
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class ActivationLayoutTest {
+    @get:Rule val compose=createComposeRule()
+    @Test fun activationRemainsReadableAt320dpAndLargeFont() {
+        val premium=PremiumState(developerPurchaseEnabled=true,developerInstallationId="AB12-CD34-EF56",
+            developerKeyId="1234567890ABCDEF",activationProblem=ActivationProblem.KEY_MISMATCH)
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            val density=LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density,1.4f)) {
+                Column(Modifier.width(320.dp).fillMaxHeight().verticalScroll(rememberScrollState()).padding(12.dp)) {
+                    DeveloperActivationPanel(premium,"TG2.example",{},false,{},{},{})
+                }
+            }
+        } } }
+        compose.onNodeWithTag("activationKeyId").performScrollTo().assertIsDisplayed()
+        val layouts=mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithTag("activationKeyId").performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        NativeScreenshots.save(compose.onRoot().captureToImage(),"activation-320dp-font140-uk")
+        assertTrue(layouts.isNotEmpty());assertFalse("Key ID layout: ${layouts.map { "size=${it.size} width=${it.didOverflowWidth} height=${it.didOverflowHeight} constraints=${it.layoutInput.constraints}" }}",layouts.any { it.hasVisualOverflow })
+        compose.onNodeWithTag("activateDeveloperCode").performScrollTo().assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("activationProblem").performScrollTo().assertIsDisplayed()
+    }
 }
 ```
 
@@ -560,6 +662,31 @@ class ComposeScreensTest {
         compose.onNodeWithTag("releaseHighlights").assertTextEquals("Що нового у " + BuildConfig.VERSION_NAME)
         compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API monobank збережено",substring=true)
         compose.onNodeWithTag("releaseHighlightsBody").assertTextContains("API ПриватБанку",substring=true)
+    }
+
+    @Test fun activationRequestIncludesTheInstalledKeyAndFailedInputIsNotDiscarded() {
+        var input by mutableStateOf("bad-code")
+        var copied = ""
+        var attempts = 0
+        val premium = com.semmyx.ledger.domain.PremiumState(developerPurchaseEnabled=true,
+            developerInstallationId="AB12-CD34-EF56",developerKeyId="1234567890ABCDEF",
+            activationProblem=com.semmyx.ledger.domain.ActivationProblem.KEY_MISMATCH)
+        compose.setContent { LocalizedContent(AppLanguage.ENGLISH) { LedgerTheme {
+            com.semmyx.ledger.settings.DeveloperActivationPanel(premium,input,{input=it},false,{attempts++},{copied=it},{})
+        } } }
+        compose.onNodeWithTag("copyActivationRequest").performClick()
+        compose.runOnIdle { assertEquals("TGREQ1|AB12-CD34-EF56|1234567890ABCDEF|ledger_plus",copied) }
+        compose.onNodeWithTag("activateDeveloperCode").performClick()
+        compose.onNodeWithTag("activationCodeField").assertTextContains("bad-code")
+        compose.onNodeWithTag("activationProblem").assertTextContains("different signing key",substring=true)
+        compose.runOnIdle { assertEquals(1,attempts) }
+    }
+    @Test fun unconfiguredActivationIsExplainedRatherThanHidden() {
+        compose.setContent { LocalizedContent(AppLanguage.UKRAINIAN) { LedgerTheme {
+            com.semmyx.ledger.settings.DeveloperActivationPanel(com.semmyx.ledger.domain.PremiumState(),"",{},false,{},{},{})
+        } } }
+        compose.onNodeWithTag("activationNotConfigured").assertIsDisplayed()
+        compose.onNodeWithTag("activateDeveloperCode").assertDoesNotExist()
     }
 
 }
@@ -4915,6 +5042,69 @@ private fun roleLabel(role: String): Int = when (role) {
 }
 ```
 
+## app/src/main/kotlin/com/semmyx/ledger/settings/DeveloperActivationPanel.kt
+
+```kotlin
+package com.semmyx.ledger.settings
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import com.semmyx.ledger.R
+import com.semmyx.ledger.domain.ActivationProblem
+import com.semmyx.ledger.domain.PremiumState
+
+fun activationRequest(state: PremiumState): String =
+    "TGREQ1|${state.developerInstallationId}|${state.developerKeyId}|${state.developerProductId}"
+
+@Composable
+fun DeveloperActivationPanel(state: PremiumState, code: String, onCodeChange: (String) -> Unit,
+    busy: Boolean, onActivate: () -> Unit, onCopy: (String) -> Unit, onSupport: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
+        Text(stringResource(R.string.developer_purchase_body), style = MaterialTheme.typography.bodyMedium)
+        Text(stringResource(R.string.installation_id_label) + ": " + state.developerInstallationId, modifier = Modifier.testTag("installationId"))
+        Text(stringResource(R.string.activation_key_id, state.developerKeyId.chunked(4).joinToString(" ").ifEmpty { "—" }),
+            style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth().testTag("activationKeyId"))
+        if (!state.developerPurchaseEnabled) {
+            Text(stringResource(R.string.activation_not_configured), color = MaterialTheme.colorScheme.error,
+                modifier = Modifier.testTag("activationNotConfigured"))
+        } else {
+            OutlinedButton(onClick = { onCopy(activationRequest(state)) }, modifier = Modifier.fillMaxWidth().testTag("copyActivationRequest")) {
+                Text(stringResource(R.string.activation_copy_request))
+            }
+            OutlinedTextField(value = code, onValueChange = { onCodeChange(it.take(16384)) },
+                modifier = Modifier.fillMaxWidth().testTag("activationCodeField"), minLines = 2, maxLines = 4,
+                label = { Text(stringResource(R.string.activation_code_label)) },
+                supportingText = { Text(stringResource(R.string.activation_code_hint)) })
+            state.activationProblem?.let {
+                Text(stringResource(when (it) {
+                    ActivationProblem.NOT_CONFIGURED -> R.string.activation_not_configured
+                    ActivationProblem.KEY_MISMATCH -> R.string.activation_key_mismatch
+                    ActivationProblem.MALFORMED -> R.string.activation_malformed
+                    ActivationProblem.SIGNATURE -> R.string.activation_signature
+                    ActivationProblem.DEVICE -> R.string.activation_device
+                    ActivationProblem.PRODUCT -> R.string.activation_product
+                    ActivationProblem.CLOCK -> R.string.activation_clock
+                    ActivationProblem.EXPIRED -> R.string.activation_expired
+                    ActivationProblem.STORAGE -> R.string.activation_storage
+                }), color = MaterialTheme.colorScheme.error, modifier = Modifier.testTag("activationProblem"))
+            }
+            Button(onClick = onActivate, enabled = code.isNotBlank() && !busy,
+                modifier = Modifier.fillMaxWidth().testTag("activateDeveloperCode")) {
+                Text(stringResource(if (busy) R.string.activation_checking else R.string.activation_code_button))
+            }
+        }
+        OutlinedButton(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.developer_purchase_button)) }
+        Text(stringResource(R.string.developer_purchase_note), style = MaterialTheme.typography.bodySmall)
+    }
+}
+```
+
 ## app/src/main/kotlin/com/semmyx/ledger/settings/RestorePurchasesAction.kt
 
 ```kotlin
@@ -5124,36 +5314,18 @@ fun SettingsRoute(model: SettingsViewModel, biometricAvailable: Boolean, onNavig
                     }
                 }
                 if (state.premium.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION }?.let {
+                state.premium.issue?.takeUnless { it == BillingIssue.CONFIGURATION || it == BillingIssue.ACTIVATION_CODE }?.let {
                     Text(stringResource(it.label()), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
                 }
                 RestorePurchasesAction(enabled = !state.premium.busy, onClick = model::restorePurchases)
             } }
-            if (state.premium.developerPurchaseEnabled && (!state.premium.entitled || state.premium.expiresAtMillis != null)) item(key = "developerPurchase") { ContentCard {
-                Text(stringResource(R.string.developer_purchase_title), style = MaterialTheme.typography.titleLarge)
-                Text(stringResource(R.string.developer_purchase_body), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Surface(shape = MaterialTheme.shapes.medium, color = MaterialTheme.colorScheme.secondaryContainer, modifier = Modifier.fillMaxWidth()) {
-                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(stringResource(R.string.developer_purchase_banner), style = MaterialTheme.typography.bodyMedium)
-                        Text(stringResource(R.string.developer_purchase_note), style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                Button(onClick = onSupport, modifier = Modifier.fillMaxWidth()) { Text(stringResource(R.string.developer_purchase_button)) }
-                HorizontalDivider()
-                Text(stringResource(R.string.installation_id_label), style = MaterialTheme.typography.titleMedium)
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(state.premium.developerInstallationId, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f).testTag("installationId"))
-                    IconButton(onClick = {
-                        clipboard.setText(AnnotatedString(state.premium.developerInstallationId))
-                        scope.launch { snackbar.showSnackbar(context.getString(R.string.installation_id_copied)) }
-                    }) { Icon(Icons.Default.ContentCopy, stringResource(R.string.installation_id_copy)) }
-                }
-                Text(stringResource(R.string.activation_code_label), style = MaterialTheme.typography.titleMedium)
-                OutlinedTextField(value = activationCode, onValueChange = { activationCode = it }, modifier = Modifier.fillMaxWidth().testTag("activationCodeField"),
-                    singleLine = true, label = { Text(stringResource(R.string.activation_code_hint)) })
-                Button(onClick = { model.activateDeveloperCode(activationCode); activationCode = "" }, enabled = activationCode.isNotBlank(), modifier = Modifier.fillMaxWidth()) {
-                    Text(stringResource(R.string.activation_code_button))
-                }
+            if (!state.premium.entitled || state.premium.expiresAtMillis != null || state.premium.source == PremiumSource.OFFICIAL_DEVELOPER) item(key = "developerPurchase") { ContentCard {
+                DeveloperActivationPanel(state.premium, activationCode, { activationCode = it }, state.activating,
+                    onActivate = { model.activateDeveloperCode(activationCode) { activationCode = "" } },
+                    onCopy = { request ->
+                        clipboard.setText(AnnotatedString(request))
+                        scope.launch { snackbar.showSnackbar(context.getString(R.string.activation_request_copied)) }
+                    }, onSupport = onSupport)
             } }
             item(key = "rates") { ContentCard {
                 Text(stringResource(R.string.reference_rates), style = MaterialTheme.typography.titleLarge)
@@ -5228,6 +5400,7 @@ data class SettingsState(
     val rates: List<ExchangeRate> = emptyList(),
     val refreshing: Boolean = false,
     val failed: Boolean = false,
+    val activating: Boolean = false,
 )
 
 class SettingsViewModel(
@@ -5237,10 +5410,11 @@ class SettingsViewModel(
     private val configureBiometrics: suspend (Boolean) -> Unit,
 ) : ViewModel() {
     private val refreshing = MutableStateFlow(false)
+    private val activating = MutableStateFlow(false)
     private val eventChannel = Channel<UiMessage>(Channel.BUFFERED)
     val events = eventChannel.receiveAsFlow()
-    val state = combine(preferences.preferences, premium.state, rates.rates, refreshing) { prefs, access, rates, busy ->
-        SettingsState(prefs, access, rates, busy)
+    val state = combine(preferences.preferences, premium.state, rates.rates, refreshing, activating) { prefs, access, rates, busy, checking ->
+        SettingsState(prefs, access, rates, busy, activating = checking)
     }.catch { error ->
         if (error is kotlinx.coroutines.CancellationException) throw error
         emit(SettingsState(failed = true))
@@ -5273,11 +5447,16 @@ class SettingsViewModel(
     }
     fun restorePurchases() = change { premium.refresh() }
     /** Verifies a developer-issued Telegram-sale activation code and grants TG Plus offline if valid. */
-    fun activateDeveloperCode(code: String) {
+    fun activateDeveloperCode(code: String, onAccepted: () -> Unit = {}) {
+        if (activating.value) return
         if (code.isBlank()) { eventChannel.trySend(UiMessage.ACTIVATION_INVALID); return }
-        guarded(onError = { eventChannel.trySend(UiMessage.STORAGE) }) {
-            val granted = premium.activateDeveloperToken(code)
-            eventChannel.send(if (granted) UiMessage.PREMIUM_ACTIVATED else UiMessage.ACTIVATION_INVALID)
+        activating.value = true
+        guarded(onError = { activating.value = false; eventChannel.trySend(UiMessage.STORAGE) }) {
+            try {
+                val granted = premium.activateDeveloperToken(code)
+                if (granted) onAccepted()
+                eventChannel.send(if (granted) UiMessage.PREMIUM_ACTIVATED else UiMessage.ACTIVATION_INVALID)
+            } finally { activating.value = false }
         }
     }
     fun refreshRates() {
@@ -6742,10 +6921,10 @@ object VoiceSmallTalk {
     <string name="premium_expires">Активація дійсна до %1$s</string>
     <string name="premium_assistant_toggle">Показувати персонажа-помічника</string>
     <string name="premium_assistant_toggle_hint">Увімкніть або вимкніть маскота на головному екрані. Доступно лише з активною підпискою Plus.</string>
-    <string name="developer_purchase_title">Купити безпосередньо в розробника</string>
-    <string name="developer_purchase_body">Купи довічний Plus напряму: зв’яжися з розробником у Telegram, узгодь ціну, сплати та отримай підписаний довічний код для свого ID встановлення.</string>
-    <string name="developer_purchase_banner">Пряма довічна активація · лише офіційний розробник</string>
-    <string name="developer_purchase_note">Примітка: згадайте TG Plus і свій ідентифікатор встановлення, коли пишете розробнику щодо покупки.</string>
+    <string name="developer_purchase_title">Активація TG Plus</string>
+    <string name="developer_purchase_body">Код відкриває Plus на виданий термін або безстроково. Узгодьте ціну та підтвердьте оплату з розробником перед отриманням коду.</string>
+    <string name="developer_purchase_banner">Пряма активація · лише офіційний розробник</string>
+    <string name="developer_purchase_note">Надішліть розробнику запит активації. Він містить ID інсталяції та Key ID, але не ваші приватні дані чи ключ підпису.</string>
     <string name="developer_purchase_button">Написати розробнику в Telegram</string>
     <string name="installation_id_label">Ваш ідентифікатор встановлення</string>
     <string name="installation_id_copy">Скопіювати ідентифікатор встановлення</string>
@@ -6956,7 +7135,20 @@ object VoiceSmallTalk {
     <string name="import_confirm_enabled">Сповіщення про збережені платежі ввімкнено</string>
     <string name="assistant_write_short">Написати</string>
     <string name="major_release_title">Що нового у %1$s</string>
-    <string name="major_release_body">• API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
+    <string name="major_release_body">Менеджер активацій для Windows; ключі поза папкою версії; автоматичне налаштування публічного ключа, видимий Key ID та точні причини відмови. Старі коди підтримуються. • API monobank збережено; додано API ПриватБанку для бізнесу/ФОП.\n• Push банків у фоні та дочитування зі шторки.\n• Одна компактна картка балансу, адаптивні назви й кнопки.\n• Періоди Plus: 7 днів, 30 днів і весь час.\n• Повна довідка про банки та нативні тести Android 8/16.</string>
+    <string name="activation_key_id">Key ID активації: %1$s</string>
+    <string name="activation_copy_request">Скопіювати запит активації</string>
+    <string name="activation_request_copied">Запит скопійовано; надішліть його розробнику.</string>
+    <string name="activation_checking">Перевірка…</string>
+    <string name="activation_not_configured">Активацію не налаштовано в цій збірці. Розробник має налаштувати публічний ключ і перевстановити оновлення. Не видаляйте застосунок.</string>
+    <string name="activation_key_mismatch">Код підписано іншим ключем. Надішліть запит активації розробнику та звірте Key ID.</string>
+    <string name="activation_malformed">Код неповний або пошкоджений. Скопіюйте лише повний код активації. Переноси рядків дозволені.</string>
+    <string name="activation_signature">Підпис не відповідає цій збірці. Скопіюйте код знову та звірте Key ID розробника.</string>
+    <string name="activation_device">Код видано для іншої інсталяції. Надішліть поточний запит активації з цього застосунку.</string>
+    <string name="activation_product">Код видано для іншого продукту. Попросіть код TG Plus.</string>
+    <string name="activation_clock">Код видано в майбутньому. Перевірте автоматичну дату й час на телефоні та комп’ютері розробника.</string>
+    <string name="activation_expired">Термін дії коду завершився. Попросіть новий код.</string>
+    <string name="activation_storage">Не вдалося безпечно зберегти код. Повторіть або зверніться до підтримки; не очищуйте дані застосунку.</string>
 </resources>
 ```
 
@@ -7173,10 +7365,10 @@ object VoiceSmallTalk {
     <string name="premium_expires">Activation valid until %1$s</string>
     <string name="premium_assistant_toggle">Show assistant character</string>
     <string name="premium_assistant_toggle_hint">Turn the dashboard mascot on or off. Only visible with an active Plus subscription.</string>
-    <string name="developer_purchase_title">Buy directly from the developer</string>
-    <string name="developer_purchase_body">Buy lifetime Plus directly: contact the developer on Telegram to confirm the price, pay and receive a signed lifetime code for your installation ID.</string>
-    <string name="developer_purchase_banner">Direct lifetime activation · official developer only</string>
-    <string name="developer_purchase_note">Note: mention TG Plus and your installation ID when you write to the developer about your purchase.</string>
+    <string name="developer_purchase_title">TG Plus activation</string>
+    <string name="developer_purchase_body">A code unlocks Plus for its issued duration or permanently. Agree on the price and confirm payment with the developer before requesting a code.</string>
+    <string name="developer_purchase_banner">Direct activation · official developer only</string>
+    <string name="developer_purchase_note">Send the activation request to the developer. It contains the installation and Key ID, not your private data or signing key.</string>
     <string name="developer_purchase_button">Message the developer on Telegram</string>
     <string name="installation_id_label">Your installation ID</string>
     <string name="installation_id_copy">Copy installation ID</string>
@@ -7387,7 +7579,20 @@ object VoiceSmallTalk {
     <string name="import_confirm_enabled">Saved-payment notifications enabled</string>
     <string name="assistant_write_short">Write</string>
     <string name="major_release_title">What is new in %1$s</string>
-    <string name="major_release_body">• monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
+    <string name="major_release_body">Activation manager for Windows; signing keys outside version folders; automatic public-key setup, visible Key ID and precise activation errors. Old codes remain supported. • monobank API kept; PrivatBank Business API added.\n• Bank push import in the background and catch-up from the shade.\n• One compact balance card and responsive labels/buttons.\n• Protected Plus periods: 7 days, 30 days and all time.\n• Expanded bank help and native Android 8/16 tests.</string>
+    <string name="activation_key_id">Activation Key ID: %1$s</string>
+    <string name="activation_copy_request">Copy activation request</string>
+    <string name="activation_request_copied">Activation request copied; send it to the developer.</string>
+    <string name="activation_checking">Checking…</string>
+    <string name="activation_not_configured">Activation is not configured in this build. The developer must configure the public key and rebuild. Do not uninstall the app.</string>
+    <string name="activation_key_mismatch">This code uses a different signing key. Send the activation request to the developer; compare Key IDs.</string>
+    <string name="activation_malformed">The code is incomplete or damaged. Copy only the complete activation code. Line breaks are allowed.</string>
+    <string name="activation_signature">The signature does not match this build. Copy the code again and compare the developer Key ID.</string>
+    <string name="activation_device">This code is for another installation. Send the current activation request from this app.</string>
+    <string name="activation_product">This code is for a different product. Request a TG Plus code.</string>
+    <string name="activation_clock">The code was issued in the future. Check automatic date/time on the phone and issuer computer.</string>
+    <string name="activation_expired">This activation code has expired. Request a new code.</string>
+    <string name="activation_storage">The code could not be saved securely. Retry or contact support; do not clear application data.</string>
 </resources>
 ```
 
@@ -7560,6 +7765,66 @@ import org.junit.runner.Description
 class MainDispatcherRule(val dispatcher: TestDispatcher = StandardTestDispatcher()) : TestWatcher() {
     override fun starting(description: Description) { Dispatchers.setMain(dispatcher) }
     override fun finished(description: Description) { Dispatchers.resetMain() }
+}
+```
+
+## app/src/test/kotlin/com/semmyx/ledger/SettingsActivationTest.kt
+
+```kotlin
+package com.semmyx.ledger
+
+import androidx.lifecycle.ViewModelStore
+import com.semmyx.ledger.domain.*
+import com.semmyx.ledger.settings.SettingsViewModel
+import java.lang.reflect.Proxy
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.test.*
+import org.junit.*
+import org.junit.Assert.*
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class SettingsActivationTest {
+    @get:Rule val main = MainDispatcherRule()
+    private class Premium : PremiumRepository {
+        override val state = MutableStateFlow(PremiumState())
+        var result = false
+        var calls = 0
+        var wait: CompletableDeferred<Unit>? = null
+        override suspend fun refresh() {}
+        override suspend fun activateDeveloperToken(token: String): Boolean { calls++;wait?.await();return result }
+        override suspend fun developerInstallationId() = "AB12-CD34-EF56"
+        override fun clearIssue() {}
+    }
+    private fun model(premium: Premium): SettingsViewModel {
+        val preferences=Proxy.newProxyInstance(PreferencesRepository::class.java.classLoader,arrayOf(PreferencesRepository::class.java)) { _, _, _ ->
+            MutableStateFlow(UserPreferences())
+        } as PreferencesRepository
+        val rates=object:RateRepository {
+            override val rates=flowOf(emptyList<ExchangeRate>())
+            override suspend fun refresh() {}
+        }
+        return SettingsViewModel(preferences,premium,rates,{})
+    }
+    @Test fun failedActivationDoesNotClearTheCallersInputButSuccessDoes()=runTest {
+        val premium=Premium();val model=model(premium);val store=ViewModelStore().apply { put("settings",model) }
+        var cleared=false
+        try {
+            model.activateDeveloperCode("bad-code") { cleared=true };runCurrent();assertFalse(cleared)
+            premium.result=true
+            model.activateDeveloperCode("valid-code") { cleared=true };runCurrent();assertTrue(cleared)
+        } finally { store.clear() }
+    }
+    @Test fun repeatedTapWhileVerifyingIsIgnoredAndBusyAlwaysClears()=runTest {
+        val premium=Premium().apply { wait=CompletableDeferred() };val model=model(premium)
+        val store=ViewModelStore().apply { put("settings",model) }
+        val collect=backgroundScope.launch(UnconfinedTestDispatcher(testScheduler)) { model.state.collect {} }
+        try {
+            model.activateDeveloperCode("code");model.activateDeveloperCode("code");runCurrent()
+            assertEquals(1,premium.calls);assertTrue(model.state.value.activating)
+            premium.wait!!.complete(Unit);runCurrent();assertFalse(model.state.value.activating)
+        } finally { collect.cancel();store.clear() }
+    }
 }
 ```
 
@@ -8590,6 +8855,88 @@ dependencies {
 }
 ```
 
+## data/src/androidTest/kotlin/com/semmyx/ledger/data/DeveloperActivationPersistenceTest.kt
+
+```kotlin
+package com.semmyx.ledger.data
+
+import android.content.Context
+import android.content.ContextWrapper
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.semmyx.ledger.data.billing.DeveloperSubscriptionVerifier
+import com.semmyx.ledger.data.billing.PlayPremiumRepository
+import com.semmyx.ledger.data.security.KeystoreVault
+import com.semmyx.ledger.domain.*
+import java.io.File
+import java.security.KeyPairGenerator
+import java.security.KeyStore
+import java.security.Signature
+import java.time.Clock
+import java.time.Instant
+import java.time.ZoneOffset
+import java.util.Base64
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
+import org.junit.*
+import org.junit.Assert.*
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class DeveloperActivationPersistenceTest {
+    private lateinit var context: Context
+    private lateinit var scope: CoroutineScope
+    private val pair=KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+    private val publicKey=Base64.getEncoder().encodeToString(pair.public.encoded)
+    private val clock=Clock.fixed(Instant.ofEpochMilli(1767225600000L),ZoneOffset.UTC)
+    @Before fun setup() {
+        val base=ApplicationProvider.getApplicationContext<Context>()
+        context=object:ContextWrapper(base) {
+            override fun getApplicationContext():Context=this
+            override fun getPackageName()=base.packageName+".activationtest"
+            override fun getNoBackupFilesDir()=File(base.cacheDir,"activation-vault-test").apply { mkdirs() }
+        }
+        cleanVault();scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+    }
+    private fun cleanVault() {
+        context.noBackupFilesDir.deleteRecursively();context.noBackupFilesDir.mkdirs()
+        KeyStore.getInstance("AndroidKeyStore").apply { load(null);deleteEntry(context.packageName+".vault.v1") }
+    }
+    @After fun clean() { scope.cancel();cleanVault() }
+    private fun repository()=PlayPremiumRepository(context,KeystoreVault(context),scope,clock,"",publicKey,"ledger_plus")
+    private fun token(id:String,end:String):String {
+        val kid=DeveloperSubscriptionVerifier(publicKey).keyId
+        val raw="v2|$kid|$id|ledger_plus|${clock.millis()}|$end".toByteArray()
+        val sig=Signature.getInstance("SHA256withRSA").run { initSign(pair.private);update(raw);sign() }
+        val encoder=Base64.getUrlEncoder().withoutPadding()
+        return "TG2.$kid.${encoder.encodeToString(raw)}.${encoder.encodeToString(sig)}"
+    }
+    @Test fun codeSurvivesRealAndroidKeystoreAndRepositoryRecreation()=runBlocking {
+        val first=repository();val id=first.developerInstallationId();val end=clock.millis()+5*86400000L
+        assertTrue(first.activateDeveloperToken(token(id,end.toString()).chunked(50).joinToString("\n")))
+        val granted=withTimeout(5000) { first.state.first { it.source==PremiumSource.OFFICIAL_DEVELOPER } }
+        assertEquals(end,granted.expiresAtMillis)
+        val second=repository()
+        val restored=withTimeout(5000) { second.state.first { it.source==PremiumSource.OFFICIAL_DEVELOPER } }
+        assertEquals(end,restored.expiresAtMillis)
+        assertEquals(DeveloperSubscriptionVerifier(publicKey).keyId,restored.developerKeyId)
+        val bytes=File(context.noBackupFilesDir,"security.vault").readBytes().toString(Charsets.ISO_8859_1)
+        assertFalse(bytes.contains("developerActivationCode"));assertFalse(bytes.contains("TG2."))
+    }
+    @Test fun failedCodeCannotRemoveExistingAccessAndOldShortCodeCannotShortenIt()=runBlocking {
+        val repo=repository();val id=repo.developerInstallationId()
+        assertTrue(repo.activateDeveloperToken(token(id,"")))
+        assertTrue(repo.activateDeveloperToken(token(id,(clock.millis()+86400000L).toString())))
+        assertFalse(repo.activateDeveloperToken(token("0000-0000-0000",(clock.millis()+86400000L).toString())))
+        val state=withTimeout(5000) { repo.state.first { it.activationProblem==ActivationProblem.DEVICE } }
+        assertTrue(state.entitled);assertEquals(PremiumSource.OFFICIAL_DEVELOPER,state.source);assertNull(state.expiresAtMillis)
+        assertEquals("",KeystoreVault(context).read { json -> json.optString("developerActivationCode").let { code ->
+            DeveloperSubscriptionVerifier(publicKey).verify(code,id,"ledger_plus",clock.millis())?.expiresAtMillis?.toString().orEmpty()
+        } })
+    }
+}
+```
+
 ## data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt
 
 ```kotlin
@@ -9484,7 +9831,7 @@ class PrivatBankClient(
                 .addQueryParameter("limit", "100")
             cursor?.let { url.addQueryParameter("followId", it) }
             val request = Request.Builder().url(url.build()).get().header("token", token)
-                .header("User-Agent", "TG-Ledger/4.3.3")
+                .header("User-Agent", "TG-Ledger/4.4.0")
                 .header("Content-Type", "application/json;charset=utf8").header("Accept", "application/json").build()
             val root = http.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) throw ApiException(response.code)
@@ -9531,74 +9878,69 @@ class PrivatBankClient(
 ```kotlin
 package com.semmyx.ledger.data.billing
 
+import com.semmyx.ledger.domain.ActivationProblem
 import java.security.KeyFactory
+import java.security.MessageDigest
 import java.security.Signature
+import java.security.interfaces.RSAPublicKey
 import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
+import java.util.Locale
 
-/**
- * Verifies activation codes issued manually by the developer (e.g. after a Telegram sale),
- * for installs where a Google Play purchase is not available or not yet published.
- * Only the developer's private key (never shipped in the app; see tools/issue_activation_code.py)
- * can issue a code. This class only ever holds the public key and can only verify, never issue.
- *
- * Code format (a plain-text token, safe to paste/copy from a chat app):
- *   base64url(payload) + "." + base64url(signature)
- * payload (before base64url; a pipe-delimited string, not JSON, so this class stays testable
- * without depending on Android's org.json stubs) is:
- *   "v1|<installationId>|<productId>|<issuedAtMillis>|<expiresAtMillisOrEmpty>"
- * signed with SHA256withRSA over the raw payload bytes.
- */
+/** Offline RSA verification. v1 grants remain valid; v2 identifies the signing key. Never contains a private key. */
 class DeveloperSubscriptionVerifier(base64PublicKey: String) {
     private val publicKey = try {
-        KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(base64PublicKey.trim())))
+        (KeyFactory.getInstance("RSA").generatePublic(X509EncodedKeySpec(Base64.getDecoder().decode(base64PublicKey.trim()))) as RSAPublicKey)
+            .takeIf { it.modulus.bitLength() >= 2048 }
     } catch (_: Exception) { null }
     val configured: Boolean get() = publicKey != null
+    val keyId: String = publicKey?.encoded?.let { encoded ->
+        MessageDigest.getInstance("SHA-256").digest(encoded).take(8).joinToString("") { "%02X".format(it) }
+    }.orEmpty()
 
-    data class Activation(
-        val installationId: String,
-        val productId: String,
-        val issuedAtMillis: Long,
-        val expiresAtMillis: Long?,
-    )
+    data class Activation(val installationId: String, val productId: String, val issuedAtMillis: Long, val expiresAtMillis: Long?)
+    data class Result(val activation: Activation? = null, val problem: ActivationProblem? = null)
 
-    /**
-     * Returns the decoded activation only if the signature is valid, the code targets this
-     * exact installation and product, and (when present) it has not expired as of [nowMillis].
-     * Returns null for any wrong, tampered, expired, or mismatched code, or when unconfigured.
-     */
-    fun verify(code: String, installationId: String, productId: String, nowMillis: Long = System.currentTimeMillis()): Activation? {
-        val key = publicKey ?: return null
-        val trimmed = code.trim()
-        val dot = trimmed.lastIndexOf('.')
-        if (dot <= 0 || dot == trimmed.length - 1) return null
-        val payloadSegment = trimmed.substring(0, dot)
-        val signatureSegment = trimmed.substring(dot + 1)
+    /** Accept chat line wrapping/zero-width separators, not arbitrary prose or changed payload characters. */
+    fun normalize(code: String): String = code.filterNot { it.isWhitespace() || it == '\u200B' || it == '\uFEFF' }.trim()
+
+    fun verify(code: String, installationId: String, productId: String, nowMillis: Long = System.currentTimeMillis()): Activation? =
+        check(code, installationId, productId, nowMillis).activation
+
+    fun check(code: String, installationId: String, productId: String, nowMillis: Long = System.currentTimeMillis()): Result {
+        fun fail(problem: ActivationProblem) = Result(problem = problem)
+        val key = publicKey ?: return fail(ActivationProblem.NOT_CONFIGURED)
+        if (code.length > 16384) return fail(ActivationProblem.MALFORMED)
+        val parts = normalize(code).split('.')
+        val v2 = parts.size == 4 && parts[0] == "TG2"
+        if ((!v2 && parts.size != 2) || parts.any { it.isEmpty() }) return fail(ActivationProblem.MALFORMED)
+        if (v2 && !parts[1].matches(Regex("[A-F0-9]{16}"))) return fail(ActivationProblem.MALFORMED)
+        if (v2 && parts[1] != keyId) return fail(ActivationProblem.KEY_MISMATCH)
         return try {
-            val payloadBytes = Base64.getUrlDecoder().decode(payloadSegment)
-            val signatureBytes = Base64.getUrlDecoder().decode(signatureSegment)
-            val verified = Signature.getInstance("SHA256withRSA").run {
-                initVerify(key)
-                update(payloadBytes)
-                verify(signatureBytes)
+            val payloadBytes = Base64.getUrlDecoder().decode(parts[if (v2) 2 else 0])
+            val signatureBytes = Base64.getUrlDecoder().decode(parts[if (v2) 3 else 1])
+            val verified = Signature.getInstance("SHA256withRSA").run { initVerify(key); update(payloadBytes); verify(signatureBytes) }
+            if (!verified) return fail(ActivationProblem.SIGNATURE)
+            val fields = payloadBytes.toString(Charsets.UTF_8).split('|')
+            val body = if (v2) {
+                if (fields.size != 6 || fields[0] != "v2" || fields[1] != keyId) return fail(ActivationProblem.MALFORMED)
+                fields.drop(2)
+            } else {
+                if (fields.size != 5 || fields[0] != "v1") return fail(ActivationProblem.MALFORMED)
+                fields.drop(1)
             }
-            if (!verified) return null
-            val fields = payloadBytes.toString(Charsets.UTF_8).split("|")
-            if (fields.size != 5 || fields[0] != "v1") return null
-            val expiry = if (fields[4].isEmpty()) null else fields[4].toLongOrNull() ?: return null
-            val issued = fields[3].toLongOrNull() ?: return null
-            if (issued <= 0 || issued > nowMillis + 300000 || (expiry != null && expiry <= issued)) return null
-            val activation = Activation(
-                installationId = fields[1],
-                productId = fields[2],
-                issuedAtMillis = issued,
-                expiresAtMillis = expiry,
-            )
-            if (activation.installationId != installationId || activation.productId != productId) return null
-            if (activation.expiresAtMillis != null && activation.expiresAtMillis <= nowMillis) return null
-            activation
-        } catch (_: Exception) { null }
+            val issued = body[2].toLongOrNull() ?: return fail(ActivationProblem.MALFORMED)
+            val expiry = if (body[3].isEmpty()) null else body[3].toLongOrNull() ?: return fail(ActivationProblem.MALFORMED)
+            if (issued <= 0 || (expiry != null && expiry <= issued)) return fail(ActivationProblem.MALFORMED)
+            if (issued > nowMillis && issued - nowMillis > 300000L) return fail(ActivationProblem.CLOCK)
+            if (normalizeId(body[0]) != normalizeId(installationId)) return fail(ActivationProblem.DEVICE)
+            if (body[1] != productId) return fail(ActivationProblem.PRODUCT)
+            if (expiry != null && expiry <= nowMillis) return fail(ActivationProblem.EXPIRED)
+            Result(activation = Activation(body[0], body[1], issued, expiry))
+        } catch (_: Exception) { fail(ActivationProblem.MALFORMED) }
     }
+
+    private fun normalizeId(id: String) = id.trim().uppercase(Locale.ROOT)
 }
 ```
 
@@ -9660,6 +10002,7 @@ class PlayPremiumRepository(
         .stateIn(scope, SharingStarted.Eagerly, merge(playState.value, developerActivation.value))
     private val client = createVersionedBillingClient(app, this)
     private val refreshLock = Mutex()
+    private val developerLock = Mutex()
     private var details: ProductDetails? = null
     private val cacheTtlMillis = 7L * 24 * 60 * 60 * 1000
 
@@ -9690,7 +10033,7 @@ class PlayPremiumRepository(
 
     private suspend fun refreshLocalEntitlements() {
         try {
-            developerActivation.value = cachedDeveloperEntitlement()
+            developerLock.withLock { developerActivation.value = cachedDeveloperEntitlement() }
             val now = clock.millis()
             val trialStarted = vault.read { it.has("trialStart") }
             trial.value = if (!trialStarted) Trial(available = true) else vault.update { json ->
@@ -9810,15 +10153,28 @@ class PlayPremiumRepository(
      * for a wrong, tampered, expired, or installation-mismatched code.
      */
     override suspend fun activateDeveloperToken(token: String): Boolean = withContext(Dispatchers.Default) {
-        val activation = developerVerifier.verify(token, installationId, productId, clock.millis())
-        if (activation == null) {
-            playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE) }
-            return@withContext false
+        developerLock.withLock {
+            val result = developerVerifier.check(token, installationId, productId, clock.millis())
+            val activation = result.activation
+            if (activation == null) {
+                playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE, activationProblem = result.problem) }
+                return@withLock false
+            }
+            try {
+                // Keep a valid permanent/longer grant when an older code is pasted again.
+                val existing = cachedDeveloperEntitlement()
+                val keep = existing != null && (existing.expiresAtMillis == null ||
+                    (activation.expiresAtMillis != null && existing.expiresAtMillis >= activation.expiresAtMillis))
+                if (!keep) vault.update { it.put("developerActivationCode", developerVerifier.normalize(token)) }
+                developerActivation.value = if (keep) existing else activation
+                playState.update { it.copy(issue = null, activationProblem = null) }
+                true
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                playState.update { it.copy(issue = BillingIssue.ACTIVATION_CODE, activationProblem = ActivationProblem.STORAGE) }
+                false
+            }
         }
-        vault.update { it.put("developerActivationCode", token.trim()) }
-        developerActivation.value = activation
-        playState.update { it.copy(issue = null) }
-        true
     }
 
     override suspend fun developerInstallationId(): String = installationId
@@ -9861,6 +10217,8 @@ class PlayPremiumRepository(
             expiresAtMillis = when { play.entitled -> null; developerActive -> dev?.expiresAtMillis; else -> trialEnd },
             developerPurchaseEnabled = developerVerifier.configured,
             developerInstallationId = installationId,
+            developerKeyId = developerVerifier.keyId,
+            developerProductId = productId,
         )
     }
 
@@ -10834,6 +11192,82 @@ class PrivatBankClientTest {
 }
 ```
 
+## data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt
+
+```kotlin
+package com.semmyx.ledger.data.billing
+
+import com.google.gson.JsonParser
+import com.semmyx.ledger.domain.ActivationProblem
+import java.security.KeyPairGenerator
+import java.security.MessageDigest
+import java.security.Signature
+import java.util.Base64
+import org.junit.Assert.*
+import org.junit.Test
+
+class ActivationDiagnosticsTest {
+    private val pair = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+    private val verifier = DeveloperSubscriptionVerifier(Base64.getEncoder().encodeToString(pair.public.encoded))
+    private fun signed(fields: List<String>, envelope: String = verifier.keyId): String {
+        val raw = fields.joinToString("|").toByteArray()
+        val signature = Signature.getInstance("SHA256withRSA").run { initSign(pair.private); update(raw); sign() }
+        val enc = Base64.getUrlEncoder().withoutPadding()
+        return "TG2.$envelope.${enc.encodeToString(raw)}.${enc.encodeToString(signature)}"
+    }
+    private fun code(installation: String = "AB12-CD34-EF56", product: String = "ledger_plus", issued: Long = 1000, end: String = "10000") =
+        signed(listOf("v2",verifier.keyId,installation,product,issued.toString(),end))
+    private fun problem(code: String, now: Long = 5000) = verifier.check(code,"AB12-CD34-EF56","ledger_plus",now).problem
+
+    @Test fun pythonV1AndV2SignaturesVerifyInTheActualKotlinVerifier() {
+        val fixture = javaClass.classLoader!!.getResourceAsStream("activation_python.json")!!.reader().use { JsonParser.parseReader(it).asJsonObject }
+        val v = DeveloperSubscriptionVerifier(fixture["public_key"].asString)
+        assertEquals(fixture["key_id"].asString,v.keyId)
+        for (name in listOf("code_v1","code_v2")) {
+            val result = v.check(fixture[name].asString,fixture["installation_id"].asString,fixture["product_id"].asString,fixture["now_millis"].asLong)
+            assertNull(result.problem);assertEquals(1767225600000L+5*86400000L,result.activation!!.expiresAtMillis)
+        }
+    }
+    @Test fun lineWrappingAndChatSeparatorsDoNotInvalidateTheSignature() {
+        val wrapped=code().chunked(31).joinToString("\r\n \u200B")
+        assertNull(problem("\uFEFF$wrapped\n"));assertNotNull(verifier.verify(wrapped,"AB12-CD34-EF56","ledger_plus",5000))
+    }
+    @Test fun wrongSigningKeyHasSpecificDiagnostic() {
+        assertEquals(ActivationProblem.KEY_MISMATCH,problem(code().replace("TG2.${verifier.keyId}.","TG2.0000000000000000.")))
+    }
+    @Test fun envelopeMustMatchTheSignedKeyId() {
+        assertEquals(ActivationProblem.MALFORMED,problem(signed(listOf("v2","0000000000000000","AB12-CD34-EF56","ledger_plus","1000","10000"))))
+    }
+    @Test fun wrongDeviceAndWrongProductAreDistinct() {
+        assertEquals(ActivationProblem.DEVICE,problem(code(installation="1111-2222-3333")))
+        assertEquals(ActivationProblem.PRODUCT,problem(code(product="other_product")))
+    }
+    @Test fun expiredAndFutureIssuedAreDistinct() {
+        assertEquals(ActivationProblem.EXPIRED,problem(code(end="5000")))
+        assertEquals(ActivationProblem.CLOCK,problem(code(issued=305001,end="999999")))
+        assertNull(problem(code(issued=305000,end="999999")))
+    }
+    @Test fun permanentCodeAndLowercaseDeviceIdWork() {
+        assertNotNull(verifier.verify(code(end=""),"ab12-cd34-ef56","ledger_plus",5000))
+    }
+    @Test fun invalidTimeRangeIsNotAccepted() {
+        assertEquals(ActivationProblem.MALFORMED,problem(code(end="1000")))
+        assertEquals(ActivationProblem.MALFORMED,problem(code(issued=0)))
+    }
+    @Test fun changedSignatureCannotGrantAccess() {
+        val parts=code().split('.').toMutableList();val bytes=Base64.getUrlDecoder().decode(parts[3]);bytes[0]=(bytes[0].toInt() xor 1).toByte()
+        parts[3]=Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        assertEquals(ActivationProblem.SIGNATURE,problem(parts.joinToString(".")))
+    }
+    @Test fun oversizedOrMalformedCodeFailsClosed() {
+        for (code in listOf("x".repeat(16385),"TG2...","TG2.AAAAAAAAAAAAAAAA.?.?","hello")) assertNotNull(problem(code))
+    }
+    @Test fun noPublicKeyIsExplicitlyUnconfigured() {
+        assertEquals(ActivationProblem.NOT_CONFIGURED,DeveloperSubscriptionVerifier("").check(code(),"AB12-CD34-EF56","ledger_plus",5000).problem)
+    }
+}
+```
+
 ## data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt
 
 ```kotlin
@@ -10930,6 +11364,21 @@ class DeveloperSubscriptionVerifierTest {
         val code = token("AAAA-BBBB-CCCC", "ledger_plus", expiresAtMillis = 10_000)
         assertNull(verifier.verify(code, "AAAA-BBBB-CCCC", "ledger_plus", nowMillis = 5_000))
     }
+}
+```
+
+## data/src/test/resources/activation_python.json
+
+```json
+{
+  "source": "Synthetic fixture generated by tools/issue_activation_code.py; public verification data only",
+  "public_key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtHwe7xs40X04Ymg1/q1JLVki5n8W9zdy7pg1AyKRc5LaBoa9HrO2KTAzfq9MtcqRo4KrCswmVEGsNU7h3rreg1JR8SJsYprqeXXF6W8vnuBfjVC/Cmt5ogoqVl8AgJLX9DjfYpcDPRTopg1eTmCvazMXT5PNBWdmTGBnSmFT2pVoNeA55m/lHUuJSrRZf1KEE+VRz6jKozB1fI9wZMlwPjPICWrUf7SkBSE9CWTJjhKhsTo4DVjrClJt3tJXEeifWo7/O5RNLtVFUHFf9xtMSYYFpDIL2dfZTsE8flwgEOTpnogvT7RWuv+2JuKzYdbI8rEW1i5kFX0Yw7tkPMmsawIDAQAB",
+  "key_id": "522FF6229DD37F8C",
+  "installation_id": "AB12-CD34-EF56",
+  "product_id": "ledger_plus",
+  "now_millis": 1767225600000,
+  "code_v2": "TG2.522FF6229DD37F8C.djJ8NTIyRkY2MjI5REQzN0Y4Q3xBQjEyLUNEMzQtRUY1NnxsZWRnZXJfcGx1c3wxNzY3MjI1NjAwMDAwfDE3Njc2NTc2MDAwMDA.lJEGI0qxSR-u3fT9g6Vh14oH2t0NK36NC6q7Qc9-Yad_2BDVuybm54ViJrNZ_W1Gdj2TpVY6Df6rkzNmkkLdbUR1F-hEBAL8XrkvCgY3tJlUkXE87gUYthXrAPZZvjONHPGiDCDt0GfxLTxioYbbNrVa2Ohn-mUYgxNoueado2lhfN3RME4BoyX3m6eKa3a1tbRSwLhFo3EMbrDJGkaaYqxzo-qHbAQsu8oevZQzqXWXHDjnTTLSuT-zgMfCzWuZpFhJm5Yf_vdsxV1PzSKn9PyYfDd2nlsUElz2pwxtcAXKDHwtXUO5hiDzzHKqzaAAl0rSTiP2iNrV904iNZbNtw",
+  "code_v1": "djF8QUIxMi1DRDM0LUVGNTZ8bGVkZ2VyX3BsdXN8MTc2NzIyNTYwMDAwMHwxNzY3NjU3NjAwMDAw.khuNyAA6wTbAcd3IvuqsaadOXg4Tk7fdLHvwYYUUv-Lu-_jIAz9_NriTE2Gkhel0idkwfkQQeJJJx_u2_s6nDLUoYZX2IUcayQPt6EHP9Hy3I7htd3xHcG7YC2Nhz_XSzeCabRFgEMxJUbsug3c3LQyJEvNmP3xN6C59Cuah7-XLiEh4sNBwIWdnxNVhPfyshqtXuaHOdXBVASsRo21G0UsDPssoLDT22mh_PggK9CZAXWqmr14CYk_xg3o2wGvQLXfT5B9yW_vs2OYbhzdRlkjjXWOv28q5y1t5Ge_VlI6C0rAph-mQ_deWrCfJBoYTncIoAW_EWpqlBxw8klZ-UA"
 }
 ```
 
@@ -11127,6 +11576,8 @@ sealed interface PinResult {
 
 enum class BillingIssue { UNAVAILABLE, CONFIGURATION, NETWORK, PENDING, VERIFICATION, ACKNOWLEDGEMENT, ACTIVATION_CODE }
 
+enum class ActivationProblem { NOT_CONFIGURED, KEY_MISMATCH, MALFORMED, SIGNATURE, DEVICE, PRODUCT, CLOCK, EXPIRED, STORAGE }
+
 /** Where the currently active entitlement (if any) came from. */
 enum class PremiumSource { GOOGLE_PLAY, OFFICIAL_DEVELOPER, TRIAL }
 
@@ -11144,6 +11595,9 @@ data class PremiumState(
     val developerPurchaseEnabled: Boolean = false,
     // Stable per-installation id the developer binds an activation code to.
     val developerInstallationId: String = "",
+    val developerKeyId: String = "",
+    val developerProductId: String = "ledger_plus",
+    val activationProblem: ActivationProblem? = null,
     val trialAvailable: Boolean = false,
 )
 ```
@@ -12146,14 +12600,11 @@ kotlin.code.style=official
 # like "\u041a\u043e\u0448\u0435\u043b\u0435\u043a"). This project is expected to live under such a path,
 # so the check is explicitly disabled here. See http://b.android.com/95744.
 android.overridePathCheck=true
-# Public key for the "buy directly from the developer" activation-code path (Ledger Plus).
-# This is only the PUBLIC key -- safe to keep here. The matching PRIVATE key lives at
-# tools/developer_private_key.pem, is git-ignored, and must never be shared with anyone;
-# only you (the developer) use it, with tools/issue_activation_code.py, to mint codes.
-DEVELOPER_SUBSCRIPTION_PUBLIC_KEY=MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAsOk68sCOTVl/4WCNZuvCidKZy4b3zz+ZjB4TsJOs07fRk/IolFxIOC1vrL55ncwzLeQlRpmWWKLkRIwEV0tbOu56+3NHuHF8Jcfq07VOyXplWT7kxzd+bTjmcZsXhO3J7z4kJtbYY3X3Fo465/8RuXHSQLyFkrHjS0FepclHDgnaZB/7qz6diLtLbOk7so4rScuIl7W362Vz71bDp/OD6UkDW6W+niGlQQKhKNJI7XnBA2AVl1W/4ZFY4v+7kNyztRcIzazJlbnrVjX9kLZiC9Sbk7+R+ZXssWXNvu7JytHTb+A8rWjkqu7GWvspJmvieWoj1dGB5PL/k+17s8BtyvDm7CNiG7lhKn0Lq7x/oMRDW5hu2HnYtmd8DqJjks2peUTsewkUGL3UrnDPgDnIXud1YJuyI0SWZN/P2RqTo40sMHPjGYd4esUk6R5/ATgKfSf01kPN2oabZzeC7rYpecP0QLCM0lDVMVGpxVaiegDxsKajGLyy67XVx29V72ShAgMBAAE=
 
 # Enabled parallel sync for Gradle 9.4+
 org.gradle.tooling.parallel=true
+
+# No sample activation key. Run START_ACTIVATION.cmd; setup writes ignored activation-public.properties.
 ```
 
 ## gradle/bootstrap.ps1
@@ -12287,6 +12738,210 @@ dependencyResolutionManagement {
 rootProject.name = "TGLedger"
 include(":app", ":domain", ":data")
 include(":bank-fixture")
+```
+
+## tools/activation_manager.py
+
+```python
+#!/usr/bin/env python3
+"""Local Windows-friendly GUI. Does not send keys/codes to any server."""
+from pathlib import Path
+import os
+import queue
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+PROJECT = Path(__file__).resolve().parents[1]
+
+
+def main():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        import issue_activation_code as issuer
+    except SystemExit as error:
+        if not messagebox.askyesno('Нужна библиотека cryptography',
+                'Для локальной подписи нужна cryptography. Установить её из PyPI сейчас? Приватные ключи никуда не передаются.'):
+            return
+        try:
+            subprocess.run([sys.executable, '-m', 'pip', 'install', '-r', str(PROJECT / 'tools/requirements-activation.txt')], check=True)
+        except Exception as exc:
+            messagebox.showerror('Установка не завершена', str(exc))
+            return
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+    root.deiconify()
+    root.title('TG Ledger 4.4.0 — менеджер активаций')
+    root.geometry('820x700')
+    root.minsize(580, 560)
+    root.columnconfigure(0, weight=1)
+    frame = ttk.Frame(root, padding=16)
+    frame.grid(sticky='nsew')
+    frame.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+    frame.rowconfigure(10, weight=1)
+    status = tk.StringVar(value='Импортируйте прежний ключ или явно создайте новый. Ключ не хранится в папке версии.')
+    ttk.Label(frame, textvariable=status, wraplength=740).grid(row=0, column=0, sticky='ew', pady=(0,12))
+    actions = ttk.Frame(frame)
+    actions.grid(row=1, column=0, sticky='ew')
+    output = tk.Text(frame, wrap='word', height=11)
+    jobs = queue.Queue()
+    busy = False
+    buttons = []
+
+    def log(value):
+        output.insert('end', str(value) + '\n')
+        output.see('end')
+
+    def doctor():
+        s = issuer.inspect_project(PROJECT)
+        if not s['matches']:
+            raise ValueError('Ключ и проект не совпадают. Импортируйте нужный ключ или нажмите «Настроить проект».')
+        status.set('Ключ издателя и проекта: ' + s['key_id'] + '\nПриватный ключ: ' + s['private_path'])
+        return s
+
+    def run_action(action):
+        try:
+            action()
+        except Exception as exc:
+            messagebox.showerror('Действие не выполнено', str(exc))
+            log('Ошибка: ' + str(exc))
+
+    def configure(source=None, create=False):
+        s = issuer.setup(PROJECT, source, create)
+        status.set('Настроено. Key ID: ' + s['key_id'] + '\nКлюч: ' + s['private_path'])
+        log('Публичная настройка записана автоматически. Пересоберите/установите приложение один раз и сравните Key ID в нём.')
+        log('Резервную копию приватного ключа храните отдельно от проекта. Не отправляйте её в чат/GitHub.')
+
+    def import_key():
+        filename = filedialog.askopenfilename(title='Выберите ПРЕЖНИЙ приватный ключ', filetypes=[('PEM private key','*.pem'),('All files','*')])
+        if filename:
+            configure(Path(filename))
+
+    def create_key():
+        if messagebox.askyesno('Новый ключ — только при необходимости',
+                'Импорт прежнего ключа предпочтительнее. Новый ключ не подходит к уже установленному APK со старым ключом: потребуется пересборка/установка, старые коды без прежнего ключа не пройдут. Создать новый ключ?'):
+            configure(create=True)
+
+    for index, (title, action) in enumerate([('Импорт прежнего .pem', import_key), ('Создать новый ключ', create_key),
+                          ('Настроить проект', configure), ('Проверить', doctor)]):
+        button = ttk.Button(actions, text=title, command=lambda f=action: run_action(f))
+        actions.columnconfigure(index % 2, weight=1)
+        button.grid(row=index // 2, column=index % 2, sticky='ew', padx=(0,6), pady=4)
+        buttons.append(button)
+    ttk.Label(frame, text='1. Из приложения: Настройки → активация → «Скопировать запрос». Вставьте запрос ниже.\nМожно использовать старый Installation ID, но тогда отдельно сверяйте Key ID.').grid(row=2,column=0,sticky='w',pady=(14,4))
+    request = tk.StringVar()
+    ttk.Entry(frame, textvariable=request).grid(row=3,column=0,sticky='ew')
+    row = ttk.Frame(frame);row.grid(row=4,column=0,sticky='ew',pady=8)
+    ttk.Label(row,text='Дней (0 = бессрочно):').pack(side='left')
+    days = tk.StringVar(value='30')
+    ttk.Entry(row,textvariable=days,width=8).pack(side='left',padx=8)
+    code = tk.Text(frame,height=5,wrap='char')
+    code.grid(row=6,column=0,sticky='ew')
+
+    def issue():
+        value = request.get().strip()
+        if value.startswith('TGREQ1|'):
+            installation, expected, product = issuer.parse_request(value)
+        else:
+            installation, expected, product = issuer.normalize_installation(value), None, issuer.DEFAULT_PRODUCT_ID
+            if not messagebox.askyesno('Сверьте Key ID', 'Запрос не содержит Key ID приложения. Вы сверили его с Key ID вверху окна?'):
+                return
+        token, _ = issuer.issue_checked(installation,float(days.get()),PROJECT,expected_key=expected,product=product)
+        code.delete('1.0','end');code.insert('1.0',token)
+        log('Код выдан. Подпись проверяется офлайн; выдавайте только после подтверждения оплаты.')
+
+    button=ttk.Button(row,text='Выдать код',command=lambda:run_action(issue));button.pack(side='left',padx=4);buttons.append(button)
+
+    def copy_code():
+        token=code.get('1.0','end').strip()
+        if not token:raise ValueError('Сначала выдайте код.')
+        root.clipboard_clear();root.clipboard_append(token);root.update()
+        log('Код скопирован без поясняющего текста.')
+    ttk.Button(frame,text='Скопировать только код',command=lambda:run_action(copy_code)).grid(row=7,column=0,sticky='w',pady=8)
+    buildrow=ttk.Frame(frame);buildrow.grid(row=8,column=0,sticky='ew',pady=8)
+
+    def build(install=False):
+        nonlocal busy
+        if busy:return
+        doctor()
+        busy=True
+        for b in buttons:b.configure(state='disabled')
+        log('Сборка началась. Нужны JDK 17/21/поддерживаемая Gradle JDK, Android SDK и доступ к зависимостям. Для установки подключите телефон с USB debugging.')
+        def worker():
+            try:
+                wrapper='gradlew.bat' if os.name=='nt' else 'gradlew'
+                # Fixed tasks; no user-entered text is executed as shell code.
+                cmd=(['cmd.exe','/d','/c',wrapper] if os.name=='nt' else ['sh',wrapper])+[
+                    '-PREQUIRE_DEVELOPER_ACTIVATION=true',':app:installPlayDebug' if install else ':app:assemblePlayDebug']
+                with subprocess.Popen(cmd,cwd=PROJECT,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace') as process:
+                    for line in process.stdout:jobs.put(('log',line.rstrip()))
+                    result=process.wait()
+                jobs.put(('log','Готово: app/build/outputs/apk/play/debug/app-play-debug.apk' if result==0 else 'Сборка/установка не завершена. Исправьте ошибку выше; установленное приложение не удаляйте.'))
+            except Exception as exc:jobs.put(('log','Ошибка запуска сборки: '+str(exc)))
+            finally:jobs.put(('done',None))
+        threading.Thread(target=worker,daemon=True).start()
+
+    for title, install in [('Собрать APK с этим ключом',False),('Собрать и установить по USB',True)]:
+        b=ttk.Button(buildrow,text=title,command=lambda v=install:run_action(lambda:build(v)));b.pack(side='left',padx=(0,8));buttons.append(b)
+    ttk.Label(frame,text='Обновление поверх приложения требует прежней APK-подписи. Это другой ключ, не activation .pem.\nМенеджер не удаляет приложение, не меняет его данные и не проверяет банковские счета.').grid(row=9,column=0,sticky='w')
+    output.grid(row=10,column=0,sticky='nsew',pady=(10,0))
+    def wrap_labels(event):
+        for child in frame.winfo_children():
+            if isinstance(child, ttk.Label): child.configure(wraplength=max(200,event.width-40))
+    frame.bind('<Configure>',wrap_labels)
+    def drain():
+        nonlocal busy
+        while not jobs.empty():
+            kind,value=jobs.get()
+            if kind=='log':log(value)
+            else:
+                busy=False
+                for b in buttons:b.configure(state='normal')
+        root.after(100,drain)
+    def close():
+        if busy and not messagebox.askyesno('Сборка выполняется','Закрыть менеджер? Сборка может продолжиться отдельно.'):return
+        root.destroy()
+    root.protocol('WM_DELETE_WINDOW',close)
+    drain()
+    try:doctor()
+    except Exception as exc:log(str(exc))
+    smoke_failure = []
+    if '--smoke-test' in sys.argv:
+        def smoke():
+            try:
+                s = doctor()
+                request.set('TGREQ1|AB12-CD34-EF56|' + s['key_id'] + '|ledger_plus')
+                days.set('5')
+                issue()
+                copy_code()
+                assert root.clipboard_get().strip().startswith('TG2.' + s['key_id'] + '.')
+                print('GUI_SMOKE_OK: window, project diagnosis, issuance and clipboard')
+            except Exception as exc:
+                print('GUI_SMOKE_FAILED:', str(exc), file=sys.stderr)
+                smoke_failure.append(str(exc))
+                root.destroy()
+                return
+            root.destroy()
+        root.after(300, smoke)
+    root.mainloop()
+    if smoke_failure:
+        raise SystemExit(1)
+
+if __name__=='__main__':
+    if '--smoke-test' in sys.argv:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='tg-ledger-gui-') as temporary:
+            PROJECT = Path(temporary) / 'project with spaces'
+            PROJECT.mkdir()
+            os.environ['TG_LEDGER_KEY_HOME'] = str(Path(temporary) / 'stable key')
+            import issue_activation_code as issuer
+            issuer.setup(PROJECT,create_new=True)
+            main()
+    else:
+        main()
 ```
 
 ## tools/audit_project.py
@@ -12469,7 +13124,7 @@ tracked = sorted(set(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text
 version = re.search(r'versionName = "([^"]+)"', (ROOT / 'app/build.gradle.kts').read_text())[1]
 langs = {'.kt':'kotlin', '.kts':'kotlin', '.java':'java', '.py':'python', '.xml':'xml',
          '.yml':'yaml', '.yaml':'yaml', '.properties':'properties', '.ps1':'powershell',
-         '.bat':'batch', '.toml':'toml', '.json':'json'}
+         '.bat':'batch', '.cmd':'batch', '.toml':'toml', '.json':'json'}
 source = [p for p in tracked if Path(p).suffix in langs or p == 'gradlew']
 book = [f'# TG Ledger {version} — complete file-by-file source', '',
         f'{len(source)} implementation, configuration and test files, without truncation.', '',
@@ -12492,143 +13147,422 @@ print(f'Source book: {len(source)} files; manifest: {len(files)-1} files')
 
 ```python
 #!/usr/bin/env python3
-"""Developer-side tool for the Ledger Plus "buy from the developer" path.
+"""TG Ledger activation manager. Private keys stay outside versioned project folders.
 
-This never runs inside the app and never ships in the APK. Keep the private
-key file it creates OFF source control and OFF any device but your own.
-
-Requires the 'cryptography' package (pure Python + prebuilt wheels, no
-separate OpenSSL install needed on any OS, including Windows):
-    pip install cryptography
-
-Typical manual flow (matches selling Ledger Plus over Telegram):
-  1. One-time setup:
-       pip install cryptography
-       python tools/issue_activation_code.py generate-keys
-     This writes developer_private_key.pem (KEEP SECRET, keep local) and
-     prints a base64 public key. Put that value in your OWN
-     ~/.gradle/gradle.properties (never commit it) as:
-       DEVELOPER_SUBSCRIPTION_PUBLIC_KEY=<the printed base64 value>
-     Rebuild the app once. From then on the app can verify codes you issue.
-
-  2. Every sale:
-       - Buyer messages you on Telegram asking for Ledger Plus.
-       - You reply with the price (100 UAH) and your card number.
-       - Buyer pays and sends a screenshot / confirmation.
-       - Buyer opens Settings -> Ledger Plus -> "Buy from developer" card,
-         copies their Installation ID, and sends it to you on Telegram.
-       - You check the money actually arrived, then run:
-           python tools/issue_activation_code.py issue \\
-             --installation-id XXXX-XXXX-XXXX --days 30
-       - You paste the printed code back to the buyer on Telegram.
-       - Buyer pastes the code into the app and taps Activate. Ledger Plus
-         turns on immediately and works fully offline until it expires.
-
-See docs/DEVELOPER_ACTIVATION_CODES.md for the full explanation, including
-how this same token format lets you automate step 2 later with a Telegram
-bot without ever updating the app.
+setup --import-key FILE imports an existing RSA key into ~/.tg-ledger/activation/.
+setup --create-new explicitly creates a new key (never replaces an existing one).
+setup also writes this project's ignored activation-public.properties automatically.
+doctor reports public fingerprints only. issue signs v2 codes; legacy v1 is supported.
 """
 from __future__ import annotations
-
 import argparse
 import base64
-import sys
-import time
+import hashlib
+import math
+import os
 from pathlib import Path
+import re
+import sys
+import tempfile
+import time
 
 try:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 except ImportError:
-    print("Missing dependency. Install it once with:\n    pip install cryptography", file=sys.stderr)
-    sys.exit(1)
+    raise SystemExit('Install the required package: python -m pip install -r tools/requirements-activation.txt')
 
 HERE = Path(__file__).resolve().parent
-DEFAULT_PRIVATE_KEY = HERE / "developer_private_key.pem"
-DEFAULT_PUBLIC_DER = HERE / "developer_public_key.der"
-DEFAULT_PRODUCT_ID = "ledger_plus"
+PROJECT = HERE.parent
+DEFAULT_PRODUCT_ID = 'ledger_plus'
+PROPERTY = 'DEVELOPER_SUBSCRIPTION_PUBLIC_KEY'
+MAX_CODE = 16384
+# Redirected Windows consoles can use a code page without Cyrillic. Diagnostic
+# printing must never turn a successful import into a failure after writing it.
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, 'reconfigure'):
+        stream.reconfigure(errors='backslashreplace')
 
 
-def generate_keys(private_key_path: Path, public_der_path: Path) -> None:
-    if private_key_path.exists():
-        raise SystemExit(
-            f"{private_key_path} already exists. Delete it yourself first if you really want a new "
-            "key pair -- doing so invalidates every code you issued with the old one."
-        )
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.TraditionalOpenSSL,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    private_key_path.write_bytes(private_pem)
+def key_home() -> Path:
+    return Path(os.environ.get('TG_LEDGER_KEY_HOME', str(Path.home() / '.tg-ledger' / 'activation'))).expanduser()
+
+
+def resolve_private(explicit: Path | None = None, project: Path = PROJECT) -> Path:
+    if explicit is not None:
+        return Path(explicit).expanduser()
+    env = os.environ.get('TG_LEDGER_PRIVATE_KEY')
+    if env:
+        return Path(env).expanduser()
+    stable = key_home() / 'developer_private_key.pem'
+    if stable.exists():
+        return stable
+    legacy = project / 'tools/developer_private_key.pem'
+    if legacy.exists():
+        return legacy
+    raise ValueError('Signing key not found. Open START_ACTIVATION.cmd and import your existing .pem, or explicitly create a new key. No key was created or replaced.')
+
+
+def load_private(path: Path):
+    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    if not isinstance(key, rsa.RSAPrivateKey) or key.key_size < 2048:
+        raise ValueError('Expected an RSA private key of at least 2048 bits.')
+    return key
+
+
+def public_bytes(key) -> bytes:
+    return key.public_key().public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def fingerprint(der: bytes) -> str:
+    return hashlib.sha256(der).hexdigest()[:16].upper()
+
+
+def normalize_installation(value: str) -> str:
+    clean = re.sub(r'[\s\-\u2010-\u2015]', '', value).upper()
+    if not re.fullmatch(r'[0-9A-F]{12}', clean):
+        raise ValueError('Installation ID must contain 12 hexadecimal characters, e.g. AB12-CD34-EF56. Copy it again from the app.')
+    return '-'.join(clean[i:i+4] for i in range(0, 12, 4))
+
+
+def property_value(path: Path) -> str:
+    if not path.exists():
+        return ''
+    values = re.findall(r'^' + PROPERTY + r'\s*[=:]\s*(.*?)\s*$', path.read_text(encoding='utf-8-sig'), flags=re.M)
+    return values[-1] if values else ''
+
+
+def project_public(project: Path) -> str:
+    local = project / 'activation-public.properties'
+    if local.exists():
+        return property_value(local)
+    # Gradle user properties override root project properties; mirror that precedence.
+    user = Path(os.environ.get('GRADLE_USER_HOME', str(Path.home() / '.gradle'))) / 'gradle.properties'
+    return property_value(user) or property_value(project / 'gradle.properties')
+
+
+def inspect_project(project: Path = PROJECT, private: Path | None = None) -> dict:
+    key = load_private(resolve_private(private, project))
+    der = public_bytes(key)
+    configured = project_public(project)
     try:
-        private_key_path.chmod(0o600)
-    except (OSError, NotImplementedError):
-        pass  # Permission bits are not meaningful on every OS/filesystem (e.g. some Windows drives); not fatal.
-    public_der = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.DER,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    )
-    public_der_path.write_bytes(public_der)
-    encoded = base64.b64encode(public_der).decode("ascii")
-    print("Keys generated.\n")
-    print(f"Private key (keep this SECRET, keep it only on your computer): {private_key_path}")
-    print(f"Public key DER (safe to keep, this is what gets embedded):     {public_der_path}\n")
-    print("Put this in your OWN ~/.gradle/gradle.properties (never commit it), then rebuild:")
-    print(f"DEVELOPER_SUBSCRIPTION_PUBLIC_KEY={encoded}")
+        configured_der = base64.b64decode(configured, validate=True)
+        pub = serialization.load_der_public_key(configured_der)
+        valid = isinstance(pub, rsa.RSAPublicKey) and pub.key_size >= 2048
+    except (ValueError, TypeError):
+        configured_der = b''
+        valid = False
+    return {'key_id': fingerprint(der), 'project_key_id': fingerprint(configured_der) if valid else 'NOT CONFIGURED',
+            'matches': valid and configured_der == der, 'public_key': base64.b64encode(der).decode('ascii'),
+            'private_path': str(resolve_private(private, project))}
+
+
+def atomic_write(path: Path, data: bytes, private: bool = False, replace: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not replace:
+        # Exclusive creation: no time-of-check/time-of-use key replacement.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if private else 0o644)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+        return
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '-')
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(data)
+        if private:
+            os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def setup(project: Path = PROJECT, import_key: Path | None = None, create_new: bool = False) -> dict:
+    if import_key is not None and create_new:
+        raise ValueError('Choose import OR create, not both.')
+    target = key_home() / 'developer_private_key.pem'
+    if import_key is not None:
+        key = load_private(import_key)
+    elif target.exists():
+        if create_new:
+            raise ValueError('A stable key already exists. It was NOT replaced. Use the existing key; rotation needs an explicit migration.')
+        key = load_private(target)
+    elif create_new:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    else:
+        # Adopt a legacy project key only if there is no stable one. Never choose a random drive-search match.
+        key = load_private(resolve_private(project=project))
+    if target.exists():
+        existing = load_private(target)
+        if public_bytes(existing) != public_bytes(key):
+            raise ValueError('The imported key differs from your stable key. Nothing was overwritten. Select the correct key or a separate TG_LEDGER_KEY_HOME for an intentional migration.')
+    else:
+        atomic_write(target, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                              serialization.NoEncryption()), private=True, replace=False)
+    encoded = base64.b64encode(public_bytes(key)).decode('ascii')
+    key_id = fingerprint(public_bytes(key))
+    atomic_write(key_home() / 'developer_public_key.der', public_bytes(key))
+    atomic_write(project / 'activation-public.properties',
+                 ('# LOCAL public configuration; generated by the activation manager. No private key.\n'
+                  f'# Key ID: {key_id}\n{PROPERTY}={encoded}\n').encode('utf-8'))
+    return inspect_project(project)
+
+
+def parse_request(value: str) -> tuple[str, str, str]:
+    fields = value.strip().split('|')
+    if len(fields) != 4 or fields[0] != 'TGREQ1' or not re.fullmatch(r'[A-Fa-f0-9]{16}', fields[2]):
+        raise ValueError('Invalid activation request. Copy the full TGREQ1 request from the app.')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', fields[3]):
+        raise ValueError('Invalid request product.')
+    return normalize_installation(fields[1]), fields[2].upper(), fields[3]
+
+
+def make_token(key, installation_id: str, product_id: str, days: float, legacy: bool = False, now_millis: int | None = None) -> str:
+    installation_id = normalize_installation(installation_id)
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,80}', product_id):
+        raise ValueError('Invalid product ID.')
+    if not math.isfinite(days) or days < 0 or days > 36500:
+        raise ValueError('Days must be finite and between 0 (permanent) and 36500.')
+    now = int(time.time() * 1000) if now_millis is None else now_millis
+    end = now + int(days * 86400000) if days > 0 else None
+    if now <= 0 or (end is not None and end <= now):
+        raise ValueError('Invalid issue time or duration is shorter than one millisecond.')
+    kid = fingerprint(public_bytes(key))
+    fields = ['v1', installation_id, product_id, str(now), str(end) if end is not None else ''] if legacy else [
+        'v2', kid, installation_id, product_id, str(now), str(end) if end is not None else '']
+    payload = '|'.join(fields).encode('utf-8')
+    signature = key.sign(payload, padding.PKCS1v15(), hashes.SHA256())
+    enc = lambda b: base64.urlsafe_b64encode(b).decode('ascii').rstrip('=')
+    body = enc(payload) + '.' + enc(signature)
+    return body if legacy else f'TG2.{kid}.{body}'
 
 
 def issue_token(private_key_path: Path, installation_id: str, product_id: str, days: float) -> str:
-    if not private_key_path.exists():
-        raise SystemExit(f"{private_key_path} not found. Run 'generate-keys' first.")
-    private_key = serialization.load_pem_private_key(private_key_path.read_bytes(), password=None)
-    now_millis = int(time.time() * 1000)
-    # Kotlin's DeveloperSubscriptionVerifier parses a pipe-delimited payload, NOT JSON:
-    #   "v1|<installationId>|<productId>|<issuedAtMillis>|<expiresAtMillisOrEmpty>"
-    # An empty final field (days <= 0) means the grant never expires.
-    expires_at = now_millis + int(days * 24 * 60 * 60 * 1000) if days > 0 else None
-    clean_installation_id = installation_id.strip().upper()
-    fields = ["v1", clean_installation_id, product_id, str(now_millis), str(expires_at) if expires_at is not None else ""]
-    payload_bytes = "|".join(fields).encode("utf-8")
-    # SHA256withRSA in Kotlin == RSASSA-PKCS1-v1_5 with SHA-256 here; same algorithm, no OpenSSL needed.
-    signature_bytes = private_key.sign(payload_bytes, padding.PKCS1v15(), hashes.SHA256())
-    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii")
-    signature_b64 = base64.urlsafe_b64encode(signature_bytes).decode("ascii")
-    token = f"{payload_b64}.{signature_b64}"
-    validity = "it never expires" if expires_at is None else f"valid until {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(expires_at / 1000))}"
-    print(f"Activation code (send this to the buyer, {validity}):\n")
+    """Legacy importable API; private path is always explicit, output is the code only."""
+    token = make_token(load_private(private_key_path), installation_id, product_id, days, legacy=True)
     print(token)
     return token
 
 
+def issue_checked(installation: str, days: float, project: Path = PROJECT, private: Path | None = None,
+                  expected_key: str | None = None, product: str = DEFAULT_PRODUCT_ID, legacy: bool = False) -> tuple[str, dict]:
+    status = inspect_project(project, private)
+    if not status['matches']:
+        raise ValueError('Signing key and project public key DO NOT MATCH. Run setup before building. No activation code was issued.')
+    if expected_key is not None and expected_key.upper() != status['key_id']:
+        raise ValueError(f"The app expects key {expected_key.upper()}, but this issuer uses {status['key_id']}. Rebuild/install the matching app or select its original key. No code was issued.")
+    key = load_private(resolve_private(private, project))
+    return make_token(key, installation, product, days, legacy), status
+
+
+def generate_keys(private_key_path: Path, public_der_path: Path) -> None:
+    """Backwards-compatible explicit key generation; never overwrites an existing key."""
+    if private_key_path.exists() or public_der_path.exists():
+        raise ValueError('A key file already exists. Nothing was overwritten. Use setup to import your existing key.')
+    key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    atomic_write(private_key_path, key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                                   serialization.NoEncryption()), private=True, replace=False)
+    atomic_write(public_der_path, public_bytes(key), replace=False)
+    print(f'{PROPERTY}={base64.b64encode(public_bytes(key)).decode("ascii")}')
+    print(f'Key ID: {fingerprint(public_bytes(key))}\nRun setup to configure the current project.', file=sys.stderr)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    keys_cmd = sub.add_parser("generate-keys", help="One-time: create the developer signing key pair.")
-    keys_cmd.add_argument("--private-key", type=Path, default=DEFAULT_PRIVATE_KEY)
-    keys_cmd.add_argument("--public-der", type=Path, default=DEFAULT_PUBLIC_DER)
-
-    issue_cmd = sub.add_parser("issue", help="Issue one activation code for a confirmed sale.")
-    issue_cmd.add_argument("--installation-id", required=True, help="The buyer's Installation ID from Settings.")
-    issue_cmd.add_argument("--product-id", default=DEFAULT_PRODUCT_ID)
-    issue_cmd.add_argument("--days", type=float, default=30, help="Subscription length in days (default: 30). Use 0 for a code that never expires.")
-    issue_cmd.add_argument("--private-key", type=Path, default=DEFAULT_PRIVATE_KEY)
-
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    setup_cmd = sub.add_parser('setup', help='Import/create a stable key and automatically configure this project.')
+    setup_cmd.add_argument('--import-key', type=Path)
+    setup_cmd.add_argument('--create-new', action='store_true')
+    setup_cmd.add_argument('--project', type=Path, default=PROJECT)
+    doctor = sub.add_parser('doctor', help='Print public key IDs and detect configuration mismatch.')
+    doctor.add_argument('--project', type=Path, default=PROJECT)
+    doctor.add_argument('--private-key', type=Path)
+    keys = sub.add_parser('generate-keys', help='Legacy explicit generation; prefer setup --create-new.')
+    keys.add_argument('--private-key', type=Path, default=None)
+    keys.add_argument('--public-der', type=Path, default=None)
+    issue = sub.add_parser('issue', help='Issue a signed code after checking key configuration.')
+    target = issue.add_mutually_exclusive_group(required=True)
+    target.add_argument('--installation-id')
+    target.add_argument('--request', help='Full TGREQ1 request copied from the app; checks its expected key.')
+    issue.add_argument('--key-id', help='Expected key ID shown in app; recommended with a bare installation ID.')
+    issue.add_argument('--product-id', default=DEFAULT_PRODUCT_ID)
+    issue.add_argument('--days', type=float, default=30)
+    issue.add_argument('--private-key', type=Path)
+    issue.add_argument('--project', type=Path, default=PROJECT)
+    issue.add_argument('--legacy-v1', action='store_true', help='For an old app using the SAME public key.')
     args = parser.parse_args()
-    if args.command == "generate-keys":
-        generate_keys(args.private_key, args.public_der)
-    elif args.command == "issue":
-        issue_token(args.private_key, args.installation_id, args.product_id, args.days)
+    if args.command == 'setup':
+        s = setup(args.project, args.import_key, args.create_new)
+        print(f"Configured. Key ID: {s['key_id']}\nPrivate key: {s['private_path']}\nRebuild/install the app once, then compare its Key ID.")
+    elif args.command == 'doctor':
+        s = inspect_project(args.project, args.private_key)
+        print(f"Issuer Key ID: {s['key_id']}\nProject Key ID: {s['project_key_id']}\nMatch: {s['matches']}\nInstalled APK: not checked; compare its Key ID or use --request.")
+        if not s['matches']: raise ValueError('Run setup to fix the public configuration.')
+    elif args.command == 'generate-keys':
+        generate_keys(args.private_key or key_home() / 'developer_private_key.pem',
+                      args.public_der or key_home() / 'developer_public_key.der')
+    elif args.command == 'issue':
+        installation, expected, product = parse_request(args.request) if args.request else (args.installation_id, args.key_id, args.product_id)
+        token, status = issue_checked(installation, args.days, args.project, args.private_key, expected, product, args.legacy_v1)
+        print(f"Key ID: {status['key_id']}; {'permanent' if args.days == 0 else str(args.days)+' days'}. Keep the signing key backed up.", file=sys.stderr)
+        if expected is None:
+            print('Installed APK key was not checked. Compare Key ID in the app or use its full TGREQ1 request.', file=sys.stderr)
+        print(token)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         main()
-    except RuntimeError as error:
-        print(f"Error: {error}", file=sys.stderr)
+    except (ValueError, OSError, TypeError) as error:
+        print(f'ERROR: {error}', file=sys.stderr)
         sys.exit(1)
+```
+
+## tools/tests/test_activation.py
+
+```python
+import base64
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+import issue_activation_code as a
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+
+class ActivationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.key=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+        cls.other=rsa.generate_private_key(public_exponent=65537,key_size=2048)
+
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='tg-ledger-ключ-')
+        self.root=Path(self.tmp.name);self.project=self.root/'project 4.4.0';self.project.mkdir()
+        self.home=self.root/'stable';self.gradle=self.root/'gradle'
+        self.env=patch.dict(os.environ,{'TG_LEDGER_KEY_HOME':str(self.home),'GRADLE_USER_HOME':str(self.gradle)})
+        self.env.start();self.addCleanup(self.env.stop);self.addCleanup(self.tmp.cleanup)
+        self.source=self.root/'old project'/'developer_private_key.pem';self.source.parent.mkdir()
+        self.write_key(self.source,self.key)
+
+    def write_key(self,path,key):
+        path.write_bytes(key.private_bytes(serialization.Encoding.PEM,serialization.PrivateFormat.TraditionalOpenSSL,serialization.NoEncryption()))
+
+    def setup_key(self):return a.setup(self.project,import_key=self.source)
+
+    def decode(self,code):
+        p=code.split('.');payload,sig=p[-2:]
+        raw=base64.urlsafe_b64decode(payload+'='*((-len(payload))%4))
+        signature=base64.urlsafe_b64decode(sig+'='*((-len(sig))%4))
+        self.key.public_key().verify(signature,raw,padding.PKCS1v15(),hashes.SHA256())
+        return raw.decode().split('|')
+
+    def test_import_preserves_original_and_configures_local_public_key(self):
+        old=self.source.read_bytes();s=self.setup_key()
+        self.assertTrue(s['matches']);self.assertEqual(old,self.source.read_bytes())
+        self.assertEqual(a.public_bytes(self.key),a.public_bytes(a.load_private(Path(s['private_path']))))
+        self.assertFalse((self.project/'tools/developer_private_key.pem').exists())
+
+    def test_stable_key_survives_next_project_folder(self):
+        first=self.setup_key();second=self.root/'project 4.5.0';second.mkdir()
+        self.assertEqual(first['key_id'],a.setup(second)['key_id'])
+
+    def test_cannot_silently_replace_existing_stable_key(self):
+        self.setup_key();self.write_key(self.source,self.other)
+        with self.assertRaises(ValueError):a.setup(self.project,import_key=self.source)
+        self.assertEqual(a.fingerprint(a.public_bytes(self.key)),a.inspect_project(self.project)['key_id'])
+
+    def test_create_never_replaces_existing_key(self):
+        self.setup_key();before=(self.home/'developer_private_key.pem').read_bytes()
+        with self.assertRaises(ValueError):a.setup(self.project,create_new=True)
+        self.assertEqual(before,(self.home/'developer_private_key.pem').read_bytes())
+
+    def test_create_is_explicit(self):
+        with self.assertRaises(ValueError):a.setup(self.project)
+        self.assertFalse(self.home.exists())
+
+    def test_explicit_create_and_second_setup_reuse(self):
+        s=a.setup(self.project,create_new=True)
+        self.assertTrue(s['matches']);self.assertGreaterEqual(a.load_private(Path(s['private_path'])).key_size,3072)
+        self.assertEqual(s['key_id'],a.setup(self.project)['key_id'])
+
+    def test_adopts_legacy_key_without_searching_arbitrary_directories(self):
+        legacy=self.project/'tools/developer_private_key.pem';legacy.parent.mkdir();self.write_key(legacy,self.key)
+        self.assertEqual(a.fingerprint(a.public_bytes(self.key)),a.setup(self.project)['key_id'])
+
+    def test_stale_global_gradle_key_cannot_override_local_setup(self):
+        self.gradle.mkdir();(self.gradle/'gradle.properties').write_text(a.PROPERTY+'='+base64.b64encode(a.public_bytes(self.other)).decode())
+        self.assertTrue(self.setup_key()['matches'])
+
+    def test_project_mismatch_blocks_issuance(self):
+        self.setup_key();(self.project/'activation-public.properties').write_text(a.PROPERTY+'='+base64.b64encode(a.public_bytes(self.other)).decode())
+        with self.assertRaises(ValueError):a.issue_checked('AB12-CD34-EF56',5,self.project)
+
+    def test_request_checks_actual_app_key_and_product(self):
+        s=self.setup_key();req=f"TGREQ1|AB12-CD34-EF56|{s['key_id']}|ledger_plus"
+        installation,kid,product=a.parse_request(req)
+        code,_=a.issue_checked(installation,5,self.project,expected_key=kid,product=product)
+        self.assertEqual(['v2',kid,installation,product],self.decode(code)[:4])
+
+    def test_wrong_app_key_is_blocked(self):
+        self.setup_key()
+        with self.assertRaises(ValueError):a.issue_checked('AB12-CD34-EF56',5,self.project,expected_key='0000000000000000')
+
+    def test_malformed_request(self):
+        for request in ['TGREQ1|ID','TGREQ1|AB12-CD34-EF56||ledger_plus','TGREQ1|AB12-CD34-EF56|A'*20]:
+            with self.assertRaises(ValueError):a.parse_request(request)
+
+    def test_valid_signature_and_exact_five_day_duration(self):
+        code=a.make_token(self.key,'ab12 cd34 ef56','ledger_plus',5,now_millis=1000)
+        f=self.decode(code);self.assertEqual('AB12-CD34-EF56',f[2]);self.assertEqual(5*86400000,int(f[5])-int(f[4]))
+
+    def test_permanent_and_legacy_formats(self):
+        self.assertEqual('',self.decode(a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',0,now_millis=1))[-1])
+        code=a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',5,legacy=True,now_millis=1)
+        self.assertEqual(2,len(code.split('.')));self.assertEqual('v1',self.decode(code)[0])
+
+    def test_invalid_durations_and_separator_injection(self):
+        for days in [-1,float('nan'),float('inf'),36501,0.000000001]:
+            with self.assertRaises(ValueError):a.make_token(self.key,'AB12-CD34-EF56','ledger_plus',days)
+        for installation,product in [('A21C|FEA5|E432','ledger_plus'),('AB12-CD34-EF56','x|y')]:
+            with self.assertRaises(ValueError):a.make_token(self.key,installation,product,5)
+
+    def test_wrong_key_type_is_rejected(self):
+        self.write_key(self.source,ec.generate_private_key(ec.SECP256R1()))
+        with self.assertRaises(ValueError):a.setup(self.project,import_key=self.source)
+        self.assertFalse(self.home.exists())
+
+    def test_private_file_permissions(self):
+        s=self.setup_key()
+        if os.name!='nt':self.assertEqual(0o600,Path(s['private_path']).stat().st_mode&0o777)
+
+    def test_cli_paths_with_unicode_spaces_and_code_only_stdout(self):
+        script=str(Path(a.__file__))
+        result=subprocess.run([sys.executable,script,'setup','--import-key',str(self.source),'--project',str(self.project)],capture_output=True,text=True)
+        self.assertEqual(0,result.returncode,result.stderr)
+        result=subprocess.run([sys.executable,script,'issue','--installation-id','AB12-CD34-EF56','--days','5','--project',str(self.project)],capture_output=True,text=True)
+        self.assertEqual(0,result.returncode,result.stderr);self.assertEqual('v2',self.decode(result.stdout.strip())[0])
+        self.assertNotIn('PRIVATE KEY',result.stdout+result.stderr)
+
+    def test_redirected_ascii_console_cannot_break_import_of_cyrillic_path(self):
+        result=subprocess.run([sys.executable,str(Path(a.__file__)),'setup','--import-key',str(self.source),'--project',str(self.project)],
+                              capture_output=True,text=True,env={**os.environ,'PYTHONIOENCODING':'ascii'})
+        self.assertEqual(0,result.returncode,result.stderr)
+        self.assertTrue(a.inspect_project(self.project)['matches'])
+
+    def test_legacy_generate_does_not_overwrite_public_or_private(self):
+        out=self.root/'test.der';out.write_bytes(b'preserve')
+        with self.assertRaises(ValueError):a.generate_keys(self.root/'new.pem',out)
+        self.assertFalse((self.root/'new.pem').exists());self.assertEqual(b'preserve',out.read_bytes())
+
+if __name__=='__main__':unittest.main()
 ```
 
 ## tools/verify_bank_regex.py
@@ -12871,6 +13805,39 @@ with tempfile.TemporaryDirectory() as folder:
     (R/'verification/voice-regex-jvm.json').write_text(json.dumps({'kind':'exact-source-regex-on-JVM','passed':7,'compiled_kotlin':False,'compiled_android':False,'output':result.stdout.strip()},indent=2)+'\n')
 ```
 
+## verification/activation-build-config.json
+
+```json
+{
+  "kind": "actual-gradle-configuration-tests",
+  "checks": [
+    {
+      "check": "activation-gradle-local-wins",
+      "passed": true,
+      "expected_success": true
+    },
+    {
+      "check": "activation-gradle-invalid-rejected",
+      "passed": true,
+      "expected_success": false
+    },
+    {
+      "check": "activation-gradle-required-rejected",
+      "passed": true,
+      "expected_success": false
+    },
+    {
+      "check": "activation-gradle-disabled-explicit",
+      "passed": true,
+      "expected_success": true
+    }
+  ],
+  "all_passed": true,
+  "private_keys_created": false,
+  "build_script_sha256": "b1c69d1a39a80abc7f68ff296f4e47ca898aecee0ee7b535c0136ef310e76efe"
+}
+```
+
 ## verification/bank-regex-jvm.json
 
 ```json
@@ -12983,30 +13950,7 @@ with tempfile.TemporaryDirectory() as folder:
 }
 ```
 
-## verification/navigation-recovery.json
-
-```json
-{
-  "kind": "source-regression-guards",
-  "passed": 10,
-  "checks": [
-    "Explicit real Activity owners are provided above localized content",
-    "Registry owner is installed before the localized Context replacement",
-    "History button no longer invokes dashboard back action",
-    "History has an independent navigation destination",
-    "Analytics selected month is passed to history",
-    "System settings launched safely from localized non-Activity Context",
-    "Local text recovery has a preview and explicit submit action",
-    "Manual recovery works without automation and never bypasses confirmation",
-    "Live import diagnostics are visible in the banking screen",
-    "Reconnect and bank package configuration are provided"
-  ],
-  "compiled_android": false,
-  "device_crash_fixed_verified": false
-}
-```
-
-## verification/release-4.3.3.json
+## verification/history/4.3.3/release-4.3.3.json
 
 ```json
 {
@@ -13087,15 +14031,135 @@ with tempfile.TemporaryDirectory() as folder:
 }
 ```
 
+## verification/navigation-recovery.json
+
+```json
+{
+  "kind": "source-regression-guards",
+  "passed": 10,
+  "checks": [
+    "Explicit real Activity owners are provided above localized content",
+    "Registry owner is installed before the localized Context replacement",
+    "History button no longer invokes dashboard back action",
+    "History has an independent navigation destination",
+    "Analytics selected month is passed to history",
+    "System settings launched safely from localized non-Activity Context",
+    "Local text recovery has a preview and explicit submit action",
+    "Manual recovery works without automation and never bypasses confirmation",
+    "Live import diagnostics are visible in the banking screen",
+    "Reconnect and bank package configuration are provided"
+  ],
+  "compiled_android": false,
+  "device_crash_fixed_verified": false
+}
+```
+
+## verification/release-4.4.0.json
+
+```json
+{
+  "version": "4.4.0",
+  "version_code": 19,
+  "tested_code_commit": "010aeec90dbaf5fc6a754e1fcbc09345438bbd1c",
+  "ci_url": "https://github.com/semmyx666/TG_Ledger/actions/runs/38732319264",
+  "jobs": [
+    {
+      "name": "activation-windows",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:08:15Z"
+    },
+    {
+      "name": "build",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:11:52Z"
+    },
+    {
+      "name": "instrumented (26)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:12:22Z"
+    },
+    {
+      "name": "instrumented (36)",
+      "conclusion": "success",
+      "started_at": "2026-10-15T12:07:48Z",
+      "completed_at": "2026-10-15T12:14:00Z"
+    }
+  ],
+  "artifacts": [
+    {
+      "id": 11970507644,
+      "name": "device-reports-api-26",
+      "size_in_bytes": 227826
+    },
+    {
+      "id": 11970333062,
+      "name": "device-reports-api-36",
+      "size_in_bytes": 234062
+    },
+    {
+      "id": 11970483125,
+      "name": "validation-reports",
+      "size_in_bytes": 229072
+    }
+  ],
+  "unit_executions": {
+    "domain": 53,
+    "app_play": 27,
+    "data_play": 29,
+    "data_legacy_v7": 29
+  },
+  "instrumented": {
+    "api26": {
+      "app": 18,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    },
+    "api36": {
+      "app": 18,
+      "data": 8,
+      "failed": 0,
+      "skipped": 0
+    }
+  },
+  "windows": {
+    "unit_tests": 20,
+    "failed": 0,
+    "gui_smoke": true,
+    "clipboard": true,
+    "unicode_paths": true
+  },
+  "activation_build_configuration_checks": 4,
+  "native_widths_dp": [
+    288,
+    320,
+    360
+  ],
+  "font_scales": [
+    1.0,
+    1.4,
+    1.7
+  ],
+  "live_bank_accounts_tested": false,
+  "physical_user_phone_tested": false,
+  "user_private_key_accessed": false,
+  "new_production_private_key_shipped": false,
+  "packaging_changes_after_tests": "Reports, documentation, native screenshots, generated source book, manifest only; app/tool/workflow code unchanged."
+}
+```
+
 ## verification/source-audit.json
 
 ```json
 {
   "kind": "offline-structural-resource-and-sql-audit",
-  "passed_assertions": 2519,
+  "passed_assertions": 2597,
   "failures": [],
-  "kotlin_source_files": 111,
-  "localized_string_pairs": 399,
+  "kotlin_source_files": 116,
+  "localized_string_pairs": 412,
   "compiled_android": false,
   "executed_android_or_junit_tests": false,
   "checks": [
@@ -13520,6 +14584,19 @@ with tempfile.TemporaryDirectory() as folder:
     "No duplicate string: values/assistant_write_short",
     "No duplicate string: values/major_release_title",
     "No duplicate string: values/major_release_body",
+    "No duplicate string: values/activation_key_id",
+    "No duplicate string: values/activation_copy_request",
+    "No duplicate string: values/activation_request_copied",
+    "No duplicate string: values/activation_checking",
+    "No duplicate string: values/activation_not_configured",
+    "No duplicate string: values/activation_key_mismatch",
+    "No duplicate string: values/activation_malformed",
+    "No duplicate string: values/activation_signature",
+    "No duplicate string: values/activation_device",
+    "No duplicate string: values/activation_product",
+    "No duplicate string: values/activation_clock",
+    "No duplicate string: values/activation_expired",
+    "No duplicate string: values/activation_storage",
     "No duplicate string: values-uk/app_name",
     "No duplicate string: values-uk/overview",
     "No duplicate string: values-uk/settings",
@@ -13917,805 +14994,844 @@ with tempfile.TemporaryDirectory() as folder:
     "No duplicate string: values-uk/assistant_write_short",
     "No duplicate string: values-uk/major_release_title",
     "No duplicate string: values-uk/major_release_body",
+    "No duplicate string: values-uk/activation_key_id",
+    "No duplicate string: values-uk/activation_copy_request",
+    "No duplicate string: values-uk/activation_request_copied",
+    "No duplicate string: values-uk/activation_checking",
+    "No duplicate string: values-uk/activation_not_configured",
+    "No duplicate string: values-uk/activation_key_mismatch",
+    "No duplicate string: values-uk/activation_malformed",
+    "No duplicate string: values-uk/activation_signature",
+    "No duplicate string: values-uk/activation_device",
+    "No duplicate string: values-uk/activation_product",
+    "No duplicate string: values-uk/activation_clock",
+    "No duplicate string: values-uk/activation_expired",
+    "No duplicate string: values-uk/activation_storage",
     "English/Ukrainian key parity",
-    "Format-argument parity: save_profile",
-    "Nonempty translations: save_profile",
-    "Format-argument parity: import_text",
-    "Nonempty translations: import_text",
-    "Format-argument parity: help_privacy_body",
-    "Nonempty translations: help_privacy_body",
-    "Format-argument parity: privat_api_error",
-    "Nonempty translations: privat_api_error",
-    "Format-argument parity: voice_reply_balance",
-    "Nonempty translations: voice_reply_balance",
-    "Format-argument parity: help",
-    "Nonempty translations: help",
-    "Format-argument parity: api_howto",
-    "Nonempty translations: api_howto",
-    "Format-argument parity: billing_configuration",
-    "Nonempty translations: billing_configuration",
-    "Format-argument parity: voice_smalltalk_joke",
-    "Nonempty translations: voice_smalltalk_joke",
-    "Format-argument parity: all_time",
-    "Nonempty translations: all_time",
-    "Format-argument parity: diagnostics_copied",
-    "Nonempty translations: diagnostics_copied",
-    "Format-argument parity: voice_smalltalk_compliment",
-    "Nonempty translations: voice_smalltalk_compliment",
-    "Format-argument parity: bank_category_stats",
-    "Nonempty translations: bank_category_stats",
-    "Format-argument parity: bank_review_count",
-    "Nonempty translations: bank_review_count",
-    "Format-argument parity: pin_incorrect",
-    "Nonempty translations: pin_incorrect",
-    "Format-argument parity: back",
-    "Nonempty translations: back",
-    "Format-argument parity: confirm_pin",
-    "Nonempty translations: confirm_pin",
-    "Format-argument parity: cancel",
-    "Nonempty translations: cancel",
-    "Format-argument parity: greeting",
-    "Nonempty translations: greeting",
-    "Format-argument parity: date_invalid",
-    "Nonempty translations: date_invalid",
-    "Format-argument parity: skip",
-    "Nonempty translations: skip",
-    "Format-argument parity: cinematic_more_than_previous",
-    "Nonempty translations: cinematic_more_than_previous",
-    "Format-argument parity: language_uk",
-    "Nonempty translations: language_uk",
-    "Format-argument parity: sms_scan",
-    "Nonempty translations: sms_scan",
-    "Format-argument parity: api_error_rate",
-    "Nonempty translations: api_error_rate",
-    "Format-argument parity: color_accent",
-    "Nonempty translations: color_accent",
-    "Format-argument parity: bank_auto",
-    "Nonempty translations: bank_auto",
-    "Format-argument parity: handle_copied",
-    "Nonempty translations: handle_copied",
-    "Format-argument parity: brand_design_label",
-    "Nonempty translations: brand_design_label",
     "Format-argument parity: help_heading",
     "Nonempty translations: help_heading",
-    "Format-argument parity: close",
-    "Nonempty translations: close",
-    "Format-argument parity: import_group",
-    "Nonempty translations: import_group",
-    "Format-argument parity: import_queued",
-    "Nonempty translations: import_queued",
-    "Format-argument parity: character_count",
-    "Nonempty translations: character_count",
-    "Format-argument parity: api_last_sync",
-    "Nonempty translations: api_last_sync",
-    "Format-argument parity: cinematic_comparison",
-    "Nonempty translations: cinematic_comparison",
-    "Format-argument parity: developer_purchase_body",
-    "Nonempty translations: developer_purchase_body",
-    "Format-argument parity: import_queue_note",
-    "Nonempty translations: import_queue_note",
-    "Format-argument parity: load_error_title",
-    "Nonempty translations: load_error_title",
-    "Format-argument parity: bank_play_sms",
-    "Nonempty translations: bank_play_sms",
-    "Format-argument parity: income",
-    "Nonempty translations: income",
-    "Format-argument parity: import_unrecognized",
-    "Nonempty translations: import_unrecognized",
-    "Format-argument parity: local_profile",
-    "Nonempty translations: local_profile",
-    "Format-argument parity: biometric_explanation",
-    "Nonempty translations: biometric_explanation",
-    "Format-argument parity: entry_title",
-    "Nonempty translations: entry_title",
+    "Format-argument parity: period_month",
+    "Nonempty translations: period_month",
+    "Format-argument parity: installation_id_label",
+    "Nonempty translations: installation_id_label",
+    "Format-argument parity: activation_invalid",
+    "Nonempty translations: activation_invalid",
+    "Format-argument parity: color_background",
+    "Nonempty translations: color_background",
+    "Format-argument parity: api_sync_now",
+    "Nonempty translations: api_sync_now",
     "Format-argument parity: billing_network",
     "Nonempty translations: billing_network",
-    "Format-argument parity: premium_body",
-    "Nonempty translations: premium_body",
-    "Format-argument parity: brand_author_signature",
-    "Nonempty translations: brand_author_signature",
-    "Format-argument parity: import_paste",
-    "Nonempty translations: import_paste",
-    "Format-argument parity: api_syncing",
-    "Nonempty translations: api_syncing",
-    "Format-argument parity: category_empty",
-    "Nonempty translations: category_empty",
-    "Format-argument parity: developer_purchase_banner",
-    "Nonempty translations: developer_purchase_banner",
-    "Format-argument parity: cinematic_chart_accessibility",
-    "Nonempty translations: cinematic_chart_accessibility",
-    "Format-argument parity: api_connecting",
-    "Nonempty translations: api_connecting",
-    "Format-argument parity: pin_unlock_subtitle",
-    "Nonempty translations: pin_unlock_subtitle",
-    "Format-argument parity: bank_card",
-    "Nonempty translations: bank_card",
-    "Format-argument parity: theme_light",
-    "Nonempty translations: theme_light",
-    "Format-argument parity: activation_code_button",
-    "Nonempty translations: activation_code_button",
-    "Format-argument parity: import_diagnostics",
-    "Nonempty translations: import_diagnostics",
-    "Format-argument parity: voice_smalltalk_how_are_you",
-    "Nonempty translations: voice_smalltalk_how_are_you",
-    "Format-argument parity: use_pin",
-    "Nonempty translations: use_pin",
-    "Format-argument parity: saved",
-    "Nonempty translations: saved",
-    "Format-argument parity: voice_smalltalk_who_are_you",
-    "Nonempty translations: voice_smalltalk_who_are_you",
-    "Format-argument parity: category_dining",
-    "Nonempty translations: category_dining",
-    "Format-argument parity: help_premium_body",
-    "Nonempty translations: help_premium_body",
-    "Format-argument parity: import_counts",
-    "Nonempty translations: import_counts",
-    "Format-argument parity: developer_purchase_note",
-    "Nonempty translations: developer_purchase_note",
-    "Format-argument parity: mascot_gray",
-    "Nonempty translations: mascot_gray",
-    "Format-argument parity: empty_ledger_body",
-    "Nonempty translations: empty_ledger_body",
-    "Format-argument parity: import_disabled",
-    "Nonempty translations: import_disabled",
-    "Format-argument parity: onboard_body_two",
-    "Nonempty translations: onboard_body_two",
-    "Format-argument parity: bank_access_yes",
-    "Nonempty translations: bank_access_yes",
-    "Format-argument parity: language_instant",
-    "Nonempty translations: language_instant",
-    "Format-argument parity: help_banks_title",
-    "Nonempty translations: help_banks_title",
-    "Format-argument parity: voice_smalltalk_thanks",
-    "Nonempty translations: voice_smalltalk_thanks",
-    "Format-argument parity: color_chart_bottom",
-    "Nonempty translations: color_chart_bottom",
-    "Format-argument parity: sms_scanning",
-    "Nonempty translations: sms_scanning",
-    "Format-argument parity: installation_id_copy",
-    "Nonempty translations: installation_id_copy",
-    "Format-argument parity: premium_local_notice",
-    "Nonempty translations: premium_local_notice",
-    "Format-argument parity: api_imported_last",
-    "Nonempty translations: api_imported_last",
-    "Format-argument parity: pin_digit_count",
-    "Nonempty translations: pin_digit_count",
-    "Format-argument parity: edit_entry",
-    "Nonempty translations: edit_entry",
-    "Format-argument parity: diagnostics_clear",
-    "Nonempty translations: diagnostics_clear",
-    "Format-argument parity: category_cashback",
-    "Nonempty translations: category_cashback",
-    "Format-argument parity: voice_reply_not_understood",
-    "Nonempty translations: voice_reply_not_understood",
-    "Format-argument parity: onboard_body_one",
-    "Nonempty translations: onboard_body_one",
-    "Format-argument parity: next",
-    "Nonempty translations: next",
-    "Format-argument parity: push_howto",
-    "Nonempty translations: push_howto",
-    "Format-argument parity: currency_scope",
-    "Nonempty translations: currency_scope",
-    "Format-argument parity: title_optional_hint",
-    "Nonempty translations: title_optional_hint",
-    "Format-argument parity: add_first_entry",
-    "Nonempty translations: add_first_entry",
-    "Format-argument parity: reference_total_for",
-    "Nonempty translations: reference_total_for",
-    "Format-argument parity: bank_sms_permission",
-    "Nonempty translations: bank_sms_permission",
-    "Format-argument parity: bank_sms_yes",
-    "Nonempty translations: bank_sms_yes",
-    "Format-argument parity: all",
-    "Nonempty translations: all",
-    "Format-argument parity: here_to_help",
-    "Nonempty translations: here_to_help",
-    "Format-argument parity: colors_title",
-    "Nonempty translations: colors_title",
-    "Format-argument parity: category_other",
-    "Nonempty translations: category_other",
-    "Format-argument parity: last_7_days",
-    "Nonempty translations: last_7_days",
-    "Format-argument parity: trial_14",
-    "Nonempty translations: trial_14",
-    "Format-argument parity: clear_search",
-    "Nonempty translations: clear_search",
-    "Format-argument parity: api_open_site",
-    "Nonempty translations: api_open_site",
-    "Format-argument parity: billing_verification",
-    "Nonempty translations: billing_verification",
-    "Format-argument parity: amount",
-    "Nonempty translations: amount",
-    "Format-argument parity: color_grid",
-    "Nonempty translations: color_grid",
-    "Format-argument parity: brand_intro_title",
-    "Nonempty translations: brand_intro_title",
-    "Format-argument parity: overview",
-    "Nonempty translations: overview",
-    "Format-argument parity: major_release_body",
-    "Nonempty translations: major_release_body",
-    "Format-argument parity: title_invalid",
-    "Nonempty translations: title_invalid",
-    "Format-argument parity: biometric_failed",
-    "Nonempty translations: biometric_failed",
-    "Format-argument parity: lead_developer",
-    "Nonempty translations: lead_developer",
-    "Format-argument parity: display_name",
-    "Nonempty translations: display_name",
-    "Format-argument parity: clear_filters",
-    "Nonempty translations: clear_filters",
-    "Format-argument parity: unlock_title",
-    "Nonempty translations: unlock_title",
-    "Format-argument parity: color_surface",
-    "Nonempty translations: color_surface",
-    "Format-argument parity: rate_offline",
-    "Nonempty translations: rate_offline",
-    "Format-argument parity: help_intro",
-    "Nonempty translations: help_intro",
-    "Format-argument parity: bank_time_received",
-    "Nonempty translations: bank_time_received",
-    "Format-argument parity: bank_budget_progress",
-    "Nonempty translations: bank_budget_progress",
-    "Format-argument parity: privat_api_howto",
-    "Nonempty translations: privat_api_howto",
-    "Format-argument parity: help_privacy_title",
-    "Nonempty translations: help_privacy_title",
-    "Format-argument parity: history_search",
-    "Nonempty translations: history_search",
-    "Format-argument parity: api_disconnect",
-    "Nonempty translations: api_disconnect",
-    "Format-argument parity: discard_body",
-    "Nonempty translations: discard_body",
-    "Format-argument parity: color_reset",
-    "Nonempty translations: color_reset",
-    "Format-argument parity: import_unsupported",
-    "Nonempty translations: import_unsupported",
-    "Format-argument parity: restore_purchases",
-    "Nonempty translations: restore_purchases",
-    "Format-argument parity: category_leisure",
-    "Nonempty translations: category_leisure",
-    "Format-argument parity: support_privacy",
-    "Nonempty translations: support_privacy",
-    "Format-argument parity: color_muted",
-    "Nonempty translations: color_muted",
     "Format-argument parity: bank_app_permissions",
     "Nonempty translations: bank_app_permissions",
-    "Format-argument parity: bank_dashboard",
-    "Nonempty translations: bank_dashboard",
+    "Format-argument parity: assistant_write_short",
+    "Nonempty translations: assistant_write_short",
+    "Format-argument parity: activation_copy_request",
+    "Nonempty translations: activation_copy_request",
+    "Format-argument parity: chart_description",
+    "Nonempty translations: chart_description",
+    "Format-argument parity: premium_local_notice",
+    "Nonempty translations: premium_local_notice",
+    "Format-argument parity: total_balance",
+    "Nonempty translations: total_balance",
+    "Format-argument parity: load_more",
+    "Nonempty translations: load_more",
+    "Format-argument parity: cinematic_history",
+    "Nonempty translations: cinematic_history",
+    "Format-argument parity: installation_id_copied",
+    "Nonempty translations: installation_id_copied",
+    "Format-argument parity: expense",
+    "Nonempty translations: expense",
+    "Format-argument parity: privat_api_howto",
+    "Nonempty translations: privat_api_howto",
+    "Format-argument parity: fps_auto",
+    "Nonempty translations: fps_auto",
+    "Format-argument parity: bank_access_yes",
+    "Nonempty translations: bank_access_yes",
+    "Format-argument parity: mascot_card_title",
+    "Nonempty translations: mascot_card_title",
+    "Format-argument parity: api_howto",
+    "Nonempty translations: api_howto",
+    "Format-argument parity: create_pin",
+    "Nonempty translations: create_pin",
+    "Format-argument parity: onboard_title_one",
+    "Nonempty translations: onboard_title_one",
+    "Format-argument parity: onboard_body_three",
+    "Nonempty translations: onboard_body_three",
+    "Format-argument parity: activation_key_id",
+    "Nonempty translations: activation_key_id",
+    "Format-argument parity: bank_budget_progress",
+    "Nonempty translations: bank_budget_progress",
+    "Format-argument parity: import_connected",
+    "Nonempty translations: import_connected",
+    "Format-argument parity: support_intro",
+    "Nonempty translations: support_intro",
+    "Format-argument parity: copy_handle",
+    "Nonempty translations: copy_handle",
+    "Format-argument parity: cinematic_week_average",
+    "Nonempty translations: cinematic_week_average",
+    "Format-argument parity: bank_privacy",
+    "Nonempty translations: bank_privacy",
+    "Format-argument parity: reference_rates",
+    "Nonempty translations: reference_rates",
+    "Format-argument parity: voice_assistant_button",
+    "Nonempty translations: voice_assistant_button",
+    "Format-argument parity: api_token_label",
+    "Nonempty translations: api_token_label",
+    "Format-argument parity: mascot_animations",
+    "Nonempty translations: mascot_animations",
+    "Format-argument parity: color_surface",
+    "Nonempty translations: color_surface",
+    "Format-argument parity: colors_explanation",
+    "Nonempty translations: colors_explanation",
+    "Format-argument parity: cash_flow",
+    "Nonempty translations: cash_flow",
+    "Format-argument parity: cinematic_transactions",
+    "Nonempty translations: cinematic_transactions",
+    "Format-argument parity: import_to_queue",
+    "Nonempty translations: import_to_queue",
+    "Format-argument parity: assistant_send",
+    "Nonempty translations: assistant_send",
+    "Format-argument parity: premium_source_trial",
+    "Nonempty translations: premium_source_trial",
+    "Format-argument parity: trial_14",
+    "Nonempty translations: trial_14",
+    "Format-argument parity: bank_sms_no",
+    "Nonempty translations: bank_sms_no",
+    "Format-argument parity: total_all_time",
+    "Nonempty translations: total_all_time",
+    "Format-argument parity: undo_expired",
+    "Nonempty translations: undo_expired",
+    "Format-argument parity: analytics_title",
+    "Nonempty translations: analytics_title",
+    "Format-argument parity: activation_code_label",
+    "Nonempty translations: activation_code_label",
+    "Format-argument parity: erase_digit",
+    "Nonempty translations: erase_digit",
+    "Format-argument parity: category_dining",
+    "Nonempty translations: category_dining",
+    "Format-argument parity: api_imported_last",
+    "Nonempty translations: api_imported_last",
+    "Format-argument parity: category_health",
+    "Nonempty translations: category_health",
+    "Format-argument parity: help_privacy_title",
+    "Nonempty translations: help_privacy_title",
+    "Format-argument parity: help_premium_body",
+    "Nonempty translations: help_premium_body",
+    "Format-argument parity: dashboard_subtitle",
+    "Nonempty translations: dashboard_subtitle",
+    "Format-argument parity: biometric_title",
+    "Nonempty translations: biometric_title",
+    "Format-argument parity: unlock_title",
+    "Nonempty translations: unlock_title",
+    "Format-argument parity: activation_device",
+    "Nonempty translations: activation_device",
+    "Format-argument parity: positive_amount",
+    "Nonempty translations: positive_amount",
+    "Format-argument parity: sms_scanning",
+    "Nonempty translations: sms_scanning",
+    "Format-argument parity: activation_clock",
+    "Nonempty translations: activation_clock",
+    "Format-argument parity: display_name",
+    "Nonempty translations: display_name",
+    "Format-argument parity: help_security_title",
+    "Nonempty translations: help_security_title",
+    "Format-argument parity: done",
+    "Nonempty translations: done",
+    "Format-argument parity: load_error_title",
+    "Nonempty translations: load_error_title",
+    "Format-argument parity: bank_duplicate",
+    "Nonempty translations: bank_duplicate",
+    "Format-argument parity: discard_body",
+    "Nonempty translations: discard_body",
+    "Format-argument parity: cinematic_period",
+    "Nonempty translations: cinematic_period",
+    "Format-argument parity: diagnostics_copy",
+    "Nonempty translations: diagnostics_copy",
+    "Format-argument parity: last_30_days",
+    "Nonempty translations: last_30_days",
+    "Format-argument parity: premium_activated",
+    "Nonempty translations: premium_activated",
+    "Format-argument parity: voice_smalltalk_joke",
+    "Nonempty translations: voice_smalltalk_joke",
+    "Format-argument parity: biometric_subtitle",
+    "Nonempty translations: biometric_subtitle",
+    "Format-argument parity: here_to_help",
+    "Nonempty translations: here_to_help",
+    "Format-argument parity: import_auto_done",
+    "Nonempty translations: import_auto_done",
+    "Format-argument parity: import_repeated",
+    "Nonempty translations: import_repeated",
+    "Format-argument parity: category_transport",
+    "Nonempty translations: category_transport",
+    "Format-argument parity: currency_explanation",
+    "Nonempty translations: currency_explanation",
+    "Format-argument parity: diagnostics_hint",
+    "Nonempty translations: diagnostics_hint",
+    "Format-argument parity: color_muted",
+    "Nonempty translations: color_muted",
+    "Format-argument parity: activation_malformed",
+    "Nonempty translations: activation_malformed",
+    "Format-argument parity: support_privacy",
+    "Nonempty translations: support_privacy",
+    "Format-argument parity: bank_day",
+    "Nonempty translations: bank_day",
+    "Format-argument parity: rates_disclaimer",
+    "Nonempty translations: rates_disclaimer",
+    "Format-argument parity: import_text",
+    "Nonempty translations: import_text",
+    "Format-argument parity: category_transfer",
+    "Nonempty translations: category_transfer",
+    "Format-argument parity: search_scope",
+    "Nonempty translations: search_scope",
+    "Format-argument parity: bank_enabled",
+    "Nonempty translations: bank_enabled",
+    "Format-argument parity: app_version",
+    "Nonempty translations: app_version",
+    "Format-argument parity: activation_code_button",
+    "Nonempty translations: activation_code_button",
+    "Format-argument parity: clear_filters",
+    "Nonempty translations: clear_filters",
+    "Format-argument parity: bank_transfer_review",
+    "Nonempty translations: bank_transfer_review",
+    "Format-argument parity: bank_battery",
+    "Nonempty translations: bank_battery",
+    "Format-argument parity: rates_empty",
+    "Nonempty translations: rates_empty",
+    "Format-argument parity: import_queued",
+    "Nonempty translations: import_queued",
+    "Format-argument parity: activity",
+    "Nonempty translations: activity",
+    "Format-argument parity: import_diagnostics",
+    "Nonempty translations: import_diagnostics",
+    "Format-argument parity: back",
+    "Nonempty translations: back",
+    "Format-argument parity: cinematic_more_buckets",
+    "Nonempty translations: cinematic_more_buckets",
+    "Format-argument parity: color_accent",
+    "Nonempty translations: color_accent",
+    "Format-argument parity: handle_copied",
+    "Nonempty translations: handle_copied",
+    "Format-argument parity: onboard_body_one",
+    "Nonempty translations: onboard_body_one",
+    "Format-argument parity: premium_assistant_toggle_hint",
+    "Nonempty translations: premium_assistant_toggle_hint",
+    "Format-argument parity: bank_category_stats",
+    "Nonempty translations: bank_category_stats",
+    "Format-argument parity: color_saturation",
+    "Nonempty translations: color_saturation",
+    "Format-argument parity: premium_source_developer",
+    "Nonempty translations: premium_source_developer",
+    "Format-argument parity: default_currency",
+    "Nonempty translations: default_currency",
+    "Format-argument parity: lock_now",
+    "Nonempty translations: lock_now",
+    "Format-argument parity: import_counts",
+    "Nonempty translations: import_counts",
+    "Format-argument parity: discard",
+    "Nonempty translations: discard",
+    "Format-argument parity: legend_income",
+    "Nonempty translations: legend_income",
+    "Format-argument parity: cinematic_expenses_period",
+    "Nonempty translations: cinematic_expenses_period",
+    "Format-argument parity: import_queue_note",
+    "Nonempty translations: import_queue_note",
+    "Format-argument parity: diagnostics_copied",
+    "Nonempty translations: diagnostics_copied",
+    "Format-argument parity: voice_permission_denied",
+    "Nonempty translations: voice_permission_denied",
+    "Format-argument parity: voice_smalltalk_compliment",
+    "Nonempty translations: voice_smalltalk_compliment",
+    "Format-argument parity: help_security_body",
+    "Nonempty translations: help_security_body",
+    "Format-argument parity: add_entry",
+    "Nonempty translations: add_entry",
+    "Format-argument parity: premium_feature_mascot",
+    "Nonempty translations: premium_feature_mascot",
+    "Format-argument parity: premium_feature_trends",
+    "Nonempty translations: premium_feature_trends",
+    "Format-argument parity: voice_smalltalk_who_are_you",
+    "Nonempty translations: voice_smalltalk_who_are_you",
+    "Format-argument parity: cinematic_income_categories",
+    "Nonempty translations: cinematic_income_categories",
+    "Format-argument parity: name_invalid",
+    "Nonempty translations: name_invalid",
+    "Format-argument parity: colors_reset_all",
+    "Nonempty translations: colors_reset_all",
+    "Format-argument parity: help_banks_title",
+    "Nonempty translations: help_banks_title",
+    "Format-argument parity: get_started",
+    "Nonempty translations: get_started",
+    "Format-argument parity: cinematic_tooltip",
+    "Nonempty translations: cinematic_tooltip",
+    "Format-argument parity: voice_reply_not_understood",
+    "Nonempty translations: voice_reply_not_understood",
+    "Format-argument parity: voice_reply_balance",
+    "Nonempty translations: voice_reply_balance",
+    "Format-argument parity: activation_product",
+    "Nonempty translations: activation_product",
+    "Format-argument parity: sms_scan",
+    "Nonempty translations: sms_scan",
+    "Format-argument parity: push_howto",
+    "Nonempty translations: push_howto",
+    "Format-argument parity: pin_incorrect",
+    "Nonempty translations: pin_incorrect",
+    "Format-argument parity: unlock_biometric",
+    "Nonempty translations: unlock_biometric",
+    "Format-argument parity: major_release_body",
+    "Nonempty translations: major_release_body",
+    "Format-argument parity: entry_currency_notice",
+    "Nonempty translations: entry_currency_notice",
+    "Format-argument parity: entry_not_found",
+    "Nonempty translations: entry_not_found",
+    "Format-argument parity: bank_cash",
+    "Nonempty translations: bank_cash",
+    "Format-argument parity: voice_entry_added",
+    "Nonempty translations: voice_entry_added",
+    "Format-argument parity: reference_total_for",
+    "Nonempty translations: reference_total_for",
+    "Format-argument parity: restore_purchases",
+    "Nonempty translations: restore_purchases",
+    "Format-argument parity: help",
+    "Nonempty translations: help",
+    "Format-argument parity: note_optional",
+    "Nonempty translations: note_optional",
+    "Format-argument parity: fps_value",
+    "Nonempty translations: fps_value",
+    "Format-argument parity: activation_signature",
+    "Nonempty translations: activation_signature",
+    "Format-argument parity: activation_not_configured",
+    "Nonempty translations: activation_not_configured",
     "Format-argument parity: cinematic_month_average",
     "Nonempty translations: cinematic_month_average",
     "Format-argument parity: fps_title",
     "Nonempty translations: fps_title",
-    "Format-argument parity: sms_scan_result",
-    "Nonempty translations: sms_scan_result",
-    "Format-argument parity: load_more",
-    "Nonempty translations: load_more",
-    "Format-argument parity: activity",
-    "Nonempty translations: activity",
-    "Format-argument parity: privat_api_token",
-    "Nonempty translations: privat_api_token",
-    "Format-argument parity: delete_named_entry",
-    "Nonempty translations: delete_named_entry",
-    "Format-argument parity: premium_feature_mascot",
-    "Nonempty translations: premium_feature_mascot",
-    "Format-argument parity: empty_ledger_title",
-    "Nonempty translations: empty_ledger_title",
-    "Format-argument parity: telegram_support",
-    "Nonempty translations: telegram_support",
-    "Format-argument parity: diagnostics_hint",
-    "Nonempty translations: diagnostics_hint",
-    "Format-argument parity: help_entries_body",
-    "Nonempty translations: help_entries_body",
-    "Format-argument parity: bank_transfer_review",
-    "Nonempty translations: bank_transfer_review",
-    "Format-argument parity: period_month",
-    "Nonempty translations: period_month",
-    "Format-argument parity: billing_pending",
-    "Nonempty translations: billing_pending",
-    "Format-argument parity: cat_tap_hint",
-    "Nonempty translations: cat_tap_hint",
-    "Format-argument parity: api_error_no_accounts",
-    "Nonempty translations: api_error_no_accounts",
-    "Format-argument parity: brand_intro_body",
-    "Nonempty translations: brand_intro_body",
-    "Format-argument parity: premium_name",
-    "Nonempty translations: premium_name",
-    "Format-argument parity: erase_digit",
-    "Nonempty translations: erase_digit",
-    "Format-argument parity: sms_howto",
-    "Nonempty translations: sms_howto",
-    "Format-argument parity: trial_explanation",
-    "Nonempty translations: trial_explanation",
-    "Format-argument parity: import_reconnect",
-    "Nonempty translations: import_reconnect",
-    "Format-argument parity: diagnostics_copy",
-    "Nonempty translations: diagnostics_copy",
-    "Format-argument parity: mascot_card_title",
-    "Nonempty translations: mascot_card_title",
-    "Format-argument parity: undo_expired",
-    "Nonempty translations: undo_expired",
-    "Format-argument parity: bank_unknown",
-    "Nonempty translations: bank_unknown",
-    "Format-argument parity: bank_import_title",
-    "Nonempty translations: bank_import_title",
-    "Format-argument parity: import_disconnected",
-    "Nonempty translations: import_disconnected",
-    "Format-argument parity: major_release_title",
-    "Nonempty translations: major_release_title",
-    "Format-argument parity: color_text",
-    "Nonempty translations: color_text",
-    "Format-argument parity: bank_privacy_body",
-    "Nonempty translations: bank_privacy_body",
-    "Format-argument parity: category_health",
-    "Nonempty translations: category_health",
-    "Format-argument parity: diagnostics_close",
-    "Nonempty translations: diagnostics_close",
-    "Format-argument parity: voice_smalltalk_greeting",
-    "Nonempty translations: voice_smalltalk_greeting",
-    "Format-argument parity: premium_source_play",
-    "Nonempty translations: premium_source_play",
-    "Format-argument parity: cinematic_week_average",
-    "Nonempty translations: cinematic_week_average",
-    "Format-argument parity: get_started",
-    "Nonempty translations: get_started",
-    "Format-argument parity: installation_id_label",
-    "Nonempty translations: installation_id_label",
-    "Format-argument parity: color_chart_top",
-    "Nonempty translations: color_chart_top",
-    "Format-argument parity: help_entries_title",
-    "Nonempty translations: help_entries_title",
-    "Format-argument parity: help_banks_body",
-    "Nonempty translations: help_banks_body",
-    "Format-argument parity: category_transaction_count",
-    "Nonempty translations: category_transaction_count",
-    "Format-argument parity: fps_value",
-    "Nonempty translations: fps_value",
-    "Format-argument parity: biometric_unavailable",
-    "Nonempty translations: biometric_unavailable",
-    "Format-argument parity: mascot_premium_note",
-    "Nonempty translations: mascot_premium_note",
-    "Format-argument parity: premium_active",
-    "Nonempty translations: premium_active",
-    "Format-argument parity: onboard_title_three",
-    "Nonempty translations: onboard_title_three",
-    "Format-argument parity: bank_notification_permission",
-    "Nonempty translations: bank_notification_permission",
-    "Format-argument parity: create_pin",
-    "Nonempty translations: create_pin",
-    "Format-argument parity: billing_acknowledgement",
-    "Nonempty translations: billing_acknowledgement",
-    "Format-argument parity: note_optional",
-    "Nonempty translations: note_optional",
-    "Format-argument parity: need_help",
-    "Nonempty translations: need_help",
-    "Format-argument parity: api_error_bad_token",
-    "Nonempty translations: api_error_bad_token",
+    "Format-argument parity: bank_play_sms",
+    "Nonempty translations: bank_play_sms",
+    "Format-argument parity: colors_title",
+    "Nonempty translations: colors_title",
+    "Format-argument parity: category_other",
+    "Nonempty translations: category_other",
     "Format-argument parity: import_empty",
     "Nonempty translations: import_empty",
-    "Format-argument parity: lock_now",
-    "Nonempty translations: lock_now",
-    "Format-argument parity: no_matches_body",
-    "Nonempty translations: no_matches_body",
-    "Format-argument parity: diagnostics_title",
-    "Nonempty translations: diagnostics_title",
-    "Format-argument parity: contact_telegram",
-    "Nonempty translations: contact_telegram",
-    "Format-argument parity: api_error_network",
-    "Nonempty translations: api_error_network",
-    "Format-argument parity: colors_edit",
-    "Nonempty translations: colors_edit",
-    "Format-argument parity: cinematic_transactions",
-    "Nonempty translations: cinematic_transactions",
-    "Format-argument parity: colors_collapse",
-    "Nonempty translations: colors_collapse",
-    "Format-argument parity: cinematic_income_categories",
-    "Nonempty translations: cinematic_income_categories",
     "Format-argument parity: last_30_days_plus",
     "Nonempty translations: last_30_days_plus",
-    "Format-argument parity: name_invalid",
-    "Nonempty translations: name_invalid",
-    "Format-argument parity: rates_empty",
-    "Nonempty translations: rates_empty",
-    "Format-argument parity: pin_mismatch",
-    "Nonempty translations: pin_mismatch",
-    "Format-argument parity: assistant_write_short",
-    "Nonempty translations: assistant_write_short",
-    "Format-argument parity: bank_battery",
-    "Nonempty translations: bank_battery",
-    "Format-argument parity: bank_day",
-    "Nonempty translations: bank_day",
-    "Format-argument parity: biometric_subtitle",
-    "Nonempty translations: biometric_subtitle",
-    "Format-argument parity: color_icons",
-    "Nonempty translations: color_icons",
-    "Format-argument parity: bank_consent",
-    "Nonempty translations: bank_consent",
-    "Format-argument parity: support_intro",
-    "Nonempty translations: support_intro",
-    "Format-argument parity: period_today",
-    "Nonempty translations: period_today",
-    "Format-argument parity: expenses",
-    "Nonempty translations: expenses",
-    "Format-argument parity: onboard_body_three",
-    "Nonempty translations: onboard_body_three",
-    "Format-argument parity: pin_locked",
-    "Nonempty translations: pin_locked",
-    "Format-argument parity: cash_flow",
-    "Nonempty translations: cash_flow",
-    "Format-argument parity: title_hint",
-    "Nonempty translations: title_hint",
-    "Format-argument parity: bank_export",
-    "Nonempty translations: bank_export",
-    "Format-argument parity: total_seven_days",
-    "Nonempty translations: total_seven_days",
-    "Format-argument parity: voice_assistant_hint",
-    "Nonempty translations: voice_assistant_hint",
-    "Format-argument parity: pin_setup_subtitle",
-    "Nonempty translations: pin_setup_subtitle",
-    "Format-argument parity: bank_cash",
-    "Nonempty translations: bank_cash",
-    "Format-argument parity: diagnostics_none",
-    "Nonempty translations: diagnostics_none",
-    "Format-argument parity: last_30_days",
-    "Nonempty translations: last_30_days",
-    "Format-argument parity: import_to_queue",
-    "Nonempty translations: import_to_queue",
-    "Format-argument parity: bank_limit_recent",
-    "Nonempty translations: bank_limit_recent",
-    "Format-argument parity: default_currency",
-    "Nonempty translations: default_currency",
-    "Format-argument parity: chart_description",
-    "Nonempty translations: chart_description",
-    "Format-argument parity: analytics_title",
-    "Nonempty translations: analytics_title",
-    "Format-argument parity: entry_deleted",
-    "Nonempty translations: entry_deleted",
-    "Format-argument parity: api_sync_now",
-    "Nonempty translations: api_sync_now",
-    "Format-argument parity: bank_new_category",
-    "Nonempty translations: bank_new_category",
-    "Format-argument parity: premium_buy",
-    "Nonempty translations: premium_buy",
-    "Format-argument parity: activation_invalid",
-    "Nonempty translations: activation_invalid",
-    "Format-argument parity: cinematic_period",
-    "Nonempty translations: cinematic_period",
-    "Format-argument parity: bank_budget",
-    "Nonempty translations: bank_budget",
-    "Format-argument parity: import_mode_notify",
-    "Nonempty translations: import_mode_notify",
-    "Format-argument parity: save_entry",
-    "Nonempty translations: save_entry",
-    "Format-argument parity: cat_asset_status",
-    "Nonempty translations: cat_asset_status",
-    "Format-argument parity: page_of",
-    "Nonempty translations: page_of",
-    "Format-argument parity: category_home",
-    "Nonempty translations: category_home",
-    "Format-argument parity: import_confirm_permission",
-    "Nonempty translations: import_confirm_permission",
-    "Format-argument parity: period_year",
-    "Nonempty translations: period_year",
-    "Format-argument parity: language_en",
-    "Nonempty translations: language_en",
-    "Format-argument parity: legend_expense",
-    "Nonempty translations: legend_expense",
-    "Format-argument parity: voice_entry_added",
-    "Nonempty translations: voice_entry_added",
-    "Format-argument parity: currency_explanation",
-    "Nonempty translations: currency_explanation",
-    "Format-argument parity: app_version",
-    "Nonempty translations: app_version",
-    "Format-argument parity: color_brightness",
-    "Nonempty translations: color_brightness",
-    "Format-argument parity: bank_access_no",
-    "Nonempty translations: bank_access_no",
-    "Format-argument parity: pay_source_required",
-    "Nonempty translations: pay_source_required",
-    "Format-argument parity: color_background",
-    "Nonempty translations: color_background",
-    "Format-argument parity: voice_statistics",
-    "Nonempty translations: voice_statistics",
-    "Format-argument parity: retry",
-    "Nonempty translations: retry",
-    "Format-argument parity: chart_empty",
-    "Nonempty translations: chart_empty",
-    "Format-argument parity: premium_expires",
-    "Nonempty translations: premium_expires",
-    "Format-argument parity: billing_unavailable",
-    "Nonempty translations: billing_unavailable",
-    "Format-argument parity: assistant_send",
-    "Nonempty translations: assistant_send",
-    "Format-argument parity: legend_income",
-    "Nonempty translations: legend_income",
-    "Format-argument parity: expense",
-    "Nonempty translations: expense",
-    "Format-argument parity: discard",
-    "Nonempty translations: discard",
-    "Format-argument parity: fps_fallback",
-    "Nonempty translations: fps_fallback",
-    "Format-argument parity: premium_offline_notice",
-    "Nonempty translations: premium_offline_notice",
-    "Format-argument parity: positive_amount",
-    "Nonempty translations: positive_amount",
-    "Format-argument parity: other_api_note",
-    "Nonempty translations: other_api_note",
-    "Format-argument parity: import_confirm_enabled",
-    "Nonempty translations: import_confirm_enabled",
-    "Format-argument parity: color_invalid",
-    "Nonempty translations: color_invalid",
-    "Format-argument parity: premium_unlock",
-    "Nonempty translations: premium_unlock",
-    "Format-argument parity: copy_handle",
-    "Nonempty translations: copy_handle",
-    "Format-argument parity: bank_setup",
-    "Nonempty translations: bank_setup",
-    "Format-argument parity: category_transport",
-    "Nonempty translations: category_transport",
-    "Format-argument parity: premium_activated",
-    "Nonempty translations: premium_activated",
-    "Format-argument parity: cinematic_expense_categories",
-    "Nonempty translations: cinematic_expense_categories",
-    "Format-argument parity: search_scope",
-    "Nonempty translations: search_scope",
-    "Format-argument parity: add_entry",
-    "Nonempty translations: add_entry",
-    "Format-argument parity: category_transfer",
-    "Nonempty translations: category_transfer",
-    "Format-argument parity: cinematic_apply",
-    "Nonempty translations: cinematic_apply",
-    "Format-argument parity: bank_ignore",
-    "Nonempty translations: bank_ignore",
-    "Format-argument parity: storage_error",
-    "Nonempty translations: storage_error",
-    "Format-argument parity: privat_api_title",
-    "Nonempty translations: privat_api_title",
-    "Format-argument parity: voice_permission_denied",
-    "Nonempty translations: voice_permission_denied",
-    "Format-argument parity: bank_sms_no",
-    "Nonempty translations: bank_sms_no",
-    "Format-argument parity: voice_ask_source",
-    "Nonempty translations: voice_ask_source",
-    "Format-argument parity: import_repeated",
-    "Nonempty translations: import_repeated",
-    "Format-argument parity: biometric_title",
-    "Nonempty translations: biometric_title",
-    "Format-argument parity: rates_disclaimer",
-    "Nonempty translations: rates_disclaimer",
-    "Format-argument parity: help_premium_title",
-    "Nonempty translations: help_premium_title",
-    "Format-argument parity: undo",
-    "Nonempty translations: undo",
-    "Format-argument parity: mascot_sky",
-    "Nonempty translations: mascot_sky",
-    "Format-argument parity: dashboard_heading",
-    "Nonempty translations: dashboard_heading",
-    "Format-argument parity: theme_system",
-    "Nonempty translations: theme_system",
-    "Format-argument parity: color_saturation",
-    "Nonempty translations: color_saturation",
-    "Format-argument parity: sms_restricted_tip",
-    "Nonempty translations: sms_restricted_tip",
-    "Format-argument parity: cinematic_tooltip",
-    "Nonempty translations: cinematic_tooltip",
-    "Format-argument parity: rate_value",
-    "Nonempty translations: rate_value",
-    "Format-argument parity: onboard_title_two",
-    "Nonempty translations: onboard_title_two",
-    "Format-argument parity: premium_source_developer",
-    "Nonempty translations: premium_source_developer",
-    "Format-argument parity: bank_clear_history",
-    "Nonempty translations: bank_clear_history",
-    "Format-argument parity: category",
-    "Nonempty translations: category",
-    "Format-argument parity: import_mode_sms",
-    "Nonempty translations: import_mode_sms",
-    "Format-argument parity: category_food",
-    "Nonempty translations: category_food",
-    "Format-argument parity: discard_title",
-    "Nonempty translations: discard_title",
-    "Format-argument parity: cinematic_expenses_period",
-    "Nonempty translations: cinematic_expenses_period",
-    "Format-argument parity: category_salary",
-    "Nonempty translations: category_salary",
-    "Format-argument parity: theme_dark",
-    "Nonempty translations: theme_dark",
-    "Format-argument parity: color_contrast_warning",
-    "Nonempty translations: color_contrast_warning",
-    "Format-argument parity: entry_not_found",
-    "Nonempty translations: entry_not_found",
-    "Format-argument parity: bank_privacy",
-    "Nonempty translations: bank_privacy",
-    "Format-argument parity: language",
-    "Nonempty translations: language",
-    "Format-argument parity: fps_supported",
-    "Nonempty translations: fps_supported",
-    "Format-argument parity: onboard_title_one",
-    "Nonempty translations: onboard_title_one",
-    "Format-argument parity: total_thirty_days",
-    "Nonempty translations: total_thirty_days",
-    "Format-argument parity: api_connected",
-    "Nonempty translations: api_connected",
-    "Format-argument parity: support_handle",
-    "Nonempty translations: support_handle",
-    "Format-argument parity: premium_feature_support",
-    "Nonempty translations: premium_feature_support",
-    "Format-argument parity: total_all_time",
-    "Nonempty translations: total_all_time",
-    "Format-argument parity: mascot_style",
-    "Nonempty translations: mascot_style",
-    "Format-argument parity: import_package_warning",
-    "Nonempty translations: import_package_warning",
-    "Format-argument parity: bank_enabled",
-    "Nonempty translations: bank_enabled",
     "Format-argument parity: voice_reply_opening_entry",
     "Nonempty translations: voice_reply_opening_entry",
-    "Format-argument parity: color_apply",
-    "Nonempty translations: color_apply",
-    "Format-argument parity: support_network_error",
-    "Nonempty translations: support_network_error",
-    "Format-argument parity: unlock_biometric",
-    "Nonempty translations: unlock_biometric",
-    "Format-argument parity: diagnostics_show_button",
-    "Nonempty translations: diagnostics_show_button",
-    "Format-argument parity: privat_api_site",
-    "Nonempty translations: privat_api_site",
-    "Format-argument parity: rates_as_of",
-    "Nonempty translations: rates_as_of",
-    "Format-argument parity: help_security_body",
-    "Nonempty translations: help_security_body",
-    "Format-argument parity: premium_source_trial",
-    "Nonempty translations: premium_source_trial",
-    "Format-argument parity: api_token_label",
-    "Nonempty translations: api_token_label",
-    "Format-argument parity: cat_locked_hint",
-    "Nonempty translations: cat_locked_hint",
-    "Format-argument parity: search_entries",
-    "Nonempty translations: search_entries",
-    "Format-argument parity: refreshing",
-    "Nonempty translations: refreshing",
-    "Format-argument parity: security",
-    "Nonempty translations: security",
-    "Format-argument parity: support",
-    "Nonempty translations: support",
-    "Format-argument parity: auto_lock_explanation",
-    "Nonempty translations: auto_lock_explanation",
-    "Format-argument parity: bank_source",
-    "Nonempty translations: bank_source",
-    "Format-argument parity: app_name",
-    "Nonempty translations: app_name",
-    "Format-argument parity: pay_source_title",
-    "Nonempty translations: pay_source_title",
-    "Format-argument parity: security_error",
-    "Nonempty translations: security_error",
-    "Format-argument parity: keep_editing",
-    "Nonempty translations: keep_editing",
-    "Format-argument parity: import_mode_title",
-    "Nonempty translations: import_mode_title",
-    "Format-argument parity: start_over",
-    "Nonempty translations: start_over",
-    "Format-argument parity: import_mode_api",
-    "Nonempty translations: import_mode_api",
-    "Format-argument parity: amount_invalid",
-    "Nonempty translations: amount_invalid",
-    "Format-argument parity: cinematic_less_than_previous",
-    "Nonempty translations: cinematic_less_than_previous",
-    "Format-argument parity: bank_budget_disable",
-    "Nonempty translations: bank_budget_disable",
-    "Format-argument parity: voice_assistant_listening",
-    "Nonempty translations: voice_assistant_listening",
-    "Format-argument parity: privat_api_connected",
-    "Nonempty translations: privat_api_connected",
-    "Format-argument parity: mascot_hear_again",
-    "Nonempty translations: mascot_hear_again",
-    "Format-argument parity: cinematic_more",
-    "Nonempty translations: cinematic_more",
-    "Format-argument parity: premium_assistant_toggle",
-    "Nonempty translations: premium_assistant_toggle",
-    "Format-argument parity: refresh_rates",
-    "Nonempty translations: refresh_rates",
-    "Format-argument parity: voice_reply_spent_today",
-    "Nonempty translations: voice_reply_spent_today",
-    "Format-argument parity: biometric_unlock",
-    "Nonempty translations: biometric_unlock",
-    "Format-argument parity: colors_explanation",
-    "Nonempty translations: colors_explanation",
-    "Format-argument parity: billing_activation_code",
-    "Nonempty translations: billing_activation_code",
-    "Format-argument parity: voice_recognizer_unavailable",
-    "Nonempty translations: voice_recognizer_unavailable",
-    "Format-argument parity: bank_duplicate",
-    "Nonempty translations: bank_duplicate",
-    "Format-argument parity: colors_categories",
-    "Nonempty translations: colors_categories",
-    "Format-argument parity: voice_smalltalk_bye",
-    "Nonempty translations: voice_smalltalk_bye",
-    "Format-argument parity: entry_currency_notice",
-    "Nonempty translations: entry_currency_notice",
-    "Format-argument parity: delete_entry",
-    "Nonempty translations: delete_entry",
+    "Format-argument parity: bank_privacy_body",
+    "Nonempty translations: bank_privacy_body",
     "Format-argument parity: import_waiting",
     "Nonempty translations: import_waiting",
-    "Format-argument parity: reference_rates",
-    "Nonempty translations: reference_rates",
-    "Format-argument parity: color_hue",
-    "Nonempty translations: color_hue",
-    "Format-argument parity: activation_code_hint",
-    "Nonempty translations: activation_code_hint",
-    "Format-argument parity: premium_feature_trends",
-    "Nonempty translations: premium_feature_trends",
-    "Format-argument parity: appearance",
-    "Nonempty translations: appearance",
-    "Format-argument parity: fps_explanation",
-    "Nonempty translations: fps_explanation",
-    "Format-argument parity: brand_copyright",
-    "Nonempty translations: brand_copyright",
-    "Format-argument parity: bank_clear_warning",
-    "Nonempty translations: bank_clear_warning",
-    "Format-argument parity: import_connected",
-    "Nonempty translations: import_connected",
-    "Format-argument parity: no_matches",
-    "Nonempty translations: no_matches",
+    "Format-argument parity: save_entry",
+    "Nonempty translations: save_entry",
+    "Format-argument parity: bank_ignore",
+    "Nonempty translations: bank_ignore",
+    "Format-argument parity: brand_intro_body",
+    "Nonempty translations: brand_intro_body",
+    "Format-argument parity: bank_notification_permission",
+    "Nonempty translations: bank_notification_permission",
+    "Format-argument parity: category_empty",
+    "Nonempty translations: category_empty",
+    "Format-argument parity: category_cashback",
+    "Nonempty translations: category_cashback",
+    "Format-argument parity: telegram_support",
+    "Nonempty translations: telegram_support",
+    "Format-argument parity: biometric_unavailable",
+    "Nonempty translations: biometric_unavailable",
+    "Format-argument parity: edit_entry",
+    "Nonempty translations: edit_entry",
+    "Format-argument parity: mascot_hear_again",
+    "Nonempty translations: mascot_hear_again",
+    "Format-argument parity: rate_offline",
+    "Nonempty translations: rate_offline",
+    "Format-argument parity: api_last_sync",
+    "Nonempty translations: api_last_sync",
     "Format-argument parity: assistant_text_hint",
     "Nonempty translations: assistant_text_hint",
-    "Format-argument parity: installation_id_copied",
-    "Nonempty translations: installation_id_copied",
-    "Format-argument parity: color_error",
-    "Nonempty translations: color_error",
-    "Format-argument parity: mascot_animations",
-    "Nonempty translations: mascot_animations",
-    "Format-argument parity: total_balance",
-    "Nonempty translations: total_balance",
-    "Format-argument parity: cinematic_history",
-    "Nonempty translations: cinematic_history",
-    "Format-argument parity: api_connect",
-    "Nonempty translations: api_connect",
-    "Format-argument parity: import_package_settings",
-    "Nonempty translations: import_package_settings",
-    "Format-argument parity: dashboard_subtitle",
-    "Nonempty translations: dashboard_subtitle",
-    "Format-argument parity: bank_recent",
-    "Nonempty translations: bank_recent",
-    "Format-argument parity: all_categories",
-    "Nonempty translations: all_categories",
-    "Format-argument parity: voice_assistant_button",
-    "Nonempty translations: voice_assistant_button",
-    "Format-argument parity: done",
-    "Nonempty translations: done",
+    "Format-argument parity: activation_code_hint",
+    "Nonempty translations: activation_code_hint",
+    "Format-argument parity: amount_invalid",
+    "Nonempty translations: amount_invalid",
     "Format-argument parity: categories",
     "Nonempty translations: categories",
-    "Format-argument parity: import_manual_privacy",
-    "Nonempty translations: import_manual_privacy",
-    "Format-argument parity: fps_auto",
-    "Nonempty translations: fps_auto",
-    "Format-argument parity: developer_purchase_title",
-    "Nonempty translations: developer_purchase_title",
-    "Format-argument parity: activation_code_label",
-    "Nonempty translations: activation_code_label",
-    "Format-argument parity: help_security_title",
-    "Nonempty translations: help_security_title",
-    "Format-argument parity: import_auto_done",
-    "Nonempty translations: import_auto_done",
-    "Format-argument parity: premium_assistant_toggle_hint",
-    "Nonempty translations: premium_assistant_toggle_hint",
-    "Format-argument parity: cinematic_more_buckets",
-    "Nonempty translations: cinematic_more_buckets",
-    "Format-argument parity: colors_reset_all",
-    "Nonempty translations: colors_reset_all",
-    "Format-argument parity: bank_week",
-    "Nonempty translations: bank_week",
-    "Format-argument parity: developer_purchase_button",
-    "Nonempty translations: developer_purchase_button",
+    "Format-argument parity: add_first_entry",
+    "Nonempty translations: add_first_entry",
+    "Format-argument parity: other_api_note",
+    "Nonempty translations: other_api_note",
+    "Format-argument parity: voice_smalltalk_how_are_you",
+    "Nonempty translations: voice_smalltalk_how_are_you",
+    "Format-argument parity: help_intro",
+    "Nonempty translations: help_intro",
     "Format-argument parity: bank_month",
     "Nonempty translations: bank_month",
+    "Format-argument parity: last_7_days",
+    "Nonempty translations: last_7_days",
+    "Format-argument parity: support_network_error",
+    "Nonempty translations: support_network_error",
+    "Format-argument parity: close",
+    "Nonempty translations: close",
+    "Format-argument parity: amount",
+    "Nonempty translations: amount",
+    "Format-argument parity: color_text",
+    "Nonempty translations: color_text",
+    "Format-argument parity: voice_statistics",
+    "Nonempty translations: voice_statistics",
+    "Format-argument parity: greeting",
+    "Nonempty translations: greeting",
+    "Format-argument parity: language",
+    "Nonempty translations: language",
+    "Format-argument parity: activation_key_mismatch",
+    "Nonempty translations: activation_key_mismatch",
+    "Format-argument parity: bank_sms_permission",
+    "Nonempty translations: bank_sms_permission",
+    "Format-argument parity: import_reconnect",
+    "Nonempty translations: import_reconnect",
+    "Format-argument parity: bank_review_count",
+    "Nonempty translations: bank_review_count",
+    "Format-argument parity: import_manual_privacy",
+    "Nonempty translations: import_manual_privacy",
+    "Format-argument parity: help_privacy_body",
+    "Nonempty translations: help_privacy_body",
+    "Format-argument parity: fps_supported",
+    "Nonempty translations: fps_supported",
+    "Format-argument parity: bank_dashboard",
+    "Nonempty translations: bank_dashboard",
+    "Format-argument parity: billing_configuration",
+    "Nonempty translations: billing_configuration",
+    "Format-argument parity: premium_feature_support",
+    "Nonempty translations: premium_feature_support",
+    "Format-argument parity: premium_expires",
+    "Nonempty translations: premium_expires",
+    "Format-argument parity: page_of",
+    "Nonempty translations: page_of",
+    "Format-argument parity: currency_scope",
+    "Nonempty translations: currency_scope",
+    "Format-argument parity: colors_categories",
+    "Nonempty translations: colors_categories",
+    "Format-argument parity: api_connect",
+    "Nonempty translations: api_connect",
+    "Format-argument parity: bank_consent",
+    "Nonempty translations: bank_consent",
+    "Format-argument parity: biometric_explanation",
+    "Nonempty translations: biometric_explanation",
+    "Format-argument parity: support",
+    "Nonempty translations: support",
+    "Format-argument parity: mascot_gray",
+    "Nonempty translations: mascot_gray",
+    "Format-argument parity: lead_developer",
+    "Nonempty translations: lead_developer",
+    "Format-argument parity: installation_id_copy",
+    "Nonempty translations: installation_id_copy",
+    "Format-argument parity: colors_collapse",
+    "Nonempty translations: colors_collapse",
+    "Format-argument parity: color_apply",
+    "Nonempty translations: color_apply",
+    "Format-argument parity: import_confirm_enabled",
+    "Nonempty translations: import_confirm_enabled",
+    "Format-argument parity: import_unrecognized",
+    "Nonempty translations: import_unrecognized",
+    "Format-argument parity: premium_buy",
+    "Nonempty translations: premium_buy",
+    "Format-argument parity: major_release_title",
+    "Nonempty translations: major_release_title",
+    "Format-argument parity: keep_editing",
+    "Nonempty translations: keep_editing",
+    "Format-argument parity: billing_unavailable",
+    "Nonempty translations: billing_unavailable",
+    "Format-argument parity: need_help",
+    "Nonempty translations: need_help",
+    "Format-argument parity: premium_active",
+    "Nonempty translations: premium_active",
     "Format-argument parity: profile",
     "Nonempty translations: profile",
+    "Format-argument parity: color_chart_top",
+    "Nonempty translations: color_chart_top",
+    "Format-argument parity: security",
+    "Nonempty translations: security",
+    "Format-argument parity: period_year",
+    "Nonempty translations: period_year",
+    "Format-argument parity: onboard_title_three",
+    "Nonempty translations: onboard_title_three",
+    "Format-argument parity: help_entries_body",
+    "Nonempty translations: help_entries_body",
+    "Format-argument parity: bank_import_title",
+    "Nonempty translations: bank_import_title",
+    "Format-argument parity: color_error",
+    "Nonempty translations: color_error",
+    "Format-argument parity: developer_purchase_button",
+    "Nonempty translations: developer_purchase_button",
+    "Format-argument parity: billing_acknowledgement",
+    "Nonempty translations: billing_acknowledgement",
+    "Format-argument parity: bank_access_no",
+    "Nonempty translations: bank_access_no",
+    "Format-argument parity: import_disconnected",
+    "Nonempty translations: import_disconnected",
+    "Format-argument parity: voice_smalltalk_thanks",
+    "Nonempty translations: voice_smalltalk_thanks",
+    "Format-argument parity: onboard_body_two",
+    "Nonempty translations: onboard_body_two",
+    "Format-argument parity: overview",
+    "Nonempty translations: overview",
+    "Format-argument parity: bank_new_category",
+    "Nonempty translations: bank_new_category",
+    "Format-argument parity: activation_request_copied",
+    "Nonempty translations: activation_request_copied",
+    "Format-argument parity: brand_intro_title",
+    "Nonempty translations: brand_intro_title",
+    "Format-argument parity: cat_asset_status",
+    "Nonempty translations: cat_asset_status",
+    "Format-argument parity: api_connecting",
+    "Nonempty translations: api_connecting",
+    "Format-argument parity: privat_api_error",
+    "Nonempty translations: privat_api_error",
+    "Format-argument parity: import_package_settings",
+    "Nonempty translations: import_package_settings",
+    "Format-argument parity: import_group",
+    "Nonempty translations: import_group",
+    "Format-argument parity: voice_assistant_hint",
+    "Nonempty translations: voice_assistant_hint",
+    "Format-argument parity: developer_purchase_body",
+    "Nonempty translations: developer_purchase_body",
+    "Format-argument parity: bank_clear_warning",
+    "Nonempty translations: bank_clear_warning",
+    "Format-argument parity: cinematic_more_than_previous",
+    "Nonempty translations: cinematic_more_than_previous",
+    "Format-argument parity: billing_verification",
+    "Nonempty translations: billing_verification",
+    "Format-argument parity: empty_ledger_title",
+    "Nonempty translations: empty_ledger_title",
+    "Format-argument parity: pin_digit_count",
+    "Nonempty translations: pin_digit_count",
+    "Format-argument parity: delete_named_entry",
+    "Nonempty translations: delete_named_entry",
+    "Format-argument parity: bank_recent",
+    "Nonempty translations: bank_recent",
+    "Format-argument parity: auto_lock_explanation",
+    "Nonempty translations: auto_lock_explanation",
+    "Format-argument parity: cinematic_less_than_previous",
+    "Nonempty translations: cinematic_less_than_previous",
+    "Format-argument parity: language_instant",
+    "Nonempty translations: language_instant",
+    "Format-argument parity: sms_restricted_tip",
+    "Nonempty translations: sms_restricted_tip",
+    "Format-argument parity: all_categories",
+    "Nonempty translations: all_categories",
+    "Format-argument parity: import_disabled",
+    "Nonempty translations: import_disabled",
+    "Format-argument parity: bank_unknown",
+    "Nonempty translations: bank_unknown",
+    "Format-argument parity: trial_explanation",
+    "Nonempty translations: trial_explanation",
+    "Format-argument parity: bank_time_received",
+    "Nonempty translations: bank_time_received",
+    "Format-argument parity: all_time",
+    "Nonempty translations: all_time",
+    "Format-argument parity: cinematic_chart_accessibility",
+    "Nonempty translations: cinematic_chart_accessibility",
+    "Format-argument parity: help_entries_title",
+    "Nonempty translations: help_entries_title",
+    "Format-argument parity: biometric_failed",
+    "Nonempty translations: biometric_failed",
+    "Format-argument parity: theme_system",
+    "Nonempty translations: theme_system",
+    "Format-argument parity: undo",
+    "Nonempty translations: undo",
+    "Format-argument parity: developer_purchase_note",
+    "Nonempty translations: developer_purchase_note",
+    "Format-argument parity: import_package_warning",
+    "Nonempty translations: import_package_warning",
+    "Format-argument parity: skip",
+    "Nonempty translations: skip",
+    "Format-argument parity: entry_title",
+    "Nonempty translations: entry_title",
+    "Format-argument parity: bank_budget",
+    "Nonempty translations: bank_budget",
+    "Format-argument parity: import_unsupported",
+    "Nonempty translations: import_unsupported",
+    "Format-argument parity: storage_error",
+    "Nonempty translations: storage_error",
+    "Format-argument parity: diagnostics_clear",
+    "Nonempty translations: diagnostics_clear",
+    "Format-argument parity: voice_ask_source",
+    "Nonempty translations: voice_ask_source",
+    "Format-argument parity: bank_week",
+    "Nonempty translations: bank_week",
+    "Format-argument parity: api_connected",
+    "Nonempty translations: api_connected",
+    "Format-argument parity: app_name",
+    "Nonempty translations: app_name",
+    "Format-argument parity: category_salary",
+    "Nonempty translations: category_salary",
+    "Format-argument parity: colors_edit",
+    "Nonempty translations: colors_edit",
+    "Format-argument parity: help_banks_body",
+    "Nonempty translations: help_banks_body",
+    "Format-argument parity: chart_empty",
+    "Nonempty translations: chart_empty",
+    "Format-argument parity: language_en",
+    "Nonempty translations: language_en",
+    "Format-argument parity: period_today",
+    "Nonempty translations: period_today",
+    "Format-argument parity: premium_source_play",
+    "Nonempty translations: premium_source_play",
+    "Format-argument parity: expenses",
+    "Nonempty translations: expenses",
+    "Format-argument parity: income",
+    "Nonempty translations: income",
+    "Format-argument parity: start_over",
+    "Nonempty translations: start_over",
+    "Format-argument parity: title_optional_hint",
+    "Nonempty translations: title_optional_hint",
+    "Format-argument parity: bank_auto",
+    "Nonempty translations: bank_auto",
+    "Format-argument parity: total_thirty_days",
+    "Nonempty translations: total_thirty_days",
+    "Format-argument parity: privat_api_connected",
+    "Nonempty translations: privat_api_connected",
+    "Format-argument parity: premium_offline_notice",
+    "Nonempty translations: premium_offline_notice",
+    "Format-argument parity: bank_card",
+    "Nonempty translations: bank_card",
+    "Format-argument parity: api_error_bad_token",
+    "Nonempty translations: api_error_bad_token",
+    "Format-argument parity: diagnostics_close",
+    "Nonempty translations: diagnostics_close",
+    "Format-argument parity: voice_recognizer_unavailable",
+    "Nonempty translations: voice_recognizer_unavailable",
+    "Format-argument parity: category",
+    "Nonempty translations: category",
+    "Format-argument parity: voice_assistant_listening",
+    "Nonempty translations: voice_assistant_listening",
+    "Format-argument parity: title_invalid",
+    "Nonempty translations: title_invalid",
     "Format-argument parity: settings",
     "Nonempty translations: settings",
-    "Format-argument parity: negative_amount",
-    "Nonempty translations: negative_amount",
+    "Format-argument parity: rates_as_of",
+    "Nonempty translations: rates_as_of",
+    "Format-argument parity: api_syncing",
+    "Nonempty translations: api_syncing",
     "Format-argument parity: pin_recovery_notice",
     "Nonempty translations: pin_recovery_notice",
+    "Format-argument parity: use_pin",
+    "Nonempty translations: use_pin",
+    "Format-argument parity: voice_reply_spent_today",
+    "Nonempty translations: voice_reply_spent_today",
+    "Format-argument parity: refreshing",
+    "Nonempty translations: refreshing",
+    "Format-argument parity: search_entries",
+    "Nonempty translations: search_entries",
+    "Format-argument parity: category_food",
+    "Nonempty translations: category_food",
+    "Format-argument parity: bank_source",
+    "Nonempty translations: bank_source",
+    "Format-argument parity: contact_telegram",
+    "Nonempty translations: contact_telegram",
+    "Format-argument parity: refresh_rates",
+    "Nonempty translations: refresh_rates",
+    "Format-argument parity: api_error_no_accounts",
+    "Nonempty translations: api_error_no_accounts",
+    "Format-argument parity: save_profile",
+    "Nonempty translations: save_profile",
+    "Format-argument parity: billing_activation_code",
+    "Nonempty translations: billing_activation_code",
+    "Format-argument parity: import_mode_title",
+    "Nonempty translations: import_mode_title",
+    "Format-argument parity: next",
+    "Nonempty translations: next",
+    "Format-argument parity: theme_dark",
+    "Nonempty translations: theme_dark",
+    "Format-argument parity: api_error_rate",
+    "Nonempty translations: api_error_rate",
+    "Format-argument parity: local_profile",
+    "Nonempty translations: local_profile",
+    "Format-argument parity: privat_api_token",
+    "Nonempty translations: privat_api_token",
+    "Format-argument parity: color_icons",
+    "Nonempty translations: color_icons",
+    "Format-argument parity: activation_checking",
+    "Nonempty translations: activation_checking",
+    "Format-argument parity: bank_export",
+    "Nonempty translations: bank_export",
+    "Format-argument parity: saved",
+    "Nonempty translations: saved",
+    "Format-argument parity: import_confirm_permission",
+    "Nonempty translations: import_confirm_permission",
+    "Format-argument parity: help_premium_title",
+    "Nonempty translations: help_premium_title",
+    "Format-argument parity: api_error_network",
+    "Nonempty translations: api_error_network",
+    "Format-argument parity: onboard_title_two",
+    "Nonempty translations: onboard_title_two",
+    "Format-argument parity: language_uk",
+    "Nonempty translations: language_uk",
+    "Format-argument parity: confirm_pin",
+    "Nonempty translations: confirm_pin",
+    "Format-argument parity: color_chart_bottom",
+    "Nonempty translations: color_chart_bottom",
+    "Format-argument parity: brand_design_label",
+    "Nonempty translations: brand_design_label",
+    "Format-argument parity: color_contrast_warning",
+    "Nonempty translations: color_contrast_warning",
+    "Format-argument parity: api_open_site",
+    "Nonempty translations: api_open_site",
+    "Format-argument parity: pin_mismatch",
+    "Nonempty translations: pin_mismatch",
+    "Format-argument parity: discard_title",
+    "Nonempty translations: discard_title",
+    "Format-argument parity: no_matches_body",
+    "Nonempty translations: no_matches_body",
+    "Format-argument parity: brand_copyright",
+    "Nonempty translations: brand_copyright",
+    "Format-argument parity: cat_tap_hint",
+    "Nonempty translations: cat_tap_hint",
+    "Format-argument parity: title_hint",
+    "Nonempty translations: title_hint",
+    "Format-argument parity: color_hue",
+    "Nonempty translations: color_hue",
+    "Format-argument parity: bank_budget_disable",
+    "Nonempty translations: bank_budget_disable",
+    "Format-argument parity: category_home",
+    "Nonempty translations: category_home",
+    "Format-argument parity: premium_assistant_toggle",
+    "Nonempty translations: premium_assistant_toggle",
+    "Format-argument parity: cinematic_expense_categories",
+    "Nonempty translations: cinematic_expense_categories",
+    "Format-argument parity: import_paste",
+    "Nonempty translations: import_paste",
+    "Format-argument parity: all",
+    "Nonempty translations: all",
+    "Format-argument parity: negative_amount",
+    "Nonempty translations: negative_amount",
+    "Format-argument parity: color_invalid",
+    "Nonempty translations: color_invalid",
+    "Format-argument parity: fps_explanation",
+    "Nonempty translations: fps_explanation",
+    "Format-argument parity: import_mode_api",
+    "Nonempty translations: import_mode_api",
+    "Format-argument parity: retry",
+    "Nonempty translations: retry",
+    "Format-argument parity: cat_locked_hint",
+    "Nonempty translations: cat_locked_hint",
+    "Format-argument parity: mascot_premium_note",
+    "Nonempty translations: mascot_premium_note",
+    "Format-argument parity: character_count",
+    "Nonempty translations: character_count",
+    "Format-argument parity: voice_smalltalk_bye",
+    "Nonempty translations: voice_smalltalk_bye",
+    "Format-argument parity: theme_light",
+    "Nonempty translations: theme_light",
+    "Format-argument parity: pay_source_required",
+    "Nonempty translations: pay_source_required",
+    "Format-argument parity: cinematic_apply",
+    "Nonempty translations: cinematic_apply",
+    "Format-argument parity: empty_ledger_body",
+    "Nonempty translations: empty_ledger_body",
+    "Format-argument parity: color_brightness",
+    "Nonempty translations: color_brightness",
+    "Format-argument parity: privat_api_title",
+    "Nonempty translations: privat_api_title",
+    "Format-argument parity: cinematic_comparison",
+    "Nonempty translations: cinematic_comparison",
+    "Format-argument parity: cinematic_more",
+    "Nonempty translations: cinematic_more",
+    "Format-argument parity: rate_value",
+    "Nonempty translations: rate_value",
+    "Format-argument parity: entry_deleted",
+    "Nonempty translations: entry_deleted",
+    "Format-argument parity: sms_scan_result",
+    "Nonempty translations: sms_scan_result",
+    "Format-argument parity: pin_setup_subtitle",
+    "Nonempty translations: pin_setup_subtitle",
+    "Format-argument parity: diagnostics_title",
+    "Nonempty translations: diagnostics_title",
+    "Format-argument parity: bank_clear_history",
+    "Nonempty translations: bank_clear_history",
+    "Format-argument parity: pin_locked",
+    "Nonempty translations: pin_locked",
+    "Format-argument parity: brand_author_signature",
+    "Nonempty translations: brand_author_signature",
+    "Format-argument parity: developer_purchase_title",
+    "Nonempty translations: developer_purchase_title",
+    "Format-argument parity: bank_limit_recent",
+    "Nonempty translations: bank_limit_recent",
+    "Format-argument parity: fps_fallback",
+    "Nonempty translations: fps_fallback",
+    "Format-argument parity: cancel",
+    "Nonempty translations: cancel",
+    "Format-argument parity: mascot_sky",
+    "Nonempty translations: mascot_sky",
+    "Format-argument parity: category_leisure",
+    "Nonempty translations: category_leisure",
+    "Format-argument parity: premium_body",
+    "Nonempty translations: premium_body",
+    "Format-argument parity: developer_purchase_banner",
+    "Nonempty translations: developer_purchase_banner",
+    "Format-argument parity: bank_setup",
+    "Nonempty translations: bank_setup",
+    "Format-argument parity: activation_expired",
+    "Nonempty translations: activation_expired",
+    "Format-argument parity: dashboard_heading",
+    "Nonempty translations: dashboard_heading",
+    "Format-argument parity: billing_pending",
+    "Nonempty translations: billing_pending",
+    "Format-argument parity: no_matches",
+    "Nonempty translations: no_matches",
+    "Format-argument parity: privat_api_site",
+    "Nonempty translations: privat_api_site",
+    "Format-argument parity: bank_sms_yes",
+    "Nonempty translations: bank_sms_yes",
+    "Format-argument parity: category_transaction_count",
+    "Nonempty translations: category_transaction_count",
+    "Format-argument parity: delete_entry",
+    "Nonempty translations: delete_entry",
+    "Format-argument parity: support_handle",
+    "Nonempty translations: support_handle",
+    "Format-argument parity: pin_unlock_subtitle",
+    "Nonempty translations: pin_unlock_subtitle",
+    "Format-argument parity: sms_howto",
+    "Nonempty translations: sms_howto",
+    "Format-argument parity: import_mode_notify",
+    "Nonempty translations: import_mode_notify",
+    "Format-argument parity: premium_unlock",
+    "Nonempty translations: premium_unlock",
+    "Format-argument parity: color_reset",
+    "Nonempty translations: color_reset",
+    "Format-argument parity: voice_smalltalk_greeting",
+    "Nonempty translations: voice_smalltalk_greeting",
+    "Format-argument parity: color_grid",
+    "Nonempty translations: color_grid",
+    "Format-argument parity: mascot_style",
+    "Nonempty translations: mascot_style",
+    "Format-argument parity: clear_search",
+    "Nonempty translations: clear_search",
+    "Format-argument parity: biometric_unlock",
+    "Nonempty translations: biometric_unlock",
+    "Format-argument parity: total_seven_days",
+    "Nonempty translations: total_seven_days",
+    "Format-argument parity: diagnostics_show_button",
+    "Nonempty translations: diagnostics_show_button",
+    "Format-argument parity: security_error",
+    "Nonempty translations: security_error",
+    "Format-argument parity: history_search",
+    "Nonempty translations: history_search",
+    "Format-argument parity: diagnostics_none",
+    "Nonempty translations: diagnostics_none",
+    "Format-argument parity: pay_source_title",
+    "Nonempty translations: pay_source_title",
+    "Format-argument parity: activation_storage",
+    "Nonempty translations: activation_storage",
+    "Format-argument parity: legend_expense",
+    "Nonempty translations: legend_expense",
+    "Format-argument parity: premium_name",
+    "Nonempty translations: premium_name",
+    "Format-argument parity: date_invalid",
+    "Nonempty translations: date_invalid",
+    "Format-argument parity: api_disconnect",
+    "Nonempty translations: api_disconnect",
+    "Format-argument parity: appearance",
+    "Nonempty translations: appearance",
+    "Format-argument parity: import_mode_sms",
+    "Nonempty translations: import_mode_sms",
     "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
     "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankBackgroundImportTest.kt",
@@ -14728,12 +15844,18 @@ with tempfile.TemporaryDirectory() as folder:
     "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
     "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/BankScreenLayoutTest.kt",
+    "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/ActivationLayoutTest.kt",
+    "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/ActivationLayoutTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/ActivationLayoutTest.kt",
     "No NUL bytes: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
     "No implementation markers: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/androidTest/kotlin/com/semmyx/ledger/CompactLayoutTest.kt",
     "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
     "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
     "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/MainDispatcherRule.kt",
+    "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/SettingsActivationTest.kt",
+    "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/SettingsActivationTest.kt",
+    "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/SettingsActivationTest.kt",
     "No NUL bytes: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
     "No implementation markers: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
     "Lexically balanced Kotlin delimiters: app/src/test/kotlin/com/semmyx/ledger/ViewModelTest.kt",
@@ -15061,17 +16183,7 @@ with tempfile.TemporaryDirectory() as folder:
     "Resolved app string: mascot_gray",
     "Resolved app string: mascot_sky",
     "Resolved app string: mascot_animations",
-    "Resolved app string: developer_purchase_title",
-    "Resolved app string: developer_purchase_body",
-    "Resolved app string: developer_purchase_banner",
-    "Resolved app string: developer_purchase_note",
-    "Resolved app string: developer_purchase_button",
-    "Resolved app string: installation_id_label",
-    "Resolved app string: installation_id_copied",
-    "Resolved app string: installation_id_copy",
-    "Resolved app string: activation_code_label",
-    "Resolved app string: activation_code_hint",
-    "Resolved app string: activation_code_button",
+    "Resolved app string: activation_request_copied",
     "Resolved app string: reference_rates",
     "Resolved app string: rates_disclaimer",
     "Resolved app string: rates_empty",
@@ -15122,6 +16234,30 @@ with tempfile.TemporaryDirectory() as folder:
     "Resolved app string: color_grid",
     "Resolved app string: color_icons",
     "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/ColorSettings.kt",
+    "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/DeveloperActivationPanel.kt",
+    "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/DeveloperActivationPanel.kt",
+    "Resolved app string: developer_purchase_title",
+    "Resolved app string: developer_purchase_body",
+    "Resolved app string: installation_id_label",
+    "Resolved app string: activation_key_id",
+    "Resolved app string: activation_not_configured",
+    "Resolved app string: activation_copy_request",
+    "Resolved app string: activation_code_label",
+    "Resolved app string: activation_code_hint",
+    "Resolved app string: activation_not_configured",
+    "Resolved app string: activation_key_mismatch",
+    "Resolved app string: activation_malformed",
+    "Resolved app string: activation_signature",
+    "Resolved app string: activation_device",
+    "Resolved app string: activation_product",
+    "Resolved app string: activation_clock",
+    "Resolved app string: activation_expired",
+    "Resolved app string: activation_storage",
+    "Resolved app string: activation_checking",
+    "Resolved app string: activation_code_button",
+    "Resolved app string: developer_purchase_button",
+    "Resolved app string: developer_purchase_note",
+    "Lexically balanced Kotlin delimiters: app/src/main/kotlin/com/semmyx/ledger/settings/DeveloperActivationPanel.kt",
     "No NUL bytes: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
     "No implementation markers: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
     "Domain-only ViewModel dependencies: app/src/main/kotlin/com/semmyx/ledger/settings/SettingsViewModel.kt",
@@ -15461,12 +16597,18 @@ with tempfile.TemporaryDirectory() as folder:
     "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
     "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
     "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/KeystoreSecurityTest.kt",
+    "No NUL bytes: data/src/androidTest/kotlin/com/semmyx/ledger/data/DeveloperActivationPersistenceTest.kt",
+    "No implementation markers: data/src/androidTest/kotlin/com/semmyx/ledger/data/DeveloperActivationPersistenceTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/androidTest/kotlin/com/semmyx/ledger/data/DeveloperActivationPersistenceTest.kt",
     "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
     "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
     "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/SearchPatternTest.kt",
     "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
     "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
     "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/PurchaseSignatureVerifierTest.kt",
+    "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt",
+    "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt",
+    "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/billing/ActivationDiagnosticsTest.kt",
     "No NUL bytes: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
     "No implementation markers: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
     "Lexically balanced Kotlin delimiters: data/src/test/kotlin/com/semmyx/ledger/data/billing/DeveloperSubscriptionVerifierTest.kt",
